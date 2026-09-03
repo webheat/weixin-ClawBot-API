@@ -16,6 +16,7 @@ import aiohttp
 from dusapi import DusAPI, DusConfig
 from deepseek import DeepSeekAPI, DeepSeekConfig
 from ima import ImaClient, ImaConfig, build_context_prompt as _ima_build_context
+from qr_web import QrFlowState, make_web_on_qrcode, wait_for_verify_code, web_enabled, start as qr_web_start
 
 executor = ThreadPoolExecutor(max_workers=4)
 ai = None  # 启动时从配置文件加载后初始化
@@ -211,6 +212,14 @@ def sanitize_bot_agent(raw: str | None) -> str:
     return " ".join(kept) if kept else DEFAULT_BOT_AGENT
 
 
+def _safe_input(prompt: str, default: str = "") -> str:
+    """stdin 没有 TTY（daemon / systemd / EOF）时返回 default，避免阻塞。"""
+    try:
+        return input(prompt)
+    except EOFError:
+        return default
+
+
 def choose_provider(default_provider: str) -> str:
     print("\n请选择 AI 提供商：")
     keys = list(PROVIDERS.keys())
@@ -219,7 +228,7 @@ def choose_provider(default_provider: str) -> str:
         print(f"  {index}. {PROVIDERS[key]['label']} {default_mark}")
 
     while True:
-        choice = input("输入序号或名称后回车: ").strip().lower()
+        choice = _safe_input("输入序号或名称后回车: ").strip().lower()
         if not choice:
             return default_provider if default_provider in PROVIDERS else "dusapi"
         if choice.isdigit():
@@ -238,16 +247,16 @@ def prompt_provider_config(provider: str, old_cfg: dict | None = None) -> dict:
 
     old_key = old_cfg.get("api_key", "")
     key_prompt = f"请输入 API Key（当前 {mask_key(old_key)}，留空沿用）: " if old_key else "请输入 API Key: "
-    api_key = input(key_prompt).strip() or old_key
+    api_key = _safe_input(key_prompt).strip() or old_key
 
     old_base_url = old_cfg.get("base_url", defaults["base_url"])
-    base_url = input(f"请输入 API 地址（留空默认/沿用 {old_base_url}）: ").strip() or old_base_url
+    base_url = _safe_input(f"请输入 API 地址（留空默认/沿用 {old_base_url}）: ").strip() or old_base_url
 
     old_model = old_cfg.get("model", defaults["model"])
-    model = input(f"请输入模型名称（留空默认/沿用 {old_model}）: ").strip() or old_model
+    model = _safe_input(f"请输入模型名称（留空默认/沿用 {old_model}）: ").strip() or old_model
 
     old_prompt = old_cfg.get("prompt", defaults["prompt"])
-    prompt = input("请输入系统提示词（留空默认/沿用当前值）: ").strip() or old_prompt
+    prompt = _safe_input("请输入系统提示词（留空默认/沿用当前值）: ").strip() or old_prompt
 
     return {
         "api_key": api_key,
@@ -288,7 +297,7 @@ def load_or_create_config() -> dict:
         print(f"  提示词   : {prompt_preview}{'...' if len(provider_cfg.get('prompt','')) > 50 else ''}")
         print(dash)
 
-        choice = input("\n使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置 / 输入 S 切换提供商): ").strip().upper()
+        choice = _safe_input("\n使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置 / 输入 S 切换提供商): ").strip().upper()
         if choice == "N":
             provider_cfg = prompt_provider_config(provider, provider_cfg)
             cfg["providers"][provider] = provider_cfg
@@ -693,7 +702,8 @@ def extract_message_text(msg: dict) -> str:
 
 async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                        typing_ticket_cache, reconnect_asked, warning_active,
-                       reconnect_in_progress, login_time_ref, cfg, runtime_state=None):
+                       reconnect_in_progress, login_time_ref, cfg, runtime_state=None,
+                       web_on_qrcode=None, web_state=None):
     """执行重连流程，并同步保存 2.4.6 token、账号 ID 与游标状态。"""
     runtime_state = runtime_state if isinstance(runtime_state, dict) else _empty_runtime_state()
     if reconnect_in_progress[0]:
@@ -709,7 +719,12 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
 
     try:
         async def deliver_qrcode(content):
-            """把当前二维码同时输出到终端并尽力发送给最近联系人。"""
+            """把当前二维码同步输出到网页 + 终端 + 最近联系人。"""
+            if web_on_qrcode is not None:
+                try:
+                    await web_on_qrcode(content)
+                except Exception as exc:
+                    print(f"[重连] web 二维码回调失败: {_redact_text(exc)}")
             qr_msg = f"[重连] 请扫码完成新连接：{content}"
             print(f"[重连] 请扫码完成新连接：{_redact_text(content)}")
             # HTTP 图片链接已由 save_qrcode_content 渲染，其他格式在这里补渲染。
@@ -723,6 +738,7 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                 [current_token] if current_token else [],
                 existing_state=runtime_state,
                 on_qrcode=deliver_qrcode,
+                web_state=web_state,
             )
         except asyncio.CancelledError:
             raise
@@ -822,7 +838,8 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
 
 async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_contact,
                                 typing_ticket_cache, reconnect_asked, warning_active,
-                                reconnect_in_progress, login_time_ref, cfg, runtime_state=None):
+                                reconnect_in_progress, login_time_ref, cfg, runtime_state=None,
+                                web_on_qrcode=None, web_state=None):
     """独立定时器任务，与主消息循环并发运行。"""
     runtime_state = runtime_state if isinstance(runtime_state, dict) else _empty_runtime_state()
     while True:
@@ -843,7 +860,8 @@ async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_co
                                     force_msg, bot_token_ref, bot_base_url_ref)
                 await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                                    typing_ticket_cache, reconnect_asked, warning_active,
-                                   reconnect_in_progress, login_time_ref, cfg, runtime_state)
+                                   reconnect_in_progress, login_time_ref, cfg, runtime_state,
+                                   web_on_qrcode, web_state)
                 continue
 
             remaining_h = remaining / 3600
@@ -866,7 +884,8 @@ async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_co
                                         force_msg, bot_token_ref, bot_base_url_ref)
                     await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                                        typing_ticket_cache, reconnect_asked, warning_active,
-                                       reconnect_in_progress, login_time_ref, cfg, runtime_state)
+                                       reconnect_in_progress, login_time_ref, cfg, runtime_state,
+                                       web_on_qrcode, web_state)
                     break
 
                 wait_secs = max(0.0, min(float(cfg["reminder_interval"]),
@@ -876,7 +895,8 @@ async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_co
                     # 用户回 Y，执行重连
                     await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                                        typing_ticket_cache, reconnect_asked, warning_active,
-                                       reconnect_in_progress, login_time_ref, cfg, runtime_state)
+                                       reconnect_in_progress, login_time_ref, cfg, runtime_state,
+                                       web_on_qrcode, web_state)
                     break
                 except asyncio.TimeoutError:
                     remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
@@ -1070,7 +1090,7 @@ async def poll_login_status(session, qrcode, base_url=BASE_URL, verify_code=None
 
 
 async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_seconds=None,
-                                  allow_already_connected=False):
+                                  allow_already_connected=False, web_state=None):
     timeout_seconds = timeout_seconds or RECONNECT_CONFIG["qrcode_scan_timeout"]
     deadline = time.time() + timeout_seconds
     current_base_url = base_url or BASE_URL
@@ -1109,6 +1129,8 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
         if result.get("scanned"):
             if pending_verify_code and result.get("verify_code_accepted"):
                 pending_verify_code = None
+            if web_state is not None:
+                web_state.status = "scanned"
             if not scanned_printed:
                 print("已扫码，等待手机端确认...")
                 scanned_printed = True
@@ -1118,13 +1140,25 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
                 if result.get("retry_verifycode")
                 else "请输入手机微信显示的数字配对码: "
             )
-            pending_verify_code = (await asyncio.to_thread(input, prompt)).strip()
+            if web_state is not None:
+                remaining = max(1.0, deadline - time.time())
+                # 单次等待不超过 120s；如果用户在页面不操作，触发超时让外层重发二维码
+                code = await wait_for_verify_code(
+                    web_state, prompt, bool(result.get("retry_verifycode")),
+                    timeout=min(remaining, 120.0),
+                )
+                if code is None:
+                    print("[登录] 网页未提交配对码超时，回到二维码等待")
+                    return {"timeout": True}
+                pending_verify_code = code.strip()
+            else:
+                pending_verify_code = (await asyncio.to_thread(input, prompt)).strip()
             continue
 
         await asyncio.sleep(1)
 
 
-async def login_with_qrcode(session, local_token_list=None, existing_state=None, on_qrcode=None):
+async def login_with_qrcode(session, local_token_list=None, existing_state=None, on_qrcode=None, web_state=None):
     """执行官方二维码登录，最多展示 MAX_QR_REFRESH_COUNT 个二维码。"""
     # 与官方实现一致：初始二维码计为第 1 次，最多共展示 3 个二维码。
     refresh_count = 1
@@ -1161,6 +1195,7 @@ async def login_with_qrcode(session, local_token_list=None, existing_state=None,
             BASE_URL,
             timeout_seconds=remaining,
             allow_already_connected=True,
+            web_state=web_state,
         )
         if login_result.get("bot_token"):
             return login_result
@@ -1218,6 +1253,14 @@ async def main():
     saved_token = str(runtime_state.get("bot_token") or "").strip()
 
     async with aiohttp.ClientSession() as session:
+        # ---- 启动 web 登录页面（CLAWBOT_WEB_ENABLED=1 默认）----
+        qr_state = QrFlowState()
+        web_task: asyncio.Task | None = None
+        web_on_qrcode = None
+        if web_enabled():
+            web_task = asyncio.create_task(qr_web_start(qr_state))
+            web_on_qrcode = make_web_on_qrcode(qr_state, session)
+
         if saved_token:
             # 官方客户端会按账号复用本地凭据；若服务端随后返回 -14，
             # 消息循环会停止紧密轮询并进入受控二维码重登录。
@@ -1233,10 +1276,15 @@ async def main():
                 session,
                 [],
                 existing_state=runtime_state,
+                on_qrcode=web_on_qrcode,
+                web_state=qr_state,
             )
         bot_token = str(login_result.get("bot_token") or "").strip()
         if not bot_token:
             raise RuntimeError("登录响应缺少 bot_token")
+
+        qr_state.status = "logged_in"
+        qr_state.logged_in_at = time.time()
 
         bot_base_url = login_result.get("baseurl") or runtime_state.get("baseurl") or BASE_URL
         old_account_id = str(runtime_state.get("ilink_bot_id") or "")
@@ -1343,6 +1391,8 @@ async def main():
                         typing_ticket_cache, reconnect_asked, warning_active,
                         reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
                         runtime_state,
+                        web_on_qrcode=web_on_qrcode,
+                        web_state=qr_state,
                     )
                 else:
                     await send_msg_safe(session, from_id, context_token, "已取消重新连接",
@@ -1515,8 +1565,14 @@ async def main():
                         save_runtime_state(runtime_state)
                         try:
                             await asyncio.sleep(RETRY_DELAY)
-                            fresh_login = await login_with_qrcode(session, [], existing_state={})
+                            fresh_login = await login_with_qrcode(
+                                session, [], existing_state={},
+                                on_qrcode=web_on_qrcode,
+                                web_state=qr_state,
+                            )
                             await apply_new_login(fresh_login)
+                            qr_state.status = "logged_in"
+                            qr_state.logged_in_at = time.time()
                             # 同账号重新登录沿用该账号游标；切换账号时
                             # apply_new_login 会清空持久化状态，这里同步本地变量。
                             get_updates_buf = str(runtime_state.get("get_updates_buf") or "")
@@ -1552,15 +1608,20 @@ async def main():
             session, bot_token_ref, bot_base_url_ref, last_contact,
             typing_ticket_cache, reconnect_asked, warning_active,
             reconnect_in_progress, login_time_ref, RECONNECT_CONFIG, runtime_state,
+            web_on_qrcode=web_on_qrcode,
+            web_state=qr_state,
         ))
         message_task = asyncio.create_task(message_loop())
         try:
             await message_task
         finally:
-            for task in (message_task, timer_task):
+            all_tasks = [message_task, timer_task]
+            if web_task is not None:
+                all_tasks.append(web_task)
+            for task in all_tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(message_task, timer_task, return_exceptions=True)
+            await asyncio.gather(*all_tasks, return_exceptions=True)
             if bot_token_ref[0]:
                 try:
                     await asyncio.wait_for(
