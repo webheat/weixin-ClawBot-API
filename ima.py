@@ -100,9 +100,11 @@ class KnowledgeBaseSummary:
 
     @classmethod
     def from_dict(cls, d: dict) -> "KnowledgeBaseSummary":
+        # ``search_knowledge_base`` 用 ``kb_id``/``kb_name``；
+        # ``addable_knowledge_base_list`` 用 ``id``/``name`` —— 两路都接。
         return cls(
-            id=d.get("kb_id", ""),
-            name=d.get("kb_name", ""),
+            id=d.get("kb_id") or d.get("id") or "",
+            name=d.get("kb_name") or d.get("name") or "",
             role=d.get("role_type", ""),
             base_type=d.get("base_type", ""),
             cover=d.get("cover_url", ""),
@@ -116,14 +118,16 @@ class SearchHit:
     title: str = ""
     content: str = ""
     snippet: str = ""
+    highlight_content: str = ""
     url: str = ""
     knowledge_base_id: str = ""
     score: float = 0.0
 
     @property
     def display_snippet(self) -> str:
-        """Go mapping: ``Snippet || Content``."""
-        return self.snippet or self.content
+        """Go mapping: ``Snippet || Content`` —— plus ``highlight_content``
+        (actual field returned by ``search_knowledge``)."""
+        return self.snippet or self.content or self.highlight_content
 
     @classmethod
     def from_dict(cls, d: dict, fallback_kb: str = "") -> "SearchHit":
@@ -132,6 +136,7 @@ class SearchHit:
             title=d.get("title", ""),
             content=d.get("content", ""),
             snippet=d.get("snippet", ""),
+            highlight_content=d.get("highlight_content", ""),
             url=d.get("url", ""),
             knowledge_base_id=d.get("knowledge_base_id") or fallback_kb,
             score=float(d.get("score", 0.0) or 0.0),
@@ -167,12 +172,33 @@ class ImaError(RuntimeError):
 
 
 def _envelope_error(data: dict) -> Optional[str]:
-    """Tencent ima error fields are inconsistent across endpoints; check all."""
+    """Tencent ima error fields are inconsistent across endpoints; check all.
+
+    Successful responses are wrapped: ``{"code": 0, "data": {...}}``; error
+    responses keep the same shape with non-zero ``code`` (and ``msg`` /
+    ``message`` / ``errmsg`` for the human-readable part).
+    """
     code = data.get("code") or data.get("errcode") or data.get("ret") or 0
     if not code:
         return None
-    msg = data.get("message") or data.get("errmsg") or ""
+    msg = (
+        data.get("msg")
+        or data.get("message")
+        or data.get("errmsg")
+        or ""
+    )
     return f"ima api error: code={code} message={msg}"
+
+
+def _unwrap_envelope(data: dict) -> dict:
+    """Tencent ima wraps successful payloads in ``{"code": 0, "data": {...}}``.
+
+    Returns the inner dict when present so callers can read fields like
+    ``info_list`` / ``is_end`` / ``next_cursor`` directly. When the inner
+    ``data`` is missing or not a dict, returns the original payload unchanged.
+    """
+    inner = data.get("data")
+    return inner if isinstance(inner, dict) else data
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +316,7 @@ class ImaClient:
                 log(f"POST {endpoint} envelope error: {err}", "ERROR")
                 last_exc = ImaError(err)
                 continue
-            return data
+            return _unwrap_envelope(data)
         raise last_exc or ImaError(f"ima {endpoint} failed without exception")
 
     # ---- read methods: return [] on error (silent degrade) ----------------
@@ -359,7 +385,8 @@ class ImaClient:
         except ImaError as exc:
             log(f"get_knowledge_list 失败: {exc}", "WARN")
             return []
-        return list(data.get("info_list") or [])
+        # 该端点返回的列表字段名是 ``knowledge_list``，不是 info_list
+        return list(data.get("knowledge_list") or [])
 
     def addable_knowledge_bases(
         self, cursor: str = "", limit: int = 0
@@ -374,7 +401,9 @@ class ImaClient:
         except ImaError as exc:
             log(f"addable_knowledge_bases 失败: {exc}", "WARN")
             return []
-        return [KnowledgeBaseSummary.from_dict(x) for x in (data.get("info_list") or [])]
+        # 该端点返回列表字段名是 ``addable_knowledge_base_list``，不是 info_list
+        items = data.get("addable_knowledge_base_list") or []
+        return [KnowledgeBaseSummary.from_dict(x) for x in items]
 
     def search_knowledge(
         self,

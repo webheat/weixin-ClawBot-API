@@ -1662,6 +1662,9 @@ class _AIWithIma:
         if self._ima.configured():
             try:
                 hits = self._ima.search_knowledge(message)
+                print(f"[ima] query='{message[:60]}' hits={len(hits)} "
+                      f"titles={[getattr(h, 'title', '')[:30] for h in hits[:3]]}",
+                      flush=True)
             except Exception as exc:  # 检索异常绝不能让回复失败
                 print(f"[ima] 检索异常: {exc}")
                 hits = []
