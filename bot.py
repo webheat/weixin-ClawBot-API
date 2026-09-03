@@ -15,6 +15,7 @@ import aiohttp
 
 from dusapi import DusAPI, DusConfig
 from deepseek import DeepSeekAPI, DeepSeekConfig
+from ima import ImaClient, ImaConfig, build_context_prompt as _ima_build_context
 
 executor = ThreadPoolExecutor(max_workers=4)
 ai = None  # 启动时从配置文件加载后初始化
@@ -1579,6 +1580,39 @@ async def main():
                     print(f"[生命周期] 停止通知未完成: {_redact_text(exc)}")
 
 
+class _AIWithIma:
+    """透明地把 ima 检索注入到 AI 调用的 system prompt。
+
+    `handle_message` 仍然只调用 ``ai.chat(text)``；检索与提示词拼接
+    在这里完成，不污染协议层的代码路径。如果 ``ima_client`` 未配置或检索
+    为空，等价于直通到底层 ``_base``。
+    """
+
+    def __init__(self, base, ima_client: ImaClient):
+        self._base = base
+        self._ima = ima_client
+        self.config = base.config  # 保持 ai.config.prompt 等属性可访问
+
+    def chat(self, message, **kwargs):
+        prompt = kwargs.pop("prompt", None)
+        if prompt is None:
+            prompt = getattr(self.config, "prompt", "") or ""
+
+        if self._ima.configured():
+            try:
+                hits = self._ima.search_knowledge(message)
+            except Exception as exc:  # 检索异常绝不能让回复失败
+                print(f"[ima] 检索异常: {exc}")
+                hits = []
+            if hits:
+                ctx = _ima_build_context(hits)
+                if ctx:
+                    prompt = (prompt + "\n\n" + ctx) if prompt else ctx
+
+        kwargs["prompt"] = prompt
+        return self._base.chat(message, **kwargs)
+
+
 def create_ai_client(raw_cfg: dict):
     """根据配置创建 AI 客户端，保持启动入口与协议代码解耦。"""
     if raw_cfg["provider"] == "deepseek":
@@ -1607,6 +1641,18 @@ if __name__ == "__main__":
     )
     _raw_cfg = load_or_create_config()
     ai = create_ai_client(_raw_cfg)
+    # 用 ima 检索为 AI 回答注入参考资料。未配置凭据时包装层会直通。
+    try:
+        _ima_client = ImaClient(ImaConfig.from_env())
+    except Exception as exc:
+        print(f"[ima] 初始化失败，回退到无检索模式: {exc}")
+        _ima_client = ImaClient(ImaConfig())  # 空配置 → configured()=False
+    if _ima_client.configured():
+        kb_ids = ImaConfig.from_env().default_knowledge_base_id or "(未设置)"
+        print(f"[ima] 知识库检索已启用，默认 KB: {kb_ids}")
+    else:
+        print("[ima] 知识库检索未启用（IMA_ILINK_CLIENT_ID / IMA_ILINK_API_KEY 未配置）")
+    ai = _AIWithIma(ai, _ima_client)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
