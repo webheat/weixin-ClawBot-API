@@ -11,6 +11,7 @@ raises into the bot loop.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -28,10 +29,17 @@ import requests
 
 VERSION = "1.0.0"
 
+# 复用项目统一 logger；handler 由 bot.py __main__ 入口注册
+log_ima = logging.getLogger("clawbot.ima")
+
 
 def log(message: str, level: str = "INFO") -> None:
-    """Project-style print logger. Mirrors ``dusapi.log`` / ``deepseek.log``."""
-    print(f"[ima:{level}] {message}")
+    """兼容旧调用方的 print 风格 logger。
+
+    注意：实际诊断日志走 ``logging.getLogger("clawbot.ima")``；本函数仅
+    兜底（外部脚本可能仍依赖这个入口）。新代码应直接用 ``log_ima``。
+    """
+    getattr(log_ima, level.lower(), log_ima.info)(message)
 
 
 # ---------------------------------------------------------------------------
@@ -280,9 +288,12 @@ class ImaClient:
         url = f"{self.cfg.base_url}/{endpoint.lstrip('/')}"
         last_exc: Optional[BaseException] = None
         attempts = (0,) + self._RETRY_DELAYS  # attempt 1 has no sleep
+        total_t0 = time.perf_counter()
         for attempt_idx, delay in enumerate(attempts):
             if delay:
                 time.sleep(delay)
+            t0 = time.perf_counter()
+            log_ima.debug("ima POST %s attempt=%d", endpoint, attempt_idx + 1)
             try:
                 resp = self._session.post(
                     url,
@@ -290,18 +301,24 @@ class ImaClient:
                     timeout=self.cfg.timeout,
                 )
             except Exception as exc:  # network / DNS / TLS / timeout
+                elapsed_ms = (time.perf_counter() - t0) * 1000
                 last_exc = exc
                 log(
                     f"POST {endpoint} attempt {attempt_idx + 1} failed: {exc}",
                     "WARN",
                 )
+                log_ima.warning("ima POST %s attempt=%d network err=%s elapsed_ms=%.0f",
+                                endpoint, attempt_idx + 1, exc, elapsed_ms)
                 continue
+            elapsed_ms = (time.perf_counter() - t0) * 1000
             if resp.status_code // 100 != 2:
                 truncated = (resp.text or "")[:512]
                 log(
                     f"POST {endpoint} http {resp.status_code}: {truncated}",
                     "ERROR",
                 )
+                log_ima.error("ima POST %s attempt=%d http=%d body=%s",
+                              endpoint, attempt_idx + 1, resp.status_code, truncated)
                 last_exc = ImaError(
                     f"ima {endpoint} returned http {resp.status_code}: {truncated}"
                 )
@@ -310,13 +327,22 @@ class ImaClient:
                 data = resp.json()
             except ValueError:
                 # Tolerated: non-JSON 2xx → return empty
+                log_ima.debug("ima POST %s attempt=%d ok elapsed_ms=%.0f (non-JSON 2xx)",
+                              endpoint, attempt_idx + 1, elapsed_ms)
                 return {}
             err = _envelope_error(data)
             if err:
                 log(f"POST {endpoint} envelope error: {err}", "ERROR")
+                log_ima.error("ima POST %s attempt=%d envelope err=%s",
+                              endpoint, attempt_idx + 1, err)
                 last_exc = ImaError(err)
                 continue
+            log_ima.debug("ima POST %s attempt=%d ok elapsed_ms=%.0f",
+                          endpoint, attempt_idx + 1, elapsed_ms)
             return _unwrap_envelope(data)
+        total_ms = (time.perf_counter() - total_t0) * 1000
+        log_ima.error("ima POST %s exhausted after %d attempts total_elapsed_ms=%.0f",
+                      endpoint, len(attempts), total_ms)
         raise last_exc or ImaError(f"ima {endpoint} failed without exception")
 
     # ---- read methods: return [] on error (silent degrade) ----------------
@@ -431,6 +457,9 @@ class ImaClient:
             return []
 
         eff_limit = limit if limit and limit > 0 else self.cfg.search_limit
+        log_ima.info("ima search q=%r kbs=%d limit=%d",
+                     (query or "")[:60], len(kb_ids), eff_limit)
+        search_t0 = time.perf_counter()
         all_hits: list[SearchHit] = []
         for kb_id in kb_ids:
             try:
@@ -445,15 +474,20 @@ class ImaClient:
                 )
             except ImaError as exc:
                 log(f"search_knowledge[{kb_id}] 失败: {exc}", "WARN")
+                log_ima.warning("ima search kb=%s failed err=%s", kb_id, exc)
                 continue
             # API inconsistency: results may be in info_list OR list.
             items = data.get("info_list") or data.get("list") or []
-            all_hits.extend(
-                SearchHit.from_dict(x, fallback_kb=kb_id) for x in items
-            )
+            kb_hits = list(SearchHit.from_dict(x, fallback_kb=kb_id) for x in items)
+            log_ima.debug("ima search kb=%s hits=%d", kb_id, len(kb_hits))
+            all_hits.extend(kb_hits)
 
         all_hits.sort(key=lambda h: h.score, reverse=True)
-        return all_hits[:eff_limit]
+        final_hits = all_hits[:eff_limit]
+        total_elapsed_ms = (time.perf_counter() - search_t0) * 1000
+        log_ima.info("ima search done hits=%d (truncated to %d) total_elapsed_ms=%.0f",
+                     len(all_hits), len(final_hits), total_elapsed_ms)
+        return final_hits
 
     # ---- mutation methods: propagate ImaError -----------------------------
 
@@ -539,9 +573,13 @@ def build_context_prompt(
         parts.append(block)
         total += len(block)
     if not parts:
+        log_ima.debug("ima build_context hits=%d prompt_chars=0 (empty)", len(list(hits) if not isinstance(hits, list) else hits))
         return ""
-    return (
+    result = (
         "以下是检索到的参考资料，请在回答时优先基于这些信息：\n\n"
         + "\n".join(parts)
         + "\n"
     )
+    log_ima.debug("ima build_context hits=%d prompt_chars=%d",
+                  len(parts), len(result))
+    return result

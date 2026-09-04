@@ -44,6 +44,14 @@
 
 ## 已完成
 
+- [x] 接入数据链路关键节点日志
+  - 新建 `utils/logging_setup.py`：标准库 `logging`，终端 + `logs/clawbot.log` 按天滚动，保留 7 天；`CLAWBOT_LOG_LEVEL` / `CLAWBOT_LOG_DIR` / `CLAWBOT_LOG_BACKUPS` 环境变量可覆盖
+  - 8 个子 logger：`clawbot.web` / `clawbot.qr` / `clawbot.message` / `clawbot.reconnect` / `clawbot.ai` / `clawbot.api` / `clawbot.state` / `clawbot.ima`
+  - `qr_web.py` 接入 logger + access_log 中间件
+  - `bot.py` 主链路 ~80 处 print 替换为 logger（保留用户态 UI print）；AI 调用加 `time.perf_counter()` 耗时
+  - `ima.py` 替换旧 `log()` print 为标准 logger；`_post` 加 elapsed_ms + 重试耗尽 ERROR；`search_knowledge` 加总耗时；`build_context_prompt` 加 prompt 字符数；`_AIWithIma.chat` 加注入 prompt before/after
+  - `RedactFilter` 兜底脱敏（防御层；主防线在调用方）
+  - README 新增"日志与排障"章节（5 个常见异常定位脚本）
 - [x] 二维码/登录态暴露到 `https://bx.mengxa.com/clawbot/`（commit `a7b4857`）
   - `qr_web.py` 内嵌 aiohttp，daemon 化后用户无需 TTY 即可扫码
   - 数字配对码走 web 提交，替代 stdin `input()` 阻塞

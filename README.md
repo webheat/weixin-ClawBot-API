@@ -32,9 +32,15 @@
 ├── bot.py              # Bot 主程序
 ├── dusapi.py           # DusAPI 兼容封装
 ├── deepseek.py         # DeepSeek 兼容封装
+├── ima.py              # 腾讯 ima 知识库 OpenAPI 客户端
+├── qr_web.py           # 内嵌 aiohttp 网页扫码服务（nginx /clawbot/ 反代）
+├── utils/
+│   ├── logging_setup.py    # 统一日志配置（终端 + 按天滚动文件）
+│   └── list_ima_kb.py      # 诊断脚本：列出 ima 账号下所有知识库
 ├── requirements.txt    # Python 依赖
 ├── config.json         # 首次运行自动生成，请勿提交
 ├── weixin_state.json   # 首次登录自动生成，包含敏感连接状态，请勿提交
+├── logs/               # 运行日志（自动生成，已 .gitignore 排除）
 └── README.md
 ```
 
@@ -165,6 +171,67 @@ POST sendtyping { status: 2 }（finally 中尽力执行）
 `sendmessage.msg.context_token` 必须使用当前入站消息的 token；`client_id` 每次发送都唯一。HTTP 200 不代表消息投递成功，必须同时检查 JSON 和业务返回码。
 
 程序停止时会先取消长轮询和重连任务，再以独立短超时调用 `POST /ilink/bot/msg/notifystop`。
+
+## 日志与排障
+
+诊断日志走标准库 `logging` 写到 `logs/clawbot.log`（按天滚动，保留 7 天），同时输出到终端。子 logger 按链路命名：
+
+| Logger | 用途 |
+|---|---|
+| `clawbot.web` | aiohttp 服务（bind / HTTP 请求 / 二维码缓存 / 配对码提交） |
+| `clawbot.qr` | 二维码登录全链路（fetch / poll / wait / refresh） |
+| `clawbot.message` | 长轮询 / 消息收发（`getupdates` / `sendmessage`） |
+| `clawbot.reconnect` | 重连流程 / 生命周期通知 |
+| `clawbot.ai` | AI 调用包装层（耗时 / 异常） |
+| `clawbot.api` | 每次 iLink HTTP 自动 trace（DEBUG） |
+| `clawbot.state` | `weixin_state.json` 读写 |
+| `clawbot.ima` | ima 检索 / 写入 / 配置 |
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CLAWBOT_LOG_LEVEL` | `INFO` | 终端级别：`DEBUG` / `INFO` / `WARNING` / `ERROR`；文件总写 DEBUG |
+| `CLAWBOT_LOG_DIR` | `logs` | 日志目录 |
+| `CLAWBOT_LOG_BACKUPS` | `7` | 滚动备份保留天数 |
+
+### 常见异常 5 行定位
+
+```bash
+# 1. 网页打不开 / 一直占位符
+grep -E "web (req|qr png|svg render)" logs/clawbot.log | tail -10
+# → 看到 "qr svg render failed (cairosvg missing)"：装 cairosvg 即可
+
+# 2. 扫码后一直不跳转
+grep -E "qr (scanned|expired|verify_code|fetched)" logs/clawbot.log | tail -10
+# → 卡在 "scanned, awaiting phone confirmation"：手机没点确认
+# → 跳到 "verify_code prompt timeout"：网页 JS 鉴权失败 / fetch 没发出去
+
+# 3. 消息能收但 AI 不回复（按 from_id 过滤）
+grep "from=xxxx" logs/clawbot.log | tail -20
+# → 有 ai call start 无 ai call done：AI 异常
+# → 有 ai call done 无 reply sent：sendmessage 失败
+
+# 4. 突然所有消息延迟 30s+（重连中）
+grep -E "reconnect (start|warning|force|credentials|getupdates)" logs/clawbot.log | tail -10
+# → "reconnect force firing remaining_s=..." 之后的所有消息都会被挡住
+#   直到 "reconnect credentials switched" 才恢复
+
+# 5. ima 检索异常
+grep -E "ima (search|POST|envelope|exhausted)" logs/clawbot.log | tail -10
+# → "envelope err code=401" → API key 失效
+# → "exhausted after 5 attempts" → 上游 5xx 或网络问题
+```
+
+DEBUG 级别会输出每次 iLink HTTP 的 method / path / status / body（脱敏后）。复盘协议漂移类问题时打开：
+
+```bash
+CLAWBOT_LOG_LEVEL=DEBUG python bot.py 2>&1 | tee /tmp/debug.log
+```
+
+### 脱敏
+
+所有 logger 调用都经过 `RedactFilter` 兜底（`utils/logging_setup.py`），对 `bot_token` / `verify_code` / `context_token` / `typing_ticket` / `qrcode` 等敏感字段做替换。新加 logger 时请主动使用 `bot._redact_text()` / `_redact_path()` 或只打前 8 字符（`token={token[:8]}…`），filter 是最后一道防线而非主防线。
 
 ## 注意事项
 

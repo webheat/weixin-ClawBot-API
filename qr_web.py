@@ -19,11 +19,17 @@ import asyncio
 import base64
 import io
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Awaitable
 
 import aiohttp
 from aiohttp import web
+
+from utils.logging_setup import get_logger
+
+# 诊断日志；不调 setup_logging（由 bot.py __main__ 统一注册）
+log_web = get_logger("web")
 
 
 WEB_ENABLED_ENV = "CLAWBOT_WEB_ENABLED"
@@ -109,6 +115,7 @@ async def to_png_bytes(session: aiohttp.ClientSession, content: str) -> tuple[by
             return cairosvg.svg2png(bytestring=svg_bytes), None
         except Exception as exc:
             print(f"[qr_web] cairosvg 渲染 SVG 失败: {exc}；请 pip install cairosvg")
+            log_web.warning("qr svg render failed (cairosvg missing/broken) err=%s", exc)
             return b"", None
     # http(s) URL 或裸 base64：本地用 qrcode 库把 content 重新渲染成 PNG。
     # 这样即便上游给的是 liteapp 落地页（fetch 拿不到图），也能给浏览器一个可扫的码。
@@ -123,6 +130,7 @@ async def to_png_bytes(session: aiohttp.ClientSession, content: str) -> tuple[by
         return buf.getvalue(), (content if content.startswith("http") else None)
     except Exception as exc:
         print(f"[qr_web] 本地生成二维码 PNG 失败: {exc}")
+        log_web.warning("qr png local-render failed err=%s", exc)
         return b"", None
 
 
@@ -135,14 +143,19 @@ def make_web_on_qrcode(
             png, url = await to_png_bytes(session, content)
             if not png:
                 print("[qr_web] 未能生成 PNG 缓存，网页将显示占位符")
+                log_web.warning("qr png generation failed (empty result) source_len=%d", len(content))
                 state.last_error = "无法生成二维码 PNG"
                 state.status = "error"
                 return
             state.reset_for_new_qr()
             state.set_qr_png(png, url)
             state.status = "qr_pending"
+            log_web.info("qr png cached seq=%d source=%s bytes=%d",
+                         state.qr_seq, "rendered" if url is None else "url",
+                         len(png))
         except Exception as exc:
             print(f"[qr_web] 缓存二维码失败: {exc}")
+            log_web.error("qr png cache crashed err=%s", exc, exc_info=True)
             state.last_error = str(exc)
             state.status = "error"
     return _cb
@@ -156,12 +169,18 @@ async def wait_for_verify_code(
     state.verify_prompt = prompt
     state.verify_retry = retry
     state.verify_event.clear()
+    log_web.info("verify_code prompt set retry=%s timeout_s=%.1f", retry, timeout)
     try:
         await asyncio.wait_for(state.verify_event.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         state.verify_prompt = None
+        log_web.warning("verify_code timeout after %.1fs", timeout)
         return None
-    return state.consume_verify_code()
+    code = state.consume_verify_code()
+    if code is not None:
+        # 严格：永不打 code 内容，只打长度与 retry 标记
+        log_web.info("verify_code received len=%d retry=%s", len(code), retry)
+    return code
 
 
 # ---------------- HTTP 路由 ----------------
@@ -339,17 +358,22 @@ async def handle_qr_png(request: web.Request) -> web.Response:
 
 async def handle_verify_code(request: web.Request) -> web.Response:
     if not _check_bearer(request):
+        log_web.warning("verify_code unauthorized remote=%s", request.remote)
         return web.json_response({"error": "unauthorized"}, status=401)
     try:
         payload = await request.json()
     except Exception:
+        log_web.warning("verify_code rejected reason=bad_json remote=%s", request.remote)
         return web.json_response({"error": "invalid json"}, status=400)
     code = str((payload or {}).get("code") or "").strip()
     if not code.isdigit() or not (4 <= len(code) <= 8):
+        log_web.warning("verify_code rejected reason=bad_format len=%d remote=%s",
+                        len(code), request.remote)
         return web.json_response({"error": "code must be 4-8 digits"}, status=400)
     state: QrFlowState = request.app["qr_state"]
     if not state.verify_prompt:
         # 没有等待配对码的 prompt：忽略（页面可能晚到）
+        log_web.debug("verify_code ignored reason=no_prompt remote=%s", request.remote)
         return web.json_response({"ok": True, "ignored": True})
     state.submit_verify_code(code)
     return web.json_response({"ok": True})
@@ -367,7 +391,29 @@ async def start(state: QrFlowState, host: Optional[str] = None, port: Optional[i
     bind_host = host or os.getenv(WEB_HOST_ENV, DEFAULT_WEB_HOST)
     bind_port = port if port is not None else int(os.getenv(WEB_PORT_ENV, str(DEFAULT_WEB_PORT)))
 
-    app = web.Application()
+    @web.middleware
+    async def access_log_mw(request: web.Request, handler):
+        """统一记录每个 HTTP 请求：method/path/status/dur_ms。
+        状态 < 400 用 DEBUG；>= 400 升 INFO 方便异常时一眼看到。"""
+        t0 = time.perf_counter()
+        try:
+            resp = await handler(request)
+            dur_ms = (time.perf_counter() - t0) * 1000
+            log_web.log(
+                logging.DEBUG if resp.status < 400 else logging.INFO,
+                "web req method=%s path=%s status=%d dur_ms=%.1f",
+                request.method, request.rel_url.path, resp.status, dur_ms,
+            )
+            return resp
+        except web.HTTPException as exc:
+            dur_ms = (time.perf_counter() - t0) * 1000
+            log_web.info("web req method=%s path=%s status=%d dur_ms=%.1f",
+                         request.method, request.rel_url.path, exc.status, dur_ms)
+            raise
+
+    import logging  # 局部导入避免顶层多一个 import（同时拿到 logging.DEBUG/INFO 常量）
+
+    app = web.Application(middlewares=[access_log_mw])
     app["qr_state"] = state
     app.router.add_get("/healthz", handle_healthz)
     app.router.add_get("/state", handle_state)
@@ -382,15 +428,19 @@ async def start(state: QrFlowState, host: Optional[str] = None, port: Optional[i
         await site.start()
     except (OSError, RuntimeError) as exc:
         print(f"[qr_web] 无法绑定 {bind_host}:{bind_port}: {exc}；回退到终端模式")
+        log_web.warning("web bind failed host=%s port=%d err=%s; fallback to terminal mode",
+                        bind_host, bind_port, exc)
         await runner.cleanup()
         return
     print(f"[qr_web] 监听 http://{bind_host}:{bind_port}/  (nginx /clawbot/ 反代)")
+    log_web.info("web bound http://%s:%d/ (reverseproxy=/clawbot/)", bind_host, bind_port)
     try:
         # 永久 sleep；外层 cancel 触发 finally 里的 cleanup
         while True:
             await asyncio.sleep(3600)
     finally:
         await runner.cleanup()
+        log_web.debug("web runner cleanup complete")
 
 
 def web_enabled() -> bool:
