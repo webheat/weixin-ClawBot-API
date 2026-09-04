@@ -35,3 +35,8 @@ Thumbs.db
 *.pid
 *.sock
 nohup.out
+
+# PyInstaller build artifacts (spec files in repo root, output ignored)
+dist/
+build/
+*.spec.bak
