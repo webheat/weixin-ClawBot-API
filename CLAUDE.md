@@ -12,6 +12,27 @@ Python 3.12+ client that speaks Tencent's [OpenClaw Weixin](https://github.com/T
 - **Recent big change (2026-09-07)** — full IMA pipeline rewrite + 150 Q&A ingested into a fresh KB. Full timeline, decisions, and sharp edges are in `docs/SESSION_2026-09-07_ima_pipeline.md`. The four new IMA knobs (`IMA_ILINK_KEYWORD_EXTRACT` / `IMA_ILINK_FETCH_BODY` / local fallback / `llm_caveat`) all live in `ima.py` and are routed via `_AIWithIma.chat`'s 3-state machine — read that section before changing AI routing.
 - **Fast Q&A lookup** — `docs/knowledge/` holds ~30 short notes indexed `qa-NNN-<topic>` (ima search keywords, context_token, X-WECHAT-UIN, ret=-14, etc.). Grep by topic when you hit an unfamiliar failure mode before reading the full 51 KB protocol reference.
 
+## Product context: IMA vs Obsidian
+
+This project references two very different products. **Don't conflate them.**
+
+- **Tencent ima** (`ima.qq.com`) — Tencent's cloud **AI knowledge workspace**. KBs live on Tencent servers (`KBT_MINE_KB` personal / `KBT_SHARED_KB` team / `KBT_SUBSCRIBED_CREATE_KB` publishable "知识号"). Built-in AI answering, indexing is **server-side async with 5–15 min delay**, retrieval in the public OpenAPI is **literal substring match** (no embedding on the API path), and bodies often come back empty until `highlight_content` fills in. Implemented in `ima.py`.
+- **Obsidian** — a **local Markdown editor + reverse-link note tool**. Data lives as plain `.md` files (optionally with YAML frontmatter) under a directory; Obsidian.app reads them directly, no server. Anything that edits text can edit them; `git diff`, `cp`, `grep` all work natively. AI is a plugin, not core. **Not yet wired into this project** — only listed as future work in `docs/SESSION_2026-09-07_ima_pipeline.md:236` ("Obsidian 当编辑源、IMA 当检索源" 双向同步方案 A).
+
+The 197 files in `docs/knowledge/` follow the Obsidian-vault convention (frontmatter + directory layout) but are read by `utils/local_kb.py` directly — no Obsidian.app process is involved. They can later be edited in Obsidian.app without code changes (frontmatter is stripped before scoring, `local_kb.py:29-40`).
+
+| If you need… | Use | Why |
+|---|---|---|
+| Multi-user editing, cross-device access, official AI answering for end users | **ima** | Service-side KB with permissions; 微信小程序 + Web + iOS/Android |
+| Publishing content externally ("知识号") | **ima** | `KBT_SUBSCRIBED_CREATE_KB` is the native publish channel |
+| Long-term personal/team second-brain with Git history, never lose data | **Obsidian** | Plain files; format doesn't rot; `git diff` works on `.md` |
+| Data sovereignty / cannot send content to any cloud | **Obsidian** | 100% local; no API call ever leaves the machine |
+| Fast RAG for an LLM agent / low latency | **Obsidian-vault-as-KB** (`LocalKBIndex`) | Zero network, no auth, no index delay; substring match but enough for keyword queries |
+| Already maintain an Obsidian vault elsewhere (`/opt/ob-vault/`) | Point `CLAWBOT_LOCAL_KB_DIR` at it | `LocalKBIndex.rglob("*.md")` + mtime auto-rebuild |
+| Mix: edit in Obsidian, serve/answer from ima | **方案 A** (future) | `SESSION_2026-09-07_ima_pipeline.md:236` — not yet built |
+
+Hard limits both share — **neither does semantic/embedding retrieval by default** (IMA's OpenAPI surface lacks it; `LocalKBIndex` is zero-deps by design: `local_kb.py:1-14`). If you need true semantic search, that's a new dependency, not a config knob.
+
 ## Common commands
 
 All commands assume the project root; the venv is `venv/`.
