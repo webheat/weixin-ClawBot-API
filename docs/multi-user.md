@@ -14,14 +14,93 @@ iLink OpenClaw 协议本身允许多个 `bot_token` 并发，但当前实现没�
 
 适用：把 bot 当作群助手、家庭号、企业号对外客服。
 
-### 场景 B：每个用户各自扫码绑定自己的微信（**当前不支持**）
+### 场景 B：每个用户各自扫码绑定自己的微信（**已实现，portal 单入口**）
 
-每个用户要独立登录自己的微信个人号、看到自己的 QR、用自己的 token 鉴权。当前问题：
+每个用户跑独立 `bot.py --user <name>` 进程，独立的 token / state / 端口 / 日志。
+所有用户共用同一入口 `https://bx.mengxa.com/clawbot/` —— 由 `qr_portal.py`
+根据 cookie 派发到对应用户的 `qr_web.py`。
 
-- `weixin_state.json` 单文件，多用户会互相覆盖 token
-- `QrFlowState` 是模块级单例，多用户的 QR 互相串
-- `:18300` 单端口，反代也只能指向一个进程
-- `CLAWBOT_WEB_TOKEN` 单值，无法隔离用户
+**当前部署形态：**
+
+```text
+                     ┌─────────────────────────────────────────────┐
+ https://bx.mengxa    │  nginx  /clawbot/  →  127.0.0.1:18300      │
+ .com/clawbot/  ───►  │  qr_portal.py (picker + 反代)               │
+                     │   ├ cookie=alice ─► 127.0.0.1:18301 (alice) │
+                     │   ├ cookie=bob   ─► 127.0.0.1:18302 (bob)   │
+                     │   └ cookie=空    ─► picker 页（列出所有用户）│
+                     └─────────────────────────────────────────────┘
+
+内部进程：
+  clawbot-portal.service            → qr_portal.py           → :18300
+  clawbot@<user>.service (每个用户)  → bot.py --user <user>   → :18301+
+  clawbot.service (legacy)           → bot.py                 → :18300 (与 portal 互斥)
+```
+
+**单入口 UX：**
+
+1. 访问 `https://bx.mengxa.com/clawbot/` → portal 显示 picker
+2. 点用户卡片 → 写 `clawbot_user` cookie → 跳转到对应用户 QR 页
+3. QR 页右上角固定显示"切换用户"按钮（portal 注入）→ 回 picker
+
+**关键文件：**
+
+| 文件 | 用途 |
+|---|---|
+| `qr_portal.py` | portal 主程序：picker + cookie 派发 + 反代 + HTML 注入 |
+| `/etc/clawbot/<user>.env` | 用户专属 env：必含 `CLAWBOT_WEB_PORT` / `CLAWBOT_WEB_TOKEN`；可覆盖 ima_* |
+| `/etc/clawbot/ima.env` | 共享 ima 凭据（兜底）。用户在 `<user>.env` 里写 ima_* 即可覆盖 |
+| `/etc/systemd/system/clawbot-portal.service` | portal systemd 单元 |
+| `/etc/systemd/system/clawbot@.service` | per-user systemd 模板 |
+| `/etc/nginx/sites-available/bx.mengxa.com` | `/clawbot/` location → `:18300`（单一反代） |
+
+**添加新用户的步骤：**
+
+```bash
+# 1) 用户 env
+sudo cp /etc/clawbot/user.env.example /etc/clawbot/alice.env
+sudo chmod 600 /etc/clawbot/alice.env
+sudo $EDITOR /etc/clawbot/alice.env
+#   CLAWBOT_WEB_PORT=18301
+#   CLAWBOT_WEB_TOKEN=$(openssl rand -hex 32)
+
+# 2) 启动（不需要再改 nginx / portal）
+sudo systemctl enable --now clawbot@alice
+
+# 3) portal 自动发现该用户（每 5s 自动刷新 picker 状态）
+# 4) 访问入口 → 选 alice → 扫码
+https://bx.mengxa.com/clawbot/
+```
+
+**IMA 共享 vs 独立：** 默认所有用户共用 `/etc/clawbot/ima.env` 一份凭据。
+需要独立时：在用户的 `<user>.env` 里写 `IMA_ILINK_CLIENT_ID` /
+`IMA_ILINK_API_KEY` / `IMA_ILINK_DEFAULT_KB`，
+`load_dotenv(override=False)` 会优先用用户值、缺失才回落共享。
+
+**portal 反代细节：**
+
+- 30 天 cookie，HttpOnly + SameSite=Lax（XSS/CSRF 防护）
+- HTML 响应自动注入"切换用户"按钮（z-index:99999 固定位）
+- 非 HTML 响应（QR png、verify_code POST）流式透传
+- 后端鉴权：portal 注入 `Authorization: Bearer <user.CLAWBOT_WEB_TOKEN>`，
+  `qr_web._check_bearer` 校验通过；qr_web 的 `?token=` 路径仍然兼容
+- 上游不可达 → 502 HTML 页（带"切换用户"链接）
+- 选中的 cookie 用户消失（env 文件被删）→ portal 清 cookie + 重定向 picker
+
+**迁移路径（从单租户升级）：**
+
+1. `systemctl stop clawbot.service`（停旧单租户）
+2. `systemctl daemon-reload`
+3. `systemctl enable --now clawbot-portal.service`
+4. 添加第一个用户：`sudo cp /etc/clawbot/user.env.example /etc/clawbot/alice.env` + 编辑 + `systemctl enable --now clawbot@alice`
+5. `sudo nginx -t && sudo systemctl reload nginx`
+6. 访问 `https://bx.mengxa.com/clawbot/` 应看到 picker（alice 卡片）
+
+## 实施记录
+
+- `b9c6d93` — `_AIWithIma` / `message_loop` 等关键节点加结构化日志；未涉及多用户
+- 第一轮 — `_resolve_user_paths()` + `--user` 参数 + `ImaConfig.from_env(env_files=list)` + `setup_logging(log_file=...)` + systemd 模板 + nginx map + `/etc/clawbot/{ima.env,user.env.example}`（已被 portal 取代）
+- 本轮 — `qr_portal.py` 单入口 portal + `clawbot-portal.service` + 撤销 nginx map（恢复单一反代）
 
 ## 多用户共享（场景 A）下的体验痛点（已复核）
 

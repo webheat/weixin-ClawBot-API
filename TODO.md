@@ -38,12 +38,26 @@
 
 ## 待评估（按需求触发）
 
-- [ ] **多用户支持（场景 B）** — 每个用户各自扫码绑定自己的微信个人号。当前为单租户架构，仅支持"多人共用一个 bot 账号"（场景 A）。详见 [`docs/multi-user.md`](docs/multi-user.md)。
-  - 触发信号：单账号活跃用户 > 50 且需要完全隔离；明确出现"用自己的微信号登录"的需求；需要 per-user AI 配置。
-  - 预设方案：多进程（`bot.py --user` + systemd 模板单元 `clawbot@.service` + nginx `/clawbot/<user>/` 路由）。
+- [ ] **多用户支持（场景 A 应用层痛点）** — 场景 B 已通过多进程 + nginx map 实现（`docs/multi-user.md` 场景 B）。
+  场景 A 下的应用层痛点（`last_contact` 单发 / `message_loop` 串行 / `send_msg_safe` 静默吞错 / `contexts` 膨胀）按 `docs/multi-user.md` 优先级处理。
+  - 触发信号：单进程用户活跃 > 50 且需要完全应用层隔离
+  - 注意：多进程方案已隔离跨用户串扰，但单用户进程内的痛点仍然存在
 
 ## 已完成
 
+- [x] **多用户支持（场景 B）—— portal 单入口** — 所有用户共用 `https://bx.mengxa.com/clawbot/`，portal 根据 cookie 派发
+  - `bot.py` 加 `--user <name>` 参数（向后兼容：不传 = 单租户旧行为）
+  - `_resolve_user_paths()` 推导 `config_<user>.json` / `weixin_state_<user>.json` / `logs/clawbot_<user>.log`；非法字符（除 `_.-` 外）自动替换为 `_`
+  - `ImaConfig.from_env(env_files=list)` 支持按顺序 `override=False` 加载；默认 `None` 跳过文件加载，env 由 `bot.py` 提前装好
+  - `setup_logging(log_file=...)` 接受完整日志路径，覆盖默认 `logs/clawbot.log`
+  - **`qr_portal.py` 单入口 portal**（`:18300`）：picker 页 + cookie 派发 + 反代到 `qr_web.py` + HTML 注入"切换用户"按钮
+  - `/etc/clawbot/ima.env` —— 共享 ima 凭据（兜底）
+  - `/etc/clawbot/user.env.example` —— 用户 env 模板
+  - `/etc/systemd/system/clawbot@.service` —— per-user systemd 模板，`EnvironmentFile=/etc/clawbot/%i.env`，`ExecStart=... bot.py --user %i`
+  - `/etc/systemd/system/clawbot-portal.service` —— portal systemd 单元
+  - nginx `/clawbot/` location 恢复单一 `proxy_pass :18300`（撤销前一轮的 map）
+  - IMA 独立：用户在 `<user>.env` 写 `IMA_ILINK_*` 即可覆盖；不写则用 `/etc/clawbot/ima.env` 共享
+  - `docs/multi-user.md` 场景 B 章节"+ portal 单入口"+ 完整部署步骤
 - [x] 接入数据链路关键节点日志
   - 新建 `utils/logging_setup.py`：标准库 `logging`，终端 + `logs/clawbot.log` 按天滚动，保留 7 天；`CLAWBOT_LOG_LEVEL` / `CLAWBOT_LOG_DIR` / `CLAWBOT_LOG_BACKUPS` 环境变量可覆盖
   - 8 个子 logger：`clawbot.web` / `clawbot.qr` / `clawbot.message` / `clawbot.reconnect` / `clawbot.ai` / `clawbot.api` / `clawbot.state` / `clawbot.ima`

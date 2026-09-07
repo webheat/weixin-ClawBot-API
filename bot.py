@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import base64
 import io
@@ -8,6 +9,8 @@ import re
 import secrets
 import time
 import urllib.request
+from pathlib import Path
+from typing import Optional
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 
@@ -15,9 +18,56 @@ import aiohttp
 
 from dusapi import DusAPI, DusConfig
 from deepseek import DeepSeekAPI, DeepSeekConfig
-from ima import ImaClient, ImaConfig, build_context_prompt as _ima_build_context
+from ima import ImaClient, ImaConfig, build_context_prompt as _ima_build_context, rerank_hits as _ima_rerank_hits
 from qr_web import QrFlowState, make_web_on_qrcode, wait_for_verify_code, web_enabled, start as qr_web_start
+from utils.local_kb import LocalKBIndex
 from utils.logging_setup import get_logger
+
+# 关键词抽取 prompt：用于 _AIWithIma._extract_keywords，从自然语言问句里
+# 拆出 1-3 个最适合 IMA 搜索的关键词。
+#
+# 关键约束：腾讯 ima 的 search_knowledge 是字面关键词严格匹配，phrase 几乎
+# 不命中；每个词必须独立，词与词之间用一个空格分开，绝不要连写。
+# 例如"ima知识库"是错的，正确是"ima 知识库"。
+_KEYWORD_EXTRACT_PROMPT = """你是检索关键词提取助手。用户用自然语言提问，下游是腾讯 ima 知识库（按字面关键词严格匹配，不是语义检索）。
+请把用户问题拆成 1-3 个独立的字或单词，每个之间用一个空格分开。
+
+硬性规则：
+- 每个词/字必须独立，词与词之间用单个空格分隔
+- 绝对不要把多个词连写（"ima知识库"是错的，"ima 知识库"才是对的）
+- 中文短语拆成独立的单字或常用二字词
+- 如果是问"什么是 X"，通常 X 本身就是关键词
+- 数字、英文术语、专有名词整体保留
+
+只输出一行关键词，不要任何解释、序号、标点或换行。
+
+示例：
+用户问：什么是 ima 知识库？
+输出：ima 知识库
+
+用户问：clawbot 多久会强制重连？重连流程是怎样的？
+输出：重连 强制重连
+
+用户问：请问下，扫码登录那段代码里的 verify_code 是干嘛用的？
+输出：verify_code 扫码登录
+
+用户问：腾讯的 ima 知识库 OpenAPI 的 search_knowledge 怎么用？
+输出：ima 知识库 search_knowledge OpenAPI
+
+用户问：{message}
+输出："""
+
+# 当 ``mode=llm-only`` 时拼到 system prompt 末尾，让 LLM 自我降自信并加标记。
+# 设计动机：ctx_chars=0 时 LLM 是在"裸答"，可能瞎编；让它主动告诉用户
+# "这是基于我自己的理解、不一定准"，比默默编一个好得多。
+# 通过 env ``CLAWBOT_LLM_CAVEAT=0`` 可关闭（默认 1）。
+_LLM_ONLY_CAVEAT_PROMPT = """【重要系统提示】本次回答未检索到任何知识库参考资料（既无 ima 云端命中，也无本地 .md 兜底命中），你的回答完全基于自身预训练知识。
+
+请严格遵守以下原则：
+1. 在回答开头加上明确的标记 "（未参考知识库）"，让用户一眼分辨这是 LLM 自主回答。
+2. 如果你对自己的答案没有把握（例如涉及具体数字、日期、引文、项目内部细节、最新事件），直接告诉用户 "我不确定" 或 "建议查证"，不要硬猜。
+3. 不要编造具体的版本号、配置项、函数名、API 端点等"看起来很具体"的内容；如果记不清，模糊处理或建议用户查文档。
+4. 如果用户问的是关于 clawbot 项目本身的具体实现细节，你应该建议用户去看仓库里的源码 / docs/ 目录 / weixin-openclaw-api-py-docs.md。"""
 
 # ========== 子系统 logger（诊断日志；用户态输出仍走 print） ==========
 log_qr        = get_logger("qr")         # 二维码登录全链路
@@ -55,6 +105,45 @@ ILINK_APP_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 6)
 BOT_AGENT = "weixin-ClawBot-API/1.2.0 (python)"
 DEFAULT_BOT_AGENT = "OpenClaw"
 BOT_AGENT_MAX_LEN = 256
+
+# ========== 多用户路径解析（--user） ==========
+USER_ENV_DIR = "/etc/clawbot"
+SHARED_IMA_ENV = f"{USER_ENV_DIR}/ima.env"
+LEGACY_PROJECT_ENV = ".env"
+
+
+def _resolve_user_paths(user: Optional[str]) -> dict:
+    """根据 --user 解析文件名 / env 文件加载顺序 / 日志路径。
+
+    不传 --user：单租户旧行为，使用 cwd 下的 config.json / weixin_state.json
+    以及项目 .env。传 --user alice：使用 config_alice.json /
+    weixin_state_alice.json / logs/clawbot_alice.log，加载
+    /etc/clawbot/alice.env（可选） → /etc/clawbot/ima.env（兜底）。
+    """
+    if not user:
+        return {
+            "user": None,
+            "config_file": CONFIG_FILE,
+            "state_file": STATE_FILE,
+            "log_file": Path("logs") / "clawbot.log",
+            "env_files": [LEGACY_PROJECT_ENV],
+            "banner_suffix": "(legacy single-tenant)",
+        }
+    # 用户名只能含字母数字_.-，其它字符替换成 _（避免 path traversal）
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", user)
+    if safe != user:
+        print(f"[警告] --user 值含非法字符，已替换为 '{safe}'")
+    return {
+        "user": safe,
+        "config_file": f"config_{safe}.json",
+        "state_file": f"weixin_state_{safe}.json",
+        "log_file": Path("logs") / f"clawbot_{safe}.log",
+        "env_files": [
+            f"{USER_ENV_DIR}/{safe}.env",   # 用户专属（不存在时静默跳过）
+            SHARED_IMA_ENV,                 # 共享 ima 兜底
+        ],
+        "banner_suffix": f"user={safe}",
+    }
 
 # iLink 2.4.6 官方客户端默认超时。长轮询超时属于正常控制流，不能当作业务失败。
 QR_STATUS_TIMEOUT = 35
@@ -1813,16 +1902,156 @@ class _AIWithIma:
         self._base = base
         self._ima = ima_client
         self.config = base.config  # 保持 ai.config.prompt 等属性可访问
+        # 本地 Markdown KB 兜底索引（lazy：只有命中 IMA 0 条时才会建索引）
+        self._local_kb: Optional[LocalKBIndex] = None
+        self._local_kb_attempted = False
+
+    def _maybe_local_kb(self) -> Optional[LocalKBIndex]:
+        """lazy 构造本地 KB 索引，仅在开关开启时。"""
+        if self._local_kb_attempted:
+            return self._local_kb
+        self._local_kb_attempted = True
+        if os.environ.get("CLAWBOT_LOCAL_FALLBACK", "").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return None
+        kb_dir = os.environ.get("CLAWBOT_LOCAL_KB_DIR", "docs/knowledge")
+        try:
+            self._local_kb = LocalKBIndex(kb_dir)
+        except Exception as exc:  # 路径/权限异常不能让回复失败
+            log_ai.warning("ai local_kb init failed dir=%s err=%s", kb_dir, exc)
+            self._local_kb = None
+        return self._local_kb
+
+    def _extract_keywords(self, message: str) -> list[str]:
+        """用底层 LLM 从自然语言问句里抽 1-3 个最适合 IMA 搜索的关键词。
+
+        返回 ``list[str]``，按相关性从高到低。每个元素是 1 个独立词/字。
+        空列表表示抽取失败/无意义。
+        异常一律向上抛，由调用方软降级到原始 message 整体搜。
+        """
+        if not message or not message.strip():
+            return []
+        # 短消息（≤2 字符）直接当关键词，避免一次 LLM 调用
+        if len(message.strip()) <= 2:
+            return [message.strip()]
+        extract_prompt = _KEYWORD_EXTRACT_PROMPT.format(message=message)
+        resp = self._base.chat(message, prompt=extract_prompt)
+        terms: list[str] = []
+        for line in (resp or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # 去掉可能的前缀："关键词：" / "关键词:" / "答案：" / 序号"1."
+            line = re.sub(
+                r"^(关键词|keyword|keywords|答案|answer|提取|抽取|问题|query|输出)"
+                r"[:：\s]+",
+                "", line, flags=re.IGNORECASE,
+            )
+            line = re.sub(r"^\d+[\.\)、]\s*", "", line)
+            line = line.strip().strip("\"'`").strip()
+            if not line:
+                continue
+            # 一行可能有多个空格分隔的词；中文常见的中英标点也按分隔处理
+            for term in re.split(r"[\s,，;；、]+", line):
+                term = term.strip().strip("\"'`").strip()
+                if not term:
+                    continue
+                if len(term) > 20:  # 太长就截掉（兜底 LLM 啰嗦输出整段解释）
+                    term = term[:20]
+                if term not in terms:  # 顺序保留、去重
+                    terms.append(term)
+                if len(terms) >= 3:
+                    break
+            if len(terms) >= 3:
+                break
+        return terms[:3]
+
+    def _search_ima_merged(self, terms: list[str], limit: int) -> list:
+        """对一组关键词分别搜 IMA，合并 hits 并按 media_id 去重（保留先出现顺序）。
+
+        第一个 term 通常是 LLM 判定的最强信号，其结果排前面；后续 term 补充召回。
+        每个 term 单独 search 时 limit 自动收紧，避免一次 IMA 调用返回太多。
+        """
+        seen: set[str] = set()
+        merged: list = []
+        for i, term in enumerate(terms):
+            if not term:
+                continue
+            # 第一个 term 用完整 limit；后续 term 用更小的 limit 节省资源
+            per_limit = limit if i == 0 else max(2, limit - i)
+            try:
+                hits = self._ima.search_knowledge(term, limit=per_limit)
+            except Exception as exc:  # 单 term 失败不阻塞其它
+                log_ima.warning("ai ima search term=%r failed err=%s", term, exc)
+                continue
+            for h in hits:
+                if h.media_id and h.media_id in seen:
+                    continue
+                if h.media_id:
+                    seen.add(h.media_id)
+                merged.append(h)
+        return merged[:limit]
 
     def chat(self, message, **kwargs):
+        """透明地把 ima 检索注入到 AI 调用的 system prompt，并打印路由决策。
+
+        ``handle_message`` 仍然只调用 ``ai.chat(text)``；检索与提示词拼接
+        在这里完成，不污染协议层的代码路径。如果 ``ima_client`` 未配置或检索
+        为空，等价于直通到底层 ``_base``。
+
+        调试阶段新增路由日志（INFO 级别，终端 + ``logs/clawbot*.log`` 同时输出），
+        三种语义明确区分：
+          ``mode=llm-only reason=ima-not-configured``  IMA 未配置（缺凭据），纯 LLM
+          ``mode=llm-only reason=ima-search-failed``   IMA 检索异常（warn 已记录详情）
+          ``mode=llm-only reason=ima-no-match``        IMA 检索成功但 0 条 / ctx 为空
+          ``mode=llm+ima  reason=hits-injected``        已拼接参考资料注入 prompt
+        一行 ``[AI 路由] mode=...`` 同步打到终端，方便肉眼确认本次回答走了哪条路径。
+        """
         prompt = kwargs.pop("prompt", None)
         if prompt is None:
             prompt = getattr(self.config, "prompt", "") or ""
 
+        # 默认路由：仅 LLM（IMA 未配置）
+        mode = "llm-only"
+        reason = "ima-not-configured"
+        hits_count = 0
+        ctx_chars = 0
+
         if self._ima.configured():
+            reason = "ima-no-match"  # 进入检索分支，覆盖默认值；命中后会再覆盖
+            # IMA_ILINK_KEYWORD_EXTRACT=1 时，先用 LLM 抽取 1-3 个关键词再搜。
+            # 自然语言问句（"IMA是什么？"/"怎么重连？"）整体搜常 hits=0，拆成
+            # 关键词后命中率显著提升。失败时软降级到原 message。
+            extract_t0 = time.perf_counter()
+            search_terms: list[str] = []  # 实际喂给 search_knowledge 的词列表
+            if getattr(self._ima.cfg, "keyword_extract", False):
+                try:
+                    search_terms = self._extract_keywords(message)
+                except Exception as exc:  # 抽取异常不能让回复失败
+                    log_ima.warning("ai ima keyword_extract failed err=%s", exc)
+                    search_terms = []
+                if search_terms:
+                    log_ima.info(
+                        "ai ima keyword_extract ok q_in=%r terms=%r elapsed_ms=%.0f",
+                        message[:60], search_terms,
+                        (time.perf_counter() - extract_t0) * 1000,
+                    )
+                else:
+                    log_ima.info(
+                        "ai ima keyword_extract empty q_in=%r (fallback to original) elapsed_ms=%.0f",
+                        message[:60], (time.perf_counter() - extract_t0) * 1000,
+                    )
+            if not search_terms:
+                # 软降级：抽取失败/未开启 → 拿整句当 1 个搜索词
+                search_terms = [message]
+
             try:
-                hits = self._ima.search_knowledge(message)
-                print(f"[ima] query='{message[:60]}' hits={len(hits)} "
+                # 多个 term 逐个搜，合并去重（_search_ima_merged）
+                hits = self._search_ima_merged(search_terms, self._ima.cfg.search_limit)
+                hits_count = len(hits)
+                query_log = " | ".join(search_terms)
+                print(f"[ima] query='{query_log[:60]}' hits={hits_count} "
                       f"titles={[getattr(h, 'title', '')[:30] for h in hits[:3]]}",
                       flush=True)
                 log_ima.debug("ai ima inject prompt before=%d", len(prompt or ""))
@@ -1830,17 +2059,133 @@ class _AIWithIma:
                 print(f"[ima] 检索异常: {exc}")
                 log_ima.warning("ai ima search failed err=%s", exc)
                 hits = []
+                reason = "ima-search-failed"
+                hits_count = 0
+
+            # IMA 0 命中 → 本地 Markdown 兜底（CLAWBOT_LOCAL_FALLBACK=1）
+            # 解决 IMA 关键词匹配对部分词不友好、本地却能 substring 命中的问题。
+            if not hits:
+                local_kb = self._maybe_local_kb()
+                if local_kb and local_kb.exists:
+                    local_t0 = time.perf_counter()
+                    local_hits = local_kb.search(search_terms, limit=self._ima.cfg.search_limit)
+                    if local_hits:
+                        hits = local_hits
+                        hits_count = len(hits)
+                        reason = "local-fallback"
+                        print(
+                            f"[local] query='{query_log[:60]}' hits={hits_count} "
+                            f"titles={[getattr(h, 'title', '')[:30] for h in hits[:3]]}",
+                            flush=True,
+                        )
+                        log_ima.info(
+                            "ai local_kb fallback hits=%d elapsed_ms=%.0f (ima was 0)",
+                            hits_count, (time.perf_counter() - local_t0) * 1000,
+                        )
+                    else:
+                        log_ima.info(
+                            "ai local_kb fallback none (ima=0, local=0) elapsed_ms=%.0f",
+                            (time.perf_counter() - local_t0) * 1000,
+                        )
+
+            # 命中数 > 0 且 IMA_ILINK_FETCH_BODY=1：逐条 get_doc_content 拿正文。
+            # 这是绕过 docs/IMA_KB.md §5 关键坑 2 的关键补丁——search_knowledge
+            # 不返回 body，必须再调一次 note 服务端的端点。
+            # 实测：只有"作者本人"创建的 note 才能拿正文，第三方 note 会 210005。
+            # media_id 格式：``note_<32-hex>_<16-digit-note-id><16-digit-folder-id>``，
+            # note_id 是紧跟 32-hex 之后的前 16 位数字（与 folder_id 无分隔符）。
+            if (
+                hits
+                and getattr(self._ima.cfg, "fetch_body", False)
+            ):
+                fetch_t0 = time.perf_counter()
+                enriched = 0
+                for h in hits:
+                    if h.display_snippet:  # 已有正文就跳过
+                        enriched += 1
+                        continue
+                    m = re.search(r"^note_[0-9a-f]{32}_(\d{16})", h.media_id or "")
+                    note_id = m.group(1) if m else ""
+                    if not note_id:
+                        log_ima.debug("ai ima fetch_body skip media_id=%r (no note_id)", h.media_id)
+                        continue
+                    try:
+                        body = self._ima.get_doc_content(note_id)
+                    except Exception as exc:  # 单条失败不阻塞其它
+                        log_ima.warning("ai ima get_doc_content[%s] failed err=%s",
+                                        note_id, exc)
+                        body = ""
+                    if body:
+                        h.content = body  # SearchHit.content；display_snippet 会优先用
+                        enriched += 1
+                log_ima.info(
+                    "ai ima fetch_body total=%d enriched=%d elapsed_ms=%.0f",
+                    len(hits), enriched, (time.perf_counter() - fetch_t0) * 1000,
+                )
+            # 可选 LLM rerank：默认关闭（IMA_ILINK_RERANK=0），失败回退原序
+            if (
+                hits
+                and getattr(self._ima.cfg, "rerank_enabled", False)
+                and len(hits) > 1
+            ):
+                try:
+                    rerank_t0 = time.perf_counter()
+                    reranked = _ima_rerank_hits(
+                        message,
+                        hits,
+                        self._base.chat,
+                        top_k=getattr(self._ima.cfg, "rerank_top_k", 3),
+                    )
+                    log_ima.info(
+                        "ai ima rerank before=%d after=%d elapsed_ms=%.0f",
+                        len(hits), len(reranked),
+                        (time.perf_counter() - rerank_t0) * 1000,
+                    )
+                    hits = reranked
+                    hits_count = len(hits)
+                except Exception as exc:  # rerank 异常绝不能让回复失败
+                    log_ima.warning(
+                        "ai ima rerank failed err=%s (continue with original)", exc
+                    )
             if hits:
                 ctx = _ima_build_context(hits)
                 if ctx:
                     prompt = (prompt + "\n\n" + ctx) if prompt else ctx
-                    log_ima.debug("ai ima inject prompt after=%d (added %d)",
-                                  len(prompt), len(ctx))
+                    # 本地 fallback 走 ``llm+local`` 模式以便日志区分；其它
+                    # 走 ``llm+ima``。reason 字段负责更细的语义。
+                    mode = "llm+local" if reason == "local-fallback" else "llm+ima"
+                    if reason != "local-fallback":
+                        reason = "hits-injected"
+                    ctx_chars = len(ctx)
+                    log_ima.debug("ai ima inject prompt after=%d (added %d, mode=%s)",
+                                  len(prompt), ctx_chars, mode)
                 else:
+                    # hits 非空但 ctx 构建为空：理论上是 _ima_build_context 的 bug，
+                    # 降级为 no-match 便于排查
                     log_ima.debug("ai ima inject prompt after=%d (ctx empty)", len(prompt))
             else:
                 log_ima.debug("ai ima inject prompt after=%d (no hits)", len(prompt))
 
+        # 路由决策统一日志：INFO 级别，文件 + 终端同时出现；便于 grep
+        log_ai.info(
+            "ai route mode=%s reason=%s msg_chars=%d hits=%d ctx_chars=%d",
+            mode, reason, len(message or ""), hits_count, ctx_chars,
+        )
+        print(
+            f"[AI 路由] mode={mode} reason={reason} "
+            f"hits={hits_count} ctx_chars={ctx_chars}",
+            flush=True,
+        )
+
+        # mode=llm-only（无任何 KB 资料）时，给 LLM 拼 caveat 让它自我降自信 + 加标记
+        if (
+            mode == "llm-only"
+            and ctx_chars == 0
+            and os.environ.get("CLAWBOT_LLM_CAVEAT", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            prompt = (prompt + "\n\n" + _LLM_ONLY_CAVEAT_PROMPT) if prompt else _LLM_ONLY_CAVEAT_PROMPT
+            log_ai.info("ai route caveat injected (llm-only mode)")
         kwargs["prompt"] = prompt
         return self._base.chat(message, **kwargs)
 
@@ -1863,22 +2208,59 @@ def create_ai_client(raw_cfg: dict):
 
 
 if __name__ == "__main__":
-    # 最早：把日志装好（终端 + logs/clawbot.log 按天滚动，保留 7 天）
+    # 1) 解析 CLI 参数（决定文件命名空间 + 日志路径）
+    parser = argparse.ArgumentParser(
+        prog="bot.py",
+        description="微信 ClawBot (OpenClaw Weixin 2.4.6) 多用户客户端",
+    )
+    parser.add_argument(
+        "--user", default=None,
+        help="多用户模式：传入用户名（仅字母数字_.-）。"
+             "会切换到 config_<user>.json / weixin_state_<user>.json / "
+             "logs/clawbot_<user>.log，并从 /etc/clawbot/<user>.env + "
+             "/etc/clawbot/ima.env 加载凭据。不传则单租户旧行为。",
+    )
+    args = parser.parse_args()
+    paths = _resolve_user_paths(args.user)
+
+    # 2) 重新绑定模块级文件名（state/config I/O 用到的常量）
+    CONFIG_FILE = paths["config_file"]
+    STATE_FILE = paths["state_file"]
+
+    # 3) 加载 env 文件（顺序：用户专属 → ima 共享 → 项目 .env 兜底）
+    if paths["env_files"]:
+        try:
+            from dotenv import load_dotenv as _load_dotenv
+        except ImportError:
+            _load_dotenv = None
+        if _load_dotenv is not None:
+            for _env_path in paths["env_files"]:
+                if _env_path and Path(_env_path).exists():
+                    _load_dotenv(_env_path, override=False)
+
+    # 4) 日志（必须在 print banner 前装好；每个用户独立日志文件）
     from utils.logging_setup import setup_logging
-    setup_logging(level=os.getenv("CLAWBOT_LOG_LEVEL", "INFO"), redactor=_redact_text)
+    setup_logging(
+        level=os.getenv("CLAWBOT_LOG_LEVEL", "INFO"),
+        log_file=paths["log_file"],
+        redactor=_redact_text,
+    )
     print(
         "\n"
         "╔══════════════════════════════════════════════════════════╗\n"
         "║          微信 ClawBot  ·  WeChat iLink Bot               ║\n"
         "║  Copyright (c) 2026 SiverKing. All rights reserved.     ║\n"
         "║  GitHub : https://github.com/SiverKing/weixin-ClawBot-API║\n"
+        f"║  Mode   : {paths['banner_suffix'].ljust(43)}║\n"
         "╚══════════════════════════════════════════════════════════╝"
     )
+    print(f"[config] config_file={CONFIG_FILE} state_file={STATE_FILE} log={paths['log_file']}")
     _raw_cfg = load_or_create_config()
     ai = create_ai_client(_raw_cfg)
     # 用 ima 检索为 AI 回答注入参考资料。未配置凭据时包装层会直通。
+    # env 已在第 3 步加载完，ImaConfig.from_env() 只读 os.environ 不再二次加载。
     try:
-        _ima_client = ImaClient(ImaConfig.from_env())
+        _ima_client = ImaClient(ImaConfig.from_env(env_files=None))
     except Exception as exc:
         print(f"[ima] 初始化失败，回退到无检索模式: {exc}")
         log_ima.warning("ima init failed err=%s; falling back to no-retrieval mode", exc)

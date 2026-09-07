@@ -112,6 +112,7 @@ def setup_logging(
     level: Optional[str] = None,
     *,
     log_dir: Optional[Path] = None,
+    log_file: Optional[Path] = None,
     backups: Optional[int] = None,
     redactor: Optional[Callable[[str], str]] = None,
 ) -> None:
@@ -120,7 +121,10 @@ def setup_logging(
     参数：
       level: 终端级别（DEBUG/INFO/WARNING/ERROR）。默认读
              ``CLAWBOT_LOG_LEVEL`` 环境变量，再退到 ``INFO``。
-      log_dir / backups: 覆盖 ``CLAWBOT_LOG_DIR`` / ``CLAWBOT_LOG_BACKUPS``。
+      log_dir: 日志目录。覆盖 ``CLAWBOT_LOG_DIR``。
+      log_file: 完整日志文件路径，覆盖默认 ``<log_dir>/clawbot.log``。
+                多用户部署时按用户名分文件（如 ``logs/clawbot_alice.log``）。
+      backups: 覆盖 ``CLAWBOT_LOG_BACKUPS``。
       redactor: 可选回调，对每条日志消息兜底脱敏。bot.py 注入
              ``bot._redact_text``。
     """
@@ -137,7 +141,7 @@ def setup_logging(
     backups = backups if backups is not None else int(
         os.getenv("CLAWBOT_LOG_BACKUPS", str(DEFAULT_BACKUPS))
     )
-    log_file = log_dir / DEFAULT_LOG_FILE.name
+    log_file = log_file or (log_dir / DEFAULT_LOG_FILE.name)
 
     console = _build_console_handler(lvl)
     console.addFilter(RedactFilter(redactor))

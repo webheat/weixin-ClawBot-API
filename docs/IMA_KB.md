@@ -90,7 +90,7 @@ embedding 检索。** 用户拿自然语言问问题，命中率会非常低。
 - 让 LLM 在拿到 `search_knowledge` 的结果后，**只用**匹配到的标题/片段
   作为线索；当 0 命中时回退到纯 LLM 回答（当前 `_AIWithIma` 默认行为）
 - 上传 KB 内容时尽量用 Q&A 短句而不是长文（便于切出可命中的关键词）
-- 长期方案：等腾讯支持向量检索，或自建一层 embedding + rerank
+- 长期方案：等腾讯支持向量检索，或自建 embedding 层（**rerank 已经内置，见 §11**，一般够用）
 
 ## 5. ⚠️ 关键坑 2：`search_knowledge` **不返回文档正文**
 
@@ -190,3 +190,27 @@ You MUST correct the value before retrying. Do not retry with the same value.
   TTL 缓存（同一 `from_id + 相同 query 字符串 → 5s 复用）
 - [ ] 如果腾讯后续支持向量检索，强烈建议把 `build_context_prompt` 的
   数据源从 `search_knowledge` 切到那个新端点，并加 rerank
+
+## 11. ⚙️ 可选 LLM Rerank（默认关闭）
+
+ima `search_knowledge` 是关键词匹配（§4），噪声偏多。客户端不改语义层，
+复用**同一个 LLM** 当 reranker，对 hits 重排过滤：
+
+| `.env` 变量 | 默认 | 说明 |
+|---|---|---|
+| `IMA_ILINK_RERANK` | `0` | `1` / `true` / `yes` / `on` 任意一个开启 |
+| `IMA_ILINK_RERANK_TOP_K` | `3` | 解析出编号后保留的目标条数（**当前实现不裁剪，只重排**，字段预留便于未来裁剪） |
+
+行为契约（任何异常路径都**回退原序，绝不让回复失败**）：
+
+- `hits <= 1` → no-op（不调 LLM）
+- LLM 调用超时 / 鉴权失败 / 网络抖动 → 用原 `hits` 顺序
+- LLM 返回空 / 不可解析 → 用原 `hits` 顺序
+- 解析出部分编号 → 用解析出的顺序 + 原序剩余补齐
+
+成本：每次开启后**多 1 次 LLM HTTP 调用**，延迟 + 几百~2k token。
+实现细节见 `ima.py::rerank_hits` / `bot.py::_AIWithIma.chat`。
+
+日志：`ai ima rerank before=N after=M elapsed_ms=...`（INFO）。
+DEBUG 可看 `ima rerank prompt_chars=...` 和 `raw_response=...`。
+

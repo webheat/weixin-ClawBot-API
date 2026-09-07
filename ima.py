@@ -55,16 +55,26 @@ class ImaConfig:
     default_knowledge_base_id: str = ""
     timeout: float = 15.0
     search_limit: int = 5
+    rerank_enabled: bool = False  # IMA_ILINK_RERANK=1/true/yes/on 开启
+    rerank_top_k: int = 3  # rerank 后保留的命中条数（1~search_limit）
+    fetch_body: bool = False  # IMA_ILINK_FETCH_BODY=1 开启：search 后再调 get_doc_content 拿正文
+    keyword_extract: bool = False  # IMA_ILINK_KEYWORD_EXTRACT=1 开启：search 前用 LLM 抽取 1-3 个关键词
 
     @classmethod
-    def from_env(cls, env_file: Optional[str] = ".env") -> "ImaConfig":
-        """Build config from ``.env`` + ``os.environ``.
+    def from_env(cls, env_files: Optional[Iterable[str]] = None) -> "ImaConfig":
+        """Build config from a list of ``.env`` files + ``os.environ``.
 
-        ``.env`` is loaded with ``override=False`` so real environment wins,
-        matching the Go project's "env > YAML > defaults" precedence.
+        ``env_files`` are loaded with ``override=False`` in order — real env
+        and earlier-loaded files win. Pass an explicit list to control
+        per-user fallback (e.g. ``["/etc/clawbot/alice.env",
+        "/etc/clawbot/ima.env"]``). ``None`` (default) skips file loading and
+        reads only ``os.environ``; ``bot.py`` orchestrates file loading before
+        calling this.
         """
-        if load_dotenv is not None and env_file and Path(env_file).exists():
-            load_dotenv(env_file, override=False)
+        if load_dotenv is not None and env_files:
+            for path in env_files:
+                if path and Path(path).exists():
+                    load_dotenv(path, override=False)
 
         def _f(name: str, default: str) -> str:
             v = os.environ.get(name)
@@ -82,6 +92,23 @@ class ImaConfig:
         except ValueError:
             search_limit = 5
 
+        rerank_raw = os.environ.get("IMA_ILINK_RERANK", "")
+        rerank_enabled = rerank_raw.strip().lower() in ("1", "true", "yes", "on")
+
+        top_k_raw = os.environ.get("IMA_ILINK_RERANK_TOP_K", "")
+        try:
+            rerank_top_k = int(top_k_raw) if top_k_raw else 3
+        except ValueError:
+            rerank_top_k = 3
+        # 至少 1，至少不超过 search_limit
+        rerank_top_k = max(1, min(rerank_top_k, search_limit))
+
+        fetch_body_raw = os.environ.get("IMA_ILINK_FETCH_BODY", "")
+        fetch_body = fetch_body_raw.strip().lower() in ("1", "true", "yes", "on")
+
+        keyword_extract_raw = os.environ.get("IMA_ILINK_KEYWORD_EXTRACT", "")
+        keyword_extract = keyword_extract_raw.strip().lower() in ("1", "true", "yes", "on")
+
         return cls(
             base_url=_f("IMA_ILINK_BASE_URL", "https://ima.qq.com").rstrip("/"),
             client_id=_f("IMA_ILINK_CLIENT_ID", ""),
@@ -89,6 +116,10 @@ class ImaConfig:
             default_knowledge_base_id=_f("IMA_ILINK_DEFAULT_KB", ""),
             timeout=timeout,
             search_limit=search_limit,
+            rerank_enabled=rerank_enabled,
+            rerank_top_k=rerank_top_k,
+            fetch_body=fetch_body,
+            keyword_extract=keyword_extract,
         )
 
 
@@ -254,10 +285,23 @@ class ImaClient:
     PATH_SEARCH_KNOWLEDGE = "openapi/wiki/v1/search_knowledge"
     PATH_CREATE_KNOWLEDGE_BASE = "openapi/wiki/v1/create_knowledge_base"
     PATH_CREATE_FOLDER = "openapi/wiki/v1/create_folder"
+    PATH_ADD_KNOWLEDGE = "openapi/wiki/v1/add_knowledge"
     PATH_ADDABLE_KNOWLEDGE_BASE_LIST = (
         "openapi/wiki/v1/get_addable_knowledge_base_list"
     )
-    PATH_IMPORT_DOC = "ima.openapi.v1.ImportDoc"
+    # 注意：旧的 `ima.openapi.v1.ImportDoc` 是 gRPC 风格 full method name，
+    # REST 实际路径在 note 服务前缀下。响应字段是 ``note_id``（不是 media_id）。
+    PATH_IMPORT_DOC = "openapi/note/v1/import_doc"
+    # 取 note 正文（search_knowledge 不返回 body；docs §5 的坑可由此端点绕过）
+    PATH_GET_DOC_CONTENT = "openapi/note/v1/get_doc_content"
+
+    # KB 类型枚举（接受字符串别名或整型值，两种形式都通过 live 验证）
+    KB_TYPE_MINE = "KBT_MINE_KB"      # 1001：个人知识库（仅创建者可见/可写）
+    KB_TYPE_SHARED = "KBT_SHARED_KB"  # 1002：共享知识库（团队协作）
+    KB_TYPE_SUBSCRIBED = "KBT_SUBSCRIBED_CREATE_KB"  # 1004：订阅型（需开通知识号）
+    KB_TYPE_INT_MINE = 1001
+    KB_TYPE_INT_SHARED = 1002
+    KB_TYPE_INT_SUBSCRIBED = 1004
 
     # 5 retries, sleeps [2,4,8,16,32]s — same ladder as deepseek.py / dusapi.py.
     _RETRY_DELAYS = (2, 4, 8, 16, 32)
@@ -284,11 +328,21 @@ class ImaClient:
 
         Returns parsed JSON dict (empty dict on non-JSON 2xx — tolerated).
         Raises :class:`ImaError` after exhausting retries.
+
+        注意：body 显式以 UTF-8 字节串发送，并带 ``charset=utf-8``。
+        之前用 ``data=json.dumps(..., ensure_ascii=False)``（Unicode str）
+        在 content 含 ``？``/``：`` 等全角标点时，ima 服务端 Go decoder
+        会返回 ``service codec Unmarshal: unexpected EOF``（实测确认）。
+        显式 UTF-8 字节 + charset 头可绕开这个隐性兼容性问题。
         """
         url = f"{self.cfg.base_url}/{endpoint.lstrip('/')}"
+        # 显式 UTF-8 字节；ensure_ascii=False 保留原文便于服务端检索
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         last_exc: Optional[BaseException] = None
         attempts = (0,) + self._RETRY_DELAYS  # attempt 1 has no sleep
         total_t0 = time.perf_counter()
+        # 显式 charset，避免某些网关在 str body 时猜错编码
+        headers = {"Content-Type": "application/json; charset=utf-8"}
         for attempt_idx, delay in enumerate(attempts):
             if delay:
                 time.sleep(delay)
@@ -297,7 +351,8 @@ class ImaClient:
             try:
                 resp = self._session.post(
                     url,
-                    data=json.dumps(payload, ensure_ascii=False),
+                    data=body_bytes,
+                    headers=headers,
                     timeout=self.cfg.timeout,
                 )
             except Exception as exc:  # network / DNS / TLS / timeout
@@ -495,16 +550,31 @@ class ImaClient:
         self,
         name: str,
         description: str = "",
-        type_: int = 0,
+        type_: object = 0,
     ) -> tuple[str, str]:
+        """创建一个知识库。
+
+        ``type_`` 接受：
+          - ``ImaClient.KB_TYPE_MINE`` / ``KB_TYPE_SHARED`` / ``KB_TYPE_SUBSCRIBED``（字符串）
+          - 整型 1001 / 1002 / 1004（与字符串别名等价）
+          - ``0`` 或省略 → 默认 ``KB_TYPE_SHARED``（1002），跟旧实现保持兼容
+          - 单独的 ``1`` / ``2`` 这种短整型已被服务端拒绝（实测 code=51）
+
+        Returns ``(id, name)``。
+        """
         if not self.configured():
             raise ImaError("client_id / api_key 未配置")
+        # 默认：共享知识库（与旧实现一致，避免破坏现有调用）
+        if type_ in (0, "", None):
+            resolved_type = self.KB_TYPE_SHARED
+        else:
+            resolved_type = type_
         data = self._post(
             self.PATH_CREATE_KNOWLEDGE_BASE,
             {
                 "name": name,
                 "description": description,
-                "type": type_ if type_ > 0 else 1002,  # default shared
+                "type": resolved_type,
             },
         )
         return data.get("id", ""), data.get("name", "")
@@ -531,7 +601,15 @@ class ImaClient:
         )
         return data.get("media_id", "")
 
-    def import_doc(self, title: str, content: str, content_format: int = 0) -> str:
+    def import_doc(self, title: str, content: str, content_format: int = 1) -> str:
+        """在 note 服务下创建一条 Markdown 笔记。
+
+        Returns the new ``note_id``. 注意：响应字段是 ``note_id``，
+        不是 ``media_id``（旧实现里的字段名错位）。
+
+        要把这条笔记接入 ``search_knowledge`` 检索范围，需再调用
+        :meth:`add_knowledge` 并带 ``media_type=11`` + ``note_info.content_id``。
+        """
         if not self.configured():
             raise ImaError("client_id / api_key 未配置")
         if not title:
@@ -544,7 +622,69 @@ class ImaClient:
                 "content_format": content_format if content_format > 0 else 1,
             },
         )
-        return data.get("media_id", "")
+        return data.get("note_id") or data.get("media_id") or ""
+
+    def add_knowledge(
+        self,
+        knowledge_base_id: str,
+        title: str,
+        *,
+        note_id: str = "",
+        media_id: str = "",
+        media_type: int = 11,
+        folder_id: str = "",
+    ) -> str:
+        """把 note / 文件挂载到指定知识库，使其能被 ``search_knowledge`` 搜到。
+
+        两种来源：
+          - note 笔记：``media_type=11``（Note），传 ``note_id``，落到 ``note_info.content_id``
+          - 文件：``media_id`` 来自 :meth:`create_media`（COS 上传凭证），``media_type`` 按真实类型
+
+        Returns ``media_id`` from response (use this to verify linkage).
+        """
+        if not self.configured():
+            raise ImaError("client_id / api_key 未配置")
+        if not knowledge_base_id:
+            raise ImaError("add_knowledge: knowledge_base_id 不能为空")
+        if not title:
+            raise ImaError("add_knowledge: title 不能为空")
+        payload: dict = {
+            "knowledge_base_id": knowledge_base_id,
+            "media_type": media_type,
+            "title": title,
+            "folder_id": folder_id,
+        }
+        if note_id:
+            payload["note_info"] = {"content_id": note_id}
+        if media_id:
+            payload["media_id"] = media_id
+        data = self._post(self.PATH_ADD_KNOWLEDGE, payload)
+        return data.get("media_id") or data.get("id") or ""
+
+    def get_doc_content(self, note_id: str) -> str:
+        """拿一条 note 的正文 Markdown。
+
+        这是 docs/IMA_KB.md §5 关键坑 2 的补丁：``search_knowledge`` 不返回正文
+        （``content``/``snippet`` 字段都空，``highlight_content`` 对 ``media_type=11``
+        也常空）。要拿到完整文档内容，必须再调一次本端点。
+
+        ⚠️ 实测权限语义：只有"作者本人"能拿到正文（用 ``doc_id`` 替代 ``note_id``
+        会得到 ``code=210005 GetNoteContent not author``），所以本端点只对
+        ``import_doc`` 出来的、当前凭据创建者拥有的 note 有效。
+
+        Returns raw content string (Markdown；换行已被服务端规范化)。
+        Returns ``""`` on any failure（与 read 类方法一致，软降级）。
+        """
+        if not self.configured():
+            return ""
+        if not note_id:
+            return ""
+        try:
+            data = self._post(self.PATH_GET_DOC_CONTENT, {"note_id": note_id})
+        except ImaError as exc:
+            log(f"get_doc_content[{note_id}] 失败: {exc}", "WARN")
+            return ""
+        return data.get("content") or data.get("markdown") or ""
 
 
 # ---------------------------------------------------------------------------
@@ -583,3 +723,105 @@ def build_context_prompt(
     log_ima.debug("ima build_context hits=%d prompt_chars=%d",
                   len(parts), len(result))
     return result
+
+
+# ---------------------------------------------------------------------------
+# High-level helper: optional LLM rerank
+# ---------------------------------------------------------------------------
+
+
+_RERANK_PROMPT_HEADER = (
+    "你是一个相关性排序助手。用户问题：\n{query}\n\n"
+    "以下候选文档片段按与问题的相关度从高到低排序。"
+    "请按顺序输出候选编号，每行一个编号，只输出编号，不要任何解释。\n\n"
+    "候选：\n"
+)
+
+
+def _format_rerank_candidate(idx: int, hit: "SearchHit") -> str:
+    """One candidate block: ``[N] <title>\\n<snippet>`` (snippet truncated)."""
+    snippet = (hit.display_snippet or "").strip().replace("\n", " ")
+    if len(snippet) > 240:
+        snippet = snippet[:240] + "…"
+    return f"[{idx}] {hit.title}\n{snippet}\n"
+
+
+def _parse_rerank_response(
+    resp: str, hits: list["SearchHit"], top_k: int
+) -> list["SearchHit"]:
+    """Parse ``"3\\n1\\n2\\n"`` style response into reordered hits.
+
+    Dedupes, drops out-of-range / non-integer tokens, preserves LLM-given
+    order. If fewer than ``top_k`` valid IDs come back, pads with the
+    remaining hits in their original order so the caller always gets
+    ``len(hits)`` items back (rerank filters nothing, only reorders).
+    """
+    if not resp:
+        return hits
+    int_re = re.compile(r"-?\d+")
+    seen: set[int] = set()
+    ordered_ids: list[int] = []
+    for line in resp.splitlines():
+        m = int_re.search(line)
+        if not m:
+            continue
+        try:
+            n = int(m.group(0))
+        except ValueError:
+            continue
+        # 1-based → 0-based；范围 [0, len(hits))
+        if 1 <= n <= len(hits) and n not in seen:
+            seen.add(n)
+            ordered_ids.append(n - 1)
+            if len(ordered_ids) >= top_k:
+                break
+    if not ordered_ids:
+        return hits
+    used_0idx = {i for i in ordered_ids}
+    reranked = [hits[i] for i in ordered_ids]
+    # 不足 top_k 时用原序剩余的补齐（rerank 不裁剪，只重排）
+    for i, h in enumerate(hits):
+        if i in used_0idx:
+            continue
+        reranked.append(h)
+        if len(reranked) >= len(hits):
+            break
+    return reranked
+
+
+def rerank_hits(
+    query: str,
+    hits: list["SearchHit"],
+    chat_fn,
+    top_k: int = 3,
+) -> list["SearchHit"]:
+    """Optional LLM-based rerank over ``hits`` (same LLM as the chat one).
+
+    Contract:
+      - ``len(hits) <= 1`` → return ``hits`` unchanged (no-op, no log).
+      - Any failure path (LLM error, parse error, empty/garbled response)
+        returns ``hits`` in original order. Never raises.
+      - Result keeps ``len(hits)`` items: rerank only reorders, never drops.
+    """
+    if not query or len(hits) <= 1:
+        return list(hits)
+    # top_k 是解析阶段的目标保留条数；rerank 本身不裁剪（contract 保持 len(hits)），
+    # 所以这里不短路 top_k == len(hits) 的情形——那仍然有意义（重排）
+
+    candidates = "".join(
+        _format_rerank_candidate(i + 1, h) for i, h in enumerate(hits)
+    )
+    prompt = _RERANK_PROMPT_HEADER.format(query=query.strip()[:500]) + candidates
+    log_ima.debug("ima rerank prompt_chars=%d hits=%d", len(prompt), len(hits))
+
+    try:
+        raw = chat_fn(message="", prompt=prompt) or ""
+    except Exception as exc:  # LLM 网络/超时/鉴权等，绝不能让回复失败
+        log_ima.warning("ima rerank chat_fn failed err=%s (fallback to original)", exc)
+        return list(hits)
+
+    log_ima.debug("ima rerank raw_response=%r", raw[:200])
+    # 解析阶段用 top_k 控制截断；这里用 max(1, ...) 防 top_k<=0 退化
+    eff_top_k = max(1, top_k)
+    reranked = _parse_rerank_response(raw, list(hits), eff_top_k)
+    return reranked
