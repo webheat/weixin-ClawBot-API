@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Python 3.12+ client that speaks Tencent's [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin) iLink 2.4.6 HTTP protocol to log in to a personal WeChat account via QR code, long-poll `getupdates` for incoming text messages, and route them through an AI provider (DusAPI / DeepSeek) with optional Tencent ima knowledge-base RAG context. Protocol details and version diffs live in `weixin-openclaw-api-py-docs.md` (51 KB reference).
 
+## Current state (read first)
+
+- **Active priorities** — see `TODO.md`. Current P0 is **per-user conversation history** (bot currently sees only the last message).
+- **Recent big change (2026-09-07)** — full IMA pipeline rewrite + 150 Q&A ingested into a fresh KB. Full timeline, decisions, and sharp edges are in `docs/SESSION_2026-09-07_ima_pipeline.md`. The four new IMA knobs (`IMA_ILINK_KEYWORD_EXTRACT` / `IMA_ILINK_FETCH_BODY` / local fallback / `llm_caveat`) all live in `ima.py` and are routed via `_AIWithIma.chat`'s 3-state machine — read that section before changing AI routing.
+- **Fast Q&A lookup** — `docs/knowledge/` holds ~30 short notes indexed `qa-NNN-<topic>` (ima search keywords, context_token, X-WECHAT-UIN, ret=-14, etc.). Grep by topic when you hit an unfamiliar failure mode before reading the full 51 KB protocol reference.
+
 ## Common commands
 
 All commands assume the project root; the venv is `venv/`.
@@ -54,7 +60,31 @@ Top-to-bottom responsibilities:
 Same shape: `@dataclass *Config` + `*API` class with `chat(message, model=None, stream=False, prompt=None, history=None)`. Both are **synchronous `requests`**, 5 retries with `[2, 4, 8, 16, 32]`s backoff. DusAPI uses Anthropic `/v1/messages` format (model name decides parser: `claude` vs `gpt`). DeepSeek uses OpenAI `/chat/completions`; for `deepseek-v4-flash` it sets `thinking: {type: disabled}`. Both cap `max_tokens=1024`.
 
 ### 3. `ima.py` — Tencent ima Knowledge Base OpenAPI client
-Sync `requests` wrapper, mirrors `dusapi.py`/`deepseek.py`. **First `.env` consumer** in the project: `ImaConfig.from_env()` calls `python-dotenv` with `override=False`. Missing creds → `configured()` returns False → caller passes through silently. Search is keyword-match (not embedding); see `docs/IMA_KB.md` §4–§5 for sharp edges. Optional rerank via `IMA_ILINK_RERANK=1` calls back into the base AI to re-score hits.
+Sync `requests` wrapper, mirrors `dusapi.py`/`deepseek.py`. **First `.env` consumer** in the project: `ImaConfig.from_env()` calls `python-dotenv` with `override=False`. Missing creds → `configured()` returns False → caller passes through silently. Search is keyword-match (not embedding); see `docs/IMA_KB.md` §4–§5 for sharp edges.
+
+**Five runtime knobs (env-driven)**; defaults match what production runs today — change only with care:
+- `IMA_ILINK_RERANK` (default `0`) — call back into base AI to re-score hits after search.
+- `IMA_ILINK_RERANK_TOP_K` (default `3`) — how many reranked hits to keep.
+- `IMA_ILINK_FETCH_BODY` (default `0`) — after search, hit `get_doc_content` per hit to fill in missing bodies (works around `highlight_content` being empty; +1–3 s).
+- `IMA_ILINK_KEYWORD_EXTRACT` (default `0`) — pre-search LLM call extracts 1–3 keywords so natural-language questions like "IMA是什么？" can hit the KB.
+- `IMA_ILINK_LOCAL_FALLBACK` — when IMA returns 0 hits, transparently try `utils/local_kb.py` (offline KB shipped with the project) before falling back to plain LLM. Set `llm_caveat` mode to make the LLM advertise when it's answering without KB context.
+
+`_AIWithIma.chat` is a 3-state machine (`ima` / `local` / `llm_only`) and logs `mode=` / `reason=` / `hits=` / `ctx_chars=` on every call — that line in `logs/clawbot.log` is the canonical answer to "did the KB fire?".
+
+#### Picking the KB: IMA vs `docs/knowledge/*.md` (Obsidian-style) vs plain LLM
+
+Two knowledge-base code paths already exist; Obsidian.app itself is **not** wired in (only listed as future work in `docs/SESSION_2026-09-07_ima_pipeline.md:236`). The 197 markdown files in `docs/knowledge/` follow the Obsidian-vault convention (frontmatter + directory layout), and `LocalKBIndex` reads them directly with no extra process.
+
+| If you need… | Use | Why |
+|---|---|---|
+| Production, multi-user, official content with editing workflow | **IMA** | Service-side KB, indexing delayed 5–15 min, supports `KEYWORD_EXTRACT` + `FETCH_BODY` + `RERANK`. Per-user creds via `/etc/clawbot/<user>.env`. |
+| Offline / no `ima.qq.com` egress / privacy-sensitive | **Local KB only** | Set `CLAWBOT_LOCAL_FALLBACK=1` and clear all `IMA_ILINK_*` to force `mode=llm+local`. |
+| Already have an Obsidian vault you want to reuse as a KB | **Local KB pointed at vault** | `CLAWBOT_LOCAL_KB_DIR=/path/to/ob-vault` — `LocalKBIndex.rglob("*.md")` + mtime auto-rebuild; frontmatter stripped to avoid `tags:` false hits (`local_kb.py:29-40`). |
+| Want the LLM to **know** it's answering without KB | Plain LLM | Leave IMA creds empty → `mode=llm-only reason=ima-not-configured`; `_LLM_ONLY_CAVEAT_PROMPT` (`bot.py:64`) injects "（未参考知识库）" caveat. |
+| New content not yet indexed by IMA (the 5–15 min lag) | **Both on** | Default config: IMA first, local fallback when IMA hits=0. `mode=llm+ima` vs `mode=llm+local reason=local-fallback` shows the transition in `logs/clawbot.log`. |
+| Debugging baseline LLM with no KB interference | Plain LLM | Same as above; fastest way to isolate the model's own answer. |
+
+Hard limits to know before choosing: **both KBs are substring keyword match — neither does embedding search** (LocalKBIndex by design: `local_kb.py:1-14`; IMA OpenAPI surface area also lacks the semantic path). If you need true semantic retrieval, that's a new dependency, not a config change.
 
 ### 4. `qr_web.py` — embedded aiohttp web login UI (per-user backend)
 Standalone aiohttp app bound to a per-user port (env `CLAWBOT_WEB_{ENABLED,TOKEN,HOST,PORT}`). Exposes: QR PNG, login state machine (`idle / qr_pending / scanned / logged_in / error`), and a verify-code POST endpoint. `QrFlowState` is the single source of truth — `bot.py` writes via `make_web_on_qrcode`, handlers read. Port collision → logs warning, returns, does not block the bot loop. `wait_for_verify_code` is shared between web and `stdin _safe_input` so the same code path works in TTY and daemon.
@@ -62,11 +92,15 @@ Standalone aiohttp app bound to a per-user port (env `CLAWBOT_WEB_{ENABLED,TOKEN
 ### 5. `qr_portal.py` — single-entry multi-user portal (`:18300`)
 aiohttp multiplexer that reads `/etc/clawbot/*.env` to enumerate users. `GET /` shows picker if no cookie, otherwise proxies to the selected user's `qr_web.py`. `GET /select?name=<user>` sets 30-day `clawbot_user` cookie; `GET /switch` clears it. HTML responses get an injected "切换用户" bar (z-index:99999, top-right) so users can return to the picker from any proxied backend page. Non-HTML responses stream through. Auth is handled by injecting `Authorization: Bearer <user.CLAWBOT_WEB_TOKEN>` from each user's env file — qr_web's `_check_bearer` validates it.
 
-### 6. `utils/logging_setup.py` — single log init
-`setup_logging()` is called once at `__main__` entry. Idempotent. Console respects `CLAWBOT_LOG_LEVEL`, file always DEBUG, rotates at midnight local time, keeps 7 backups. Sub-loggers use `get_logger("qr")` → `clawbot.qr`. `RedactFilter` takes the `_redact_text` callback and is wired onto both handlers.
+### 6. `utils/` — diagnostics, KB tools, logging
 
-### 7. `utils/list_ima_kb.py` — diagnostic CLI
-Lists ima knowledge bases for the configured account; `--pick <substr>` fuzzy-matches and prints the env line; `--update` rewrites `.env` in place. Useful when `IMA_ILINK_DEFAULT_KB` needs to change.
+All five utilities are runnable as `python utils/<name>.py` from the project root.
+
+- **`logging_setup.py`** — `setup_logging()` is called once at `__main__` entry. Idempotent. Console respects `CLAWBOT_LOG_LEVEL`, file always DEBUG, rotates at midnight local time, keeps 7 backups. Sub-loggers use `get_logger("qr")` → `clawbot.qr`. `RedactFilter` takes the `_redact_text` callback and is wired onto both handlers.
+- **`list_ima_kb.py`** — diagnostic CLI. Lists ima knowledge bases for the configured account; `--pick <substr>` fuzzy-matches and prints the env line; `--update` rewrites `.env` in place. Useful when `IMA_ILINK_DEFAULT_KB` needs to change.
+- **`local_kb.py`** — offline fallback KB (JSON-serialised Q&A pairs) consulted when IMA returns 0 hits and `IMA_ILINK_LOCAL_FALLBACK` is on. Format is the same one `import_business_lang.py` writes — keep them in sync.
+- **`seed_ima_kb.py`** — bulk-ingest a directory of markdown / text into a target ima KB using `ImaClient.import_doc`. Used for the 150 Q&A bootstrap on 2026-09-07.
+- **`import_business_lang.py`** — convenience importer that normalises a 客服话术 corpus into the local KB + ima KB shape (covers chunking, dedupe, keyword tagging). Run before `seed_ima_kb.py` if the corpus is in the raw 话术 / transcript form.
 
 ## State, config, and secrets layout
 
@@ -141,6 +175,8 @@ User-facing output (banners, menu, command echo) stays on `print` — don't move
 - `docs/IMA_KB.md` — ima integration sharp edges (keyword-match vs semantic, no body return, rerank behavior) + `list_ima_kb.py` usage.
 - `docs/multi-user.md` — single-tenant limits, scenario A vs B, comparison with XTmai reference impl, recommended fixes (#2 broadcast, #3 gather, #4 retry) ranked by ROI.
 - `docs/PORTABLE.md` — PyInstaller `--onedir` build steps, USB layout, `noexec` mount workaround.
+- `docs/SESSION_2026-09-07_ima_pipeline.md` — chronological record of the IMA rewrite + 4 new knobs + KB bootstrap. **Read this before touching `_AIWithIma.chat`** — it documents the 3-state machine (`ima` / `local` / `llm_only`) and the reasons each knob exists.
+- `docs/knowledge/` — ~30 short topic notes (`qa-NNN-<area>-<topic>.md`). First place to grep when debugging an unfamiliar failure mode (e.g. `grep -l "context_token" docs/knowledge/`).
 - `TODO.md` — current priorities (per-user history is P0; reconnect broadcast / message-loop gather are P1; tracked with `bot.py:line` refs).
 - `weixin-openclaw-api-py-docs.md` — full 2.4.6 protocol reference; consult before changing header shape, request body schema, or response parsing.
 - `weixin-clawbot.spec` — PyInstaller recipe; regenerate via `pyi-makespec` whenever `requirements.txt` or top-level imports change.
