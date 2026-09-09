@@ -11,6 +11,10 @@ weixin_state.json
 config_*.json
 weixin_state_*.json
 
+# Runtime state files (含真实 openid / bot 启动信息)，不入库
+var/
+!var/.gitkeep
+
 # Python
 __pycache__/
 *.py[cod]

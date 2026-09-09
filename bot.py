@@ -491,9 +491,9 @@ def _redact_text(value):
     else:
         text = str(value or "")
     patterns = (
-        r"(?i)(bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)=([^&\s,}\"]+)",
-        r'(?i)("(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)"\s*:\s*")([^"]+)(")',
-        r"(?i)('(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)'\s*:\s*')([^']+)(')",
+        r"(?i)(bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param|appsecret|wxoapp_app_secret|access_token|refresh_token|oauth_code)=([^&\s,}\"]+)",
+        r'(?i)("(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param|appsecret|wxoapp_app_secret|access_token|refresh_token|oauth_code)"\s*:\s*")([^"]+)(")',
+        r"(?i)('(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param|appsecret|wxoapp_app_secret|access_token|refresh_token|oauth_code)'\s*:\s*')([^']+)(')",
         r'(?i)("local_token_list"\s*:\s*)\[[^\]]*\]',
     )
     for index, pattern in enumerate(patterns):
