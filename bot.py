@@ -23,6 +23,11 @@ from qr_web import QrFlowState, make_web_on_qrcode, wait_for_verify_code, web_en
 from utils.local_kb import LocalKBIndex
 from utils.logging_setup import get_logger
 
+try:
+    from utils.semantic_kb import SemanticKBIndex  # 4 档 mode: llm+semantic
+except Exception:  # fastembed 缺失不致命；只在 SEMANTIC_KB_ENABLED=1 时才用
+    SemanticKBIndex = None  # type: ignore[assignment]
+
 # 关键词抽取 prompt：用于 _AIWithIma._extract_keywords，从自然语言问句里
 # 拆出 1-3 个最适合 IMA 搜索的关键词。
 #
@@ -109,6 +114,7 @@ BOT_AGENT_MAX_LEN = 256
 # ========== 多用户路径解析（--user） ==========
 USER_ENV_DIR = "/etc/clawbot"
 SHARED_IMA_ENV = f"{USER_ENV_DIR}/ima.env"
+SHARED_LLM_ENV = f"{USER_ENV_DIR}/llm.env"  # 共享 LLM 兜底（覆盖 config_<user>.json）
 LEGACY_PROJECT_ENV = ".env"
 
 
@@ -141,6 +147,7 @@ def _resolve_user_paths(user: Optional[str]) -> dict:
         "env_files": [
             f"{USER_ENV_DIR}/{safe}.env",   # 用户专属（不存在时静默跳过）
             SHARED_IMA_ENV,                 # 共享 ima 兜底
+            SHARED_LLM_ENV,                 # 共享 LLM 兜底（最低优先级）
         ],
         "banner_suffix": f"user={safe}",
     }
@@ -1905,6 +1912,11 @@ class _AIWithIma:
         # 本地 Markdown KB 兜底索引（lazy：只有命中 IMA 0 条时才会建索引）
         self._local_kb: Optional[LocalKBIndex] = None
         self._local_kb_attempted = False
+        # 语义检索 KB 兜底索引（lazy：IMA + local 都 0 命中才触发）
+        # 需 fastembed + 模型下载；首次 search 会触发重建（30~60s 阻塞），
+        # 日志走 ``clawbot.semantic``，warn 级排查。
+        self._semantic_kb = None
+        self._semantic_kb_attempted = False
 
     def _maybe_local_kb(self) -> Optional[LocalKBIndex]:
         """lazy 构造本地 KB 索引，仅在开关开启时。"""
@@ -1922,6 +1934,39 @@ class _AIWithIma:
             log_ai.warning("ai local_kb init failed dir=%s err=%s", kb_dir, exc)
             self._local_kb = None
         return self._local_kb
+
+    def _maybe_semantic_kb(self):
+        """lazy 构造语义检索索引。仅在 ``SEMANTIC_KB_ENABLED=1`` 时有效。
+
+        失败（fastembed 未装 / 模型下不下来 / 路径错）一律静默降级返回 ``None``，
+        让上层走纯 LLM。索引路径默认 ``docs/knowledge/``，落库到
+        ``docs/.semantic_kb.sqlite3``（已 gitignore）。
+        """
+        if self._semantic_kb_attempted:
+            return self._semantic_kb
+        self._semantic_kb_attempted = True
+        if SemanticKBIndex is None:
+            log_ai.info(
+                "ai semantic_kb unavailable: utils.semantic_kb.SemanticKBIndex "
+                "import failed (fastembed 缺失？)。开 SEMANTIC_KB_ENABLED 前 "
+                "先 pip install fastembed"
+            )
+            return None
+        if os.environ.get("SEMANTIC_KB_ENABLED", "").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return None
+        kb_dir = os.environ.get("SEMANTIC_KB_DIR", "docs/knowledge")
+        try:
+            min_score_raw = os.environ.get("SEMANTIC_KB_MIN_SCORE", "").strip()
+            min_score = float(min_score_raw) if min_score_raw else 0.0
+            self._semantic_kb = SemanticKBIndex(
+                kb_dir, min_score=min_score,
+            )
+        except Exception as exc:  # 路径/权限/模型下载异常不能让回复失败
+            log_ai.warning("ai semantic_kb init failed dir=%s err=%s", kb_dir, exc)
+            self._semantic_kb = None
+        return self._semantic_kb
 
     def _extract_keywords(self, message: str) -> list[str]:
         """用底层 LLM 从自然语言问句里抽 1-3 个最适合 IMA 搜索的关键词。
@@ -2001,11 +2046,15 @@ class _AIWithIma:
         为空，等价于直通到底层 ``_base``。
 
         调试阶段新增路由日志（INFO 级别，终端 + ``logs/clawbot*.log`` 同时输出），
-        三种语义明确区分：
-          ``mode=llm-only reason=ima-not-configured``  IMA 未配置（缺凭据），纯 LLM
-          ``mode=llm-only reason=ima-search-failed``   IMA 检索异常（warn 已记录详情）
-          ``mode=llm-only reason=ima-no-match``        IMA 检索成功但 0 条 / ctx 为空
-          ``mode=llm+ima  reason=hits-injected``        已拼接参考资料注入 prompt
+        四档 mode + reason 精确表达决策路径：
+          ``mode=llm-only     reason=ima-not-configured``   IMA 未配置（缺凭据），纯 LLM
+          ``mode=llm-only     reason=ima-search-failed``    IMA 检索异常（warn 已记录详情）
+          ``mode=llm-only     reason=ima-no-match``         IMA 检索成功但 0 条 / ctx 为空
+          ``mode=llm+ima      reason=hits-injected``        IMA 命中并注入 prompt
+          ``mode=llm+local    reason=local-fallback``       IMA 0 命中，local KB BM25 兜底
+                                                            （CLAWBOT_LOCAL_FALLBACK=1）
+          ``mode=llm+semantic reason=semantic-fallback``    IMA 0 + local 0，语义检索兜底
+                                                            （SEMANTIC_KB_ENABLED=1）
         一行 ``[AI 路由] mode=...`` 同步打到终端，方便肉眼确认本次回答走了哪条路径。
         """
         prompt = kwargs.pop("prompt", None)
@@ -2088,6 +2137,44 @@ class _AIWithIma:
                             (time.perf_counter() - local_t0) * 1000,
                         )
 
+            # IMA 0 + local KB 0 → 语义检索兜底（SEMANTIC_KB_ENABLED=1）
+            # 接在 local 后面，不抢 BM25 能命中的情形；直接吃整句 ``message``（语义
+            # 检索本身能消化自然语言，无需 keyword_extract 后的 terms）。
+            # 首次 search 会触发 embedding 重建（~30–60s 阻塞），日志里看得到。
+            if not hits:
+                semantic_kb = self._maybe_semantic_kb()
+                if semantic_kb and semantic_kb.exists:
+                    sem_t0 = time.perf_counter()
+                    try:
+                        sem_hits = semantic_kb.search(
+                            message, limit=self._ima.cfg.search_limit
+                        )
+                    except Exception as exc:
+                        log_ai.warning("ai semantic_kb search failed err=%s", exc)
+                        sem_hits = []
+                    sem_elapsed_ms = (time.perf_counter() - sem_t0) * 1000
+                    if sem_hits:
+                        hits = sem_hits
+                        hits_count = len(hits)
+                        reason = "semantic-fallback"
+                        print(
+                            f"[semantic] query='{(message or '')[:60]}' "
+                            f"hits={hits_count} "
+                            f"titles={[getattr(h, 'title', '')[:30] for h in hits[:3]]}",
+                            flush=True,
+                        )
+                        log_ai.info(
+                            "ai semantic_kb fallback hits=%d elapsed_ms=%.0f "
+                            "(ima=0, local=0)",
+                            hits_count, sem_elapsed_ms,
+                        )
+                    else:
+                        log_ai.info(
+                            "ai semantic_kb fallback none "
+                            "(ima=0, local=0, semantic=0) elapsed_ms=%.0f",
+                            sem_elapsed_ms,
+                        )
+
             # 命中数 > 0 且 IMA_ILINK_FETCH_BODY=1：逐条 get_doc_content 拿正文。
             # 这是绕过 docs/IMA_KB.md §5 关键坑 2 的关键补丁——search_knowledge
             # 不返回 body，必须再调一次 note 服务端的端点。
@@ -2151,10 +2238,14 @@ class _AIWithIma:
                 ctx = _ima_build_context(hits)
                 if ctx:
                     prompt = (prompt + "\n\n" + ctx) if prompt else ctx
-                    # 本地 fallback 走 ``llm+local`` 模式以便日志区分；其它
-                    # 走 ``llm+ima``。reason 字段负责更细的语义。
-                    mode = "llm+local" if reason == "local-fallback" else "llm+ima"
-                    if reason != "local-fallback":
+                    # fallback 来源决定 mode；reason 字段负责更细的语义。
+                    if reason == "local-fallback":
+                        mode = "llm+local"
+                    elif reason == "semantic-fallback":
+                        mode = "llm+semantic"
+                    else:
+                        mode = "llm+ima"
+                    if reason not in ("local-fallback", "semantic-fallback"):
                         reason = "hits-injected"
                     ctx_chars = len(ctx)
                     log_ima.debug("ai ima inject prompt after=%d (added %d, mode=%s)",
@@ -2256,6 +2347,37 @@ if __name__ == "__main__":
     )
     print(f"[config] config_file={CONFIG_FILE} state_file={STATE_FILE} log={paths['log_file']}")
     _raw_cfg = load_or_create_config()
+
+    # 共享 LLM env 覆盖（/etc/clawbot/llm.env + /etc/clawbot/<user>.env 里的
+    # CLAWBOT_LLM_* 任一非空 → 覆盖 config_<user>.json 对应字段）。
+    # 注意：load_or_create_config() 返回的是**扁平 dict**（顶层就是 provider/api_key/
+    # base_url/model/prompt），不是 load_config_file() 的嵌套形式。所以覆盖必须
+    # 改顶层字段——下面的"providers"分支只对 load_config_file 的原始形状有效，
+    # 在主流程里 _raw_cfg.get("providers") 是 {}，全走 setdefault 分支也无效。
+    _env_provider = os.environ.get("CLAWBOT_LLM_PROVIDER", "").strip()
+    _env_overrides = {}
+    for _k, _env_k in (
+        ("api_key", "CLAWBOT_LLM_API_KEY"),
+        ("base_url", "CLAWBOT_LLM_BASE_URL"),
+        ("model", "CLAWBOT_LLM_MODEL"),
+        ("prompt", "CLAWBOT_LLM_PROMPT"),
+    ):
+        _v = os.environ.get(_env_k, "").strip()
+        if _v:
+            _env_overrides[_k] = _v
+    if _env_provider or _env_overrides:
+        _raw_cfg = dict(_raw_cfg)
+        if _env_provider:
+            _raw_cfg["provider"] = _env_provider
+        _raw_cfg.update(_env_overrides)
+        log_msg.info(
+            "llm config overridden by env provider=%s api_key=%s base_url=%s model=%s",
+            _raw_cfg["provider"],
+            (_raw_cfg.get("api_key") or "")[:8] + "..." if _raw_cfg.get("api_key") else "<empty>",
+            _raw_cfg.get("base_url", "<unset>"),
+            _raw_cfg.get("model", "<unset>"),
+        )
+
     ai = create_ai_client(_raw_cfg)
     # 用 ima 检索为 AI 回答注入参考资料。未配置凭据时包装层会直通。
     # env 已在第 3 步加载完，ImaConfig.from_env() 只读 os.environ 不再二次加载。

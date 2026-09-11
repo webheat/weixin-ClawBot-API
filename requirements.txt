@@ -4,5 +4,9 @@ qrcode[pil] >= 7.4.2
 python-dotenv >= 1.0.0
 cairosvg >= 2.7.0
 
+# Optional: only needed when SEMANTIC_KB_ENABLED=1 (4-mode AI routing 的 llm+semantic 档)
+# fastembed 拉模型时需要联网；如果服务器在国内，要设 HF_ENDPOINT=https://hf-mirror.com
+# fastembed >= 0.8.0
+
 # Optional: only needed when building an executable from bot.spec.
 pyinstaller >= 6.0.0

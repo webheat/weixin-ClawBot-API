@@ -15,6 +15,11 @@ weixin_state_*.json
 var/
 !var/.gitkeep
 
+# 语义检索 KB 索引（fastembed 跑出来的 sqlite，含 embedding 二进制；可随时重建）
+docs/.semantic_kb.sqlite3
+docs/.semantic_kb.sqlite3-journal
+*.semantic_kb.sqlite3
+
 # Python
 __pycache__/
 *.py[cod]

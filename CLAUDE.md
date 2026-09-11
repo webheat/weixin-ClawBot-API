@@ -8,7 +8,7 @@ Python 3.12+ client that speaks Tencent's [OpenClaw Weixin](https://github.com/T
 
 ## Current state (read first)
 
-- **Active priorities** — see `TODO.md`. Current P0 is **per-user conversation history** (bot currently sees only the last message).
+- **Active P0 — per-user conversation history** (in progress). Bot currently sees only the last message; "我刚才说了什么" / "继续上次" both fail. Plan: persist `runtime_state["contexts"][from_id]["history"]` (list of `{"role","content","ts"}`) into `weixin_state.json` so it survives restart; sliding-window cap N=20 (or token-budget trim); rename `ai.chat(text)` → `ai.chat_with_history(messages, system_prompt)` and update `_AIWithIma` to merge history with `ima` snippets. Exclude `/help` / `/time` / `/重新连接` and the `COMMANDS_MSG` welcome from history; private chat only (no group messages). Risk: context bloat → token cost; need a cap and a monitor. Full TODO in `TODO.md`.
 - **Recent big change (2026-09-07)** — full IMA pipeline rewrite + 150 Q&A ingested into a fresh KB. Full timeline, decisions, and sharp edges are in `docs/SESSION_2026-09-07_ima_pipeline.md`. The four new IMA knobs (`IMA_ILINK_KEYWORD_EXTRACT` / `IMA_ILINK_FETCH_BODY` / local fallback / `llm_caveat`) all live in `ima.py` and are routed via `_AIWithIma.chat`'s 3-state machine — read that section before changing AI routing.
 - **Fast Q&A lookup** — `docs/knowledge/` holds ~30 short notes indexed `qa-NNN-<topic>` (ima search keywords, context_token, X-WECHAT-UIN, ret=-14, etc.). Grep by topic when you hit an unfamiliar failure mode before reading the full 51 KB protocol reference.
 
@@ -21,31 +21,37 @@ This project references two very different products. **Don't conflate them.**
 
 The 197 files in `docs/knowledge/` follow the Obsidian-vault convention (frontmatter + directory layout) but are read by `utils/local_kb.py` directly — no Obsidian.app process is involved. They can later be edited in Obsidian.app without code changes (frontmatter is stripped before scoring, `local_kb.py:29-40`).
 
+One unified decision table covers both the product choice and the runtime code path:
+
 | If you need… | Use | Why |
 |---|---|---|
-| Multi-user editing, cross-device access, official AI answering for end users | **ima** | Service-side KB with permissions; 微信小程序 + Web + iOS/Android |
+| Multi-user editing, cross-device access, official AI answering | **ima** (production) | Service-side KB; supports `KEYWORD_EXTRACT` + `FETCH_BODY` + `RERANK`. Per-user creds via `/etc/clawbot/<user>.env` |
 | Publishing content externally ("知识号") | **ima** | `KBT_SUBSCRIBED_CREATE_KB` is the native publish channel |
+| New content not yet indexed by IMA (5–15 min lag) | **ima + local fallback + semantic** (推荐) | 三层 fallback：IMA 命中走 `llm+ima`；0 命中走 `llm+local`（CLAWBOT_LOCAL_FALLBACK=1）；仍 0 命中走 `llm+semantic`（SEMANTIC_KB_ENABLED=1）。路由转换在 `logs/clawbot.log` 看 `mode=... reason=...` |
+| Offline / no `ima.qq.com` egress / privacy-sensitive | **LocalKBIndex** only | `CLAWBOT_LOCAL_FALLBACK=1`; clear all `IMA_ILINK_*` to force `mode=llm+local` |
+| Already maintain an Obsidian vault to reuse as KB | **LocalKBIndex pointed at vault** | `CLAWBOT_LOCAL_KB_DIR=/path/to/vault` — `LocalKBIndex.rglob("*.md")` + mtime auto-rebuild; frontmatter stripped to avoid `tags:` false hits (`local_kb.py:29-40`) |
+| Fast RAG for an LLM agent / low latency | **LocalKBIndex** | Zero network, no auth, no index delay; substring match but enough for keyword queries |
 | Long-term personal/team second-brain with Git history, never lose data | **Obsidian** | Plain files; format doesn't rot; `git diff` works on `.md` |
-| Data sovereignty / cannot send content to any cloud | **Obsidian** | 100% local; no API call ever leaves the machine |
-| Fast RAG for an LLM agent / low latency | **Obsidian-vault-as-KB** (`LocalKBIndex`) | Zero network, no auth, no index delay; substring match but enough for keyword queries |
-| Already maintain an Obsidian vault elsewhere (`/opt/ob-vault/`) | Point `CLAWBOT_LOCAL_KB_DIR` at it | `LocalKBIndex.rglob("*.md")` + mtime auto-rebuild |
+| Data sovereignty / cannot send content to any cloud | **Obsidian** or **LocalKBIndex** | 100% local; no API call ever leaves the machine |
+| Want the LLM to **know** it's answering without KB | **Plain LLM** | Leave IMA creds empty → `mode=llm-only reason=ima-not-configured`; `_LLM_ONLY_CAVEAT_PROMPT` (`bot.py:64`) injects "（未参考知识库）" caveat |
+| Bot 端需要**语义检索**（自然语言 → 整句不切词） | **`utils/semantic_kb.py`** (`SEMANTIC_KB_ENABLED=1`) | BAAI/bge-small-zh-v1.5 + fastembed（onnxruntime，无 torch），零网络（除首次模型下载）；落库到 `docs/.semantic_kb.sqlite3`；150 chunks 在毫秒级返回。**国内服务器必加 `HF_ENDPOINT=https://hf-mirror.com` + `HF_HUB_DISABLE_XET=1`** |
+| Debugging baseline LLM with no KB interference | **Plain LLM** | Same as above; fastest way to isolate the model's own answer |
 | Mix: edit in Obsidian, serve/answer from ima | **方案 A** (future) | `SESSION_2026-09-07_ima_pipeline.md:236` — not yet built |
 
-Hard limits both share — **neither does semantic/embedding retrieval by default** (IMA's OpenAPI surface lacks it; `LocalKBIndex` is zero-deps by design: `local_kb.py:1-14`). If you need true semantic search, that's a new dependency, not a config knob.
+Hard limits both share — **neither does semantic/embedding retrieval by default** (IMA's OpenAPI surface lacks it; `LocalKBIndex` is zero-deps by design: `local_kb.py:1-14`). If you need true semantic search at the bot level, that's a **new module + dependency** (`utils/semantic_kb.py` + fastembed) — see the "Bot 端需要语义检索" row above and `_AIWithIma`'s 4-mode routing.
 
 ## Common commands
 
-All commands assume the project root; the venv is `venv/`.
+All commands assume the project root; the venv is `venv/`. First-run setup (provider selection, API key entry, QR scan) is in `README.md`; this block is the day-2 cheat sheet.
 
 ```bash
-# Setup
-pip install -r requirements.txt
+# Run single-tenant (legacy default; state in weixin_state.json, config.json)
+python bot.py
+./venv/bin/python bot.py
 
-# Run (first time: interactively choose provider, paste API key, scan QR)
-python bot.py                              # or ./venv/bin/python bot.py
-
-# Run with daemon-friendly web QR UI (default; CLAWBOT_WEB_ENABLED=1)
-# Exposed via nginx: location ^~ /clawbot/ → 127.0.0.1:18300
+# Run as a named daemon user (per-user state/config/log under weixin_state_<name>.json etc.)
+python bot.py --user alice
+# Web QR UI exposed via nginx: location ^~ /clawbot/ → 127.0.0.1:18300 (portal) / :18301+ (per-user)
 
 # Diagnose ima knowledge bases (see docs/IMA_KB.md §3)
 ./venv/bin/python utils/list_ima_kb.py
@@ -60,7 +66,7 @@ CLAWBOT_LOG_LEVEL=DEBUG python bot.py 2>&1 | tee /tmp/debug.log
 # Output: dist/weixin-clawbot/ — copy directory + .env to USB root
 ```
 
-There is no test suite, no linter config, and no `Makefile`. The `pyinstaller` and `cairosvg` entries in `requirements.txt` are optional.
+There is no test suite, no linter config, and no `Makefile`. The `pyinstaller` and `cairosvg` entries in `requirements.txt` are optional. 5-line diagnosis grep recipes live in `README.md` — do not duplicate them here.
 
 ## High-level architecture
 
@@ -76,6 +82,11 @@ Top-to-bottom responsibilities:
 - **Lifecycle + main** (`bot.py:1329-1790`): `notify_lifecycle` posts `notifystart` / `notifystop`. `main()` orchestrates login → `apply_new_login` (atomic credential swap; clears cursor + contexts + `last_contact` if account id changes) → spawns `reconnect_timer_task` (lifecycle warnings at `warning_before`, force reconnect at `force_before`) and `message_loop` → `asyncio.gather` for graceful cancel of all tasks + final `notifystop`.
 - **`message_loop` & `handle_message`** (`bot.py:1479-1761`): long-polls `getupdates`, advances `get_updates_buf`, dispatches each `msg` to `handle_message`. Stale responses (token/baseurl changed mid-poll) are dropped. On `is_stale_token` (`ret/errcode == -14`) it clears `bot_token`, sleeps `RETRY_DELAY`, runs a fresh `login_with_qrcode`, and continues. **Per-peer state** lives in `runtime_state["contexts"][from_id]` and is overwritten on each inbound message; `welcomed_users` is derived from `contexts.keys()` on startup so first-time users get `COMMANDS_MSG`.
 - **AI layer** (`bot.py:1804-1886`): `_AIWithIma` is a transparent wrapper that calls `ImaClient.search_knowledge` before `base.chat` and injects snippets (`### 参考资料 N: title\nsnippet`) into the system prompt. If `ima.configured()` is false (no `IMA_ILINK_CLIENT_ID`/`API_KEY`), the wrapper passes through. `create_ai_client` picks `DeepSeekAPI` or `DusAPI` from `raw_cfg["provider"]`.
+- **4-mode AI routing** (新增；详见 `utils/semantic_kb.py` 和 `utils/local_kb.py`): `_AIWithIma.chat` 是 **4 档 state machine**，按 `ima → local → semantic → llm_only` 顺序 fallback：
+  - `mode=llm+ima` (`reason=hits-injected`) —— IMA 命中并注入 prompt
+  - `mode=llm+local` (`reason=local-fallback`) —— IMA 0 命中，BM25 substring 兜底（`CLAWBOT_LOCAL_FALLBACK=1`）
+  - `mode=llm+semantic` (`reason=semantic-fallback`) —— IMA + local 都 0 命中，向量相似度兜底（`SEMANTIC_KB_ENABLED=1` + fastembed）
+  - `mode=llm-only` —— 全部未命中或未配置，注入 `_LLM_ONLY_CAVEAT_PROMPT`（`bot.py:64`）让 LLM 自我标记"未参考知识库"
 
 ### 2. AI provider wrappers (`dusapi.py`, `deepseek.py`)
 Same shape: `@dataclass *Config` + `*API` class with `chat(message, model=None, stream=False, prompt=None, history=None)`. Both are **synchronous `requests`**, 5 retries with `[2, 4, 8, 16, 32]`s backoff. DusAPI uses Anthropic `/v1/messages` format (model name decides parser: `claude` vs `gpt`). DeepSeek uses OpenAI `/chat/completions`; for `deepseek-v4-flash` it sets `thinking: {type: disabled}`. Both cap `max_tokens=1024`.
@@ -92,20 +103,7 @@ Sync `requests` wrapper, mirrors `dusapi.py`/`deepseek.py`. **First `.env` consu
 
 `_AIWithIma.chat` is a 3-state machine (`ima` / `local` / `llm_only`) and logs `mode=` / `reason=` / `hits=` / `ctx_chars=` on every call — that line in `logs/clawbot.log` is the canonical answer to "did the KB fire?".
 
-#### Picking the KB: IMA vs `docs/knowledge/*.md` (Obsidian-style) vs plain LLM
-
-Two knowledge-base code paths already exist; Obsidian.app itself is **not** wired in (only listed as future work in `docs/SESSION_2026-09-07_ima_pipeline.md:236`). The 197 markdown files in `docs/knowledge/` follow the Obsidian-vault convention (frontmatter + directory layout), and `LocalKBIndex` reads them directly with no extra process.
-
-| If you need… | Use | Why |
-|---|---|---|
-| Production, multi-user, official content with editing workflow | **IMA** | Service-side KB, indexing delayed 5–15 min, supports `KEYWORD_EXTRACT` + `FETCH_BODY` + `RERANK`. Per-user creds via `/etc/clawbot/<user>.env`. |
-| Offline / no `ima.qq.com` egress / privacy-sensitive | **Local KB only** | Set `CLAWBOT_LOCAL_FALLBACK=1` and clear all `IMA_ILINK_*` to force `mode=llm+local`. |
-| Already have an Obsidian vault you want to reuse as a KB | **Local KB pointed at vault** | `CLAWBOT_LOCAL_KB_DIR=/path/to/ob-vault` — `LocalKBIndex.rglob("*.md")` + mtime auto-rebuild; frontmatter stripped to avoid `tags:` false hits (`local_kb.py:29-40`). |
-| Want the LLM to **know** it's answering without KB | Plain LLM | Leave IMA creds empty → `mode=llm-only reason=ima-not-configured`; `_LLM_ONLY_CAVEAT_PROMPT` (`bot.py:64`) injects "（未参考知识库）" caveat. |
-| New content not yet indexed by IMA (the 5–15 min lag) | **Both on** | Default config: IMA first, local fallback when IMA hits=0. `mode=llm+ima` vs `mode=llm+local reason=local-fallback` shows the transition in `logs/clawbot.log`. |
-| Debugging baseline LLM with no KB interference | Plain LLM | Same as above; fastest way to isolate the model's own answer. |
-
-Hard limits to know before choosing: **both KBs are substring keyword match — neither does embedding search** (LocalKBIndex by design: `local_kb.py:1-14`; IMA OpenAPI surface area also lacks the semantic path). If you need true semantic retrieval, that's a new dependency, not a config change.
+**Hard limit:** neither IMA nor `LocalKBIndex` does embedding/semantic search (substring keyword match only). If you need true semantic retrieval, that's a new dependency, not a config knob. See the decision table under "Product context: IMA vs Obsidian" for which code path to use.
 
 ### 4. `qr_web.py` — embedded aiohttp web login UI (per-user backend)
 Standalone aiohttp app bound to a per-user port (env `CLAWBOT_WEB_{ENABLED,TOKEN,HOST,PORT}`). Exposes: QR PNG, login state machine (`idle / qr_pending / scanned / logged_in / error`), and a verify-code POST endpoint. `QrFlowState` is the single source of truth — `bot.py` writes via `make_web_on_qrcode`, handlers read. Port collision → logs warning, returns, does not block the bot loop. `wait_for_verify_code` is shared between web and `stdin _safe_input` so the same code path works in TTY and daemon.
@@ -204,8 +202,9 @@ User-facing output (banners, menu, command echo) stays on `print` — don't move
 
 ## Adding a new logger / feature
 
-When adding code that emits logs or errors:
+When adding code that emits logs or handles a new error path:
 1. Use `get_logger("subsystem")` from `utils/logging_setup.py` — do not call `setup_logging()` again.
-2. Pre-redact any sensitive value with `bot._redact_text()` / `_redact_path()` or print only first 8 chars (`token={tok[:8]}…`). The `RedactFilter` is a safety net, not the primary defense.
-3. New failure paths in `message_loop` should distinguish stale-token (`exc.is_stale_token`) from transient network (`exc.network_type` ∈ `dns / tcp / tls / timeout / unknown`) from generic `Exception` — see the existing handler at `bot.py:1707-1761` for the canonical pattern.
-4. `handle_message` currently serializes per message via `for msg in msgs: await handle_message(msg)` (`bot.py:1705`). If converting to `asyncio.gather`, watch `welcomed_users.add` / `last_contact` writes — they need a lock or hoisting outside the gather (see `TODO.md` P1 #3).
+2. New failure paths in `message_loop` must distinguish stale-token (`exc.is_stale_token`) from transient network (`exc.network_type` ∈ `dns / tcp / tls / timeout / unknown`) from generic `Exception` — see the canonical handler at `bot.py:1707-1761`.
+3. `handle_message` currently serializes per message via `for msg in msgs: await handle_message(msg)` (`bot.py:1705`). If converting to `asyncio.gather` (TODO P1 #3), watch `welcomed_users.add` / `last_contact` writes — they need a lock or hoisting outside the gather.
+
+Pre-redaction of sensitive values is already covered by the Redaction bullet in the architecture section above — do not restate it here.
