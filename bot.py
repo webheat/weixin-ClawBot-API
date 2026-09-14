@@ -847,15 +847,22 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
     warning_active[0] = False
     reconnect_asked.clear()
 
-    log_reconnect.info("reconnect start current_token=%s contact=%s",
-                       (current_token[:8] + "…") if current_token else "-",
-                       from_id[-8:] if from_id else None)
-    print("[重连] 开始重连流程...")
+    # Bug fix: current_token / from_id / ctx 必须在 log 调用之前赋值——
+    # 之前把读和写分置在第 850 行（读）和第 854/856 行（写），Python 编译时
+    # 看到函数体内有 `current_token = ...` 就把整函数内 current_token 当 local，
+    # 导致首次调用 do_reconnect 必抛 UnboundLocalError，让 reconnect_in_progress[0]
+    # 卡在 True 不掉，timer 退化成 4 Hz 死循环（详见 logs/clawbot_alice.log
+    # 2026-09-12 23:59:58 那条 remaining_s=-19036 的风暴）。
+    current_token = bot_token_ref[0]
     from_id = last_contact.get("from_id")
     ctx = last_contact.get("context_token")
-    current_token = bot_token_ref[0]
 
     try:
+        log_reconnect.info("reconnect start current_token=%s contact=%s",
+                           (current_token[:8] + "…") if current_token else "-",
+                           from_id[-8:] if from_id else None)
+        print("[重连] 开始重连流程...")
+
         async def deliver_qrcode(content):
             """把当前二维码同步输出到网页 + 终端。
 
