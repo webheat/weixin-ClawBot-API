@@ -1,4 +1,4 @@
-"""统一日志初始化：终端 + 按天滚动文件，保留 7 天。
+"""统一日志初始化：终端 + 按天滚动文件，保留 3 天。
 
 入口 ``setup_logging()`` 在 ``bot.py`` ``__main__`` 最早位置调用一次；
 ``qr_web.py`` / ``ima.py`` 不调用，仅通过 ``get_logger(name)`` 获取 logger。
@@ -32,7 +32,7 @@ LOG_ROOT = "clawbot"
 
 DEFAULT_LOG_DIR = Path("logs")
 DEFAULT_LOG_FILE = DEFAULT_LOG_DIR / "clawbot.log"
-DEFAULT_BACKUPS = 7
+DEFAULT_BACKUPS = 3
 
 # 终端格式：短时间戳，刷屏不刺眼
 _FMT_CONSOLE = "%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
