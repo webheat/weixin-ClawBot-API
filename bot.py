@@ -91,6 +91,14 @@ ai = None  # 启动时从配置文件加载后初始化
 # 测试时将数值改小，例如：
 #   "session_duration": 300, "warning_before": 60, "reminder_interval": 30,
 #   "force_before": 60, "qrcode_scan_timeout": 120
+#
+# 策略（2026-09-14 改）：后台静默重连 + 终态单条通知。
+# - `warning_before` / `reminder_interval` 字段保留仅为历史兼容，运行时不再触发任何
+#   用户消息；会话到期前的"提醒"已下线。
+# - 真正起作用的字段：`session_duration`（会话音命）、`force_before`（最后多久触发
+#   do_reconnect）、`qrcode_scan_timeout`（扫码整体超时）。
+# - QR 仅通过 web (`https://bx.mengxa.com/clawbot/`) 和终端渲染；用户收件箱只在
+#   do_reconnect 成功或失败时收到一条终态通知，期间绝不打扰。
 RECONNECT_CONFIG = {
     "session_duration":    24 * 3600,  # 会话总时长（秒）
     "warning_before":       2 * 3600,  # 提前多久发出警告（秒）
@@ -98,6 +106,10 @@ RECONNECT_CONFIG = {
     "force_before":           30 * 60, # 最后多久强制重连（秒）
     "qrcode_scan_timeout":       480,  # 官方客户端默认整体等待时长（秒）
 }
+# 当 do_reconnect 还在 QR 扫描/登录流程里、或 elapsed 已越过 warning_before 但仍未成功
+# 重连时，timer 任务的下一次 recheck 至少等这么秒；避免 sendmessage 失败 + do_reconnect 挂
+# 起时退化成 ~4 Hz 日志风暴（logs/clawbot_alice.log 2026-09-13 09:18:56+）。
+_RECONNECT_RECHECK_BACKOFF_SECS = 60.0
 # =============================================
 
 # ========== 配置文件 ==========
@@ -845,7 +857,11 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
 
     try:
         async def deliver_qrcode(content):
-            """把当前二维码同步输出到网页 + 终端 + 最近联系人。"""
+            """把当前二维码同步输出到网页 + 终端。
+
+            后台静默策略：QR 不再发到 last_contact 微信会话，仅走 web_on_qrcode +
+            终端（print / render_terminal_qr）。用户收件箱保持安静。
+            """
             if web_on_qrcode is not None:
                 try:
                     await web_on_qrcode(content)
@@ -853,14 +869,11 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                     log_reconnect.warning("reconnect web_on_qrcode failed err=%s",
                                           _redact_text(exc))
                     print(f"[重连] web 二维码回调失败: {_redact_text(exc)}")
-            qr_msg = f"[重连] 请扫码完成新连接：{content}"
             print(f"[重连] 请扫码完成新连接：{_redact_text(content)}")
             # HTTP 图片链接已由 save_qrcode_content 渲染，其他格式在这里补渲染。
             if not content.startswith("http"):
                 render_terminal_qr(content)
-            await send_msg_safe(session, from_id, ctx, qr_msg, bot_token_ref, bot_base_url_ref)
-            log_reconnect.info("reconnect qr delivered via web+console+contact contact=%s",
-                               from_id[-8:] if from_id else None)
+            log_reconnect.info("reconnect qr delivered via web+console (silent, no user msg)")
 
         try:
             login_result = await login_with_qrcode(
@@ -961,9 +974,9 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
             print("[重连] 当前连接仍然有效，无需切换凭据")
         if not account_changed:
             completion_text = (
-                "[完成] 新连接已建立，已自动切换，继续使用"
+                "[完成] 已自动重新连接，继续使用"
                 if credentials_changed
-                else "[完成] 当前连接仍然有效，可以继续使用"
+                else "[完成] 当前连接仍然有效，继续使用"
             )
             await send_msg_safe(
                 session,
@@ -991,78 +1004,52 @@ async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_co
                        session_dur_h, warn_before_h, force_before_m)
     while True:
         try:
-            elapsed = time.time() - login_time_ref[0]
-            first_wait = max(0, cfg["session_duration"] - cfg["warning_before"] - elapsed)
-            await asyncio.sleep(first_wait)
-            remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-
-            if remaining <= cfg["force_before"]:
-                force_msg = "[自动] 连接即将到期，开始强制重新连接..."
-                log_reconnect.warning("reconnect force firing remaining_s=%.0f", remaining)
-                print(force_msg)
-                if not last_contact.get("from_id") or not last_contact.get("context_token"):
-                    log_reconnect.info("reconnect reminder skipped reason=no_contact (force)")
-                    print("[自动] 尚无最近联系人，跳过本轮自动重连提醒")
-                    login_time_ref[0] = time.time()
-                    continue
-                await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                    force_msg, bot_token_ref, bot_base_url_ref)
-                await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                   typing_ticket_cache, reconnect_asked, warning_active,
-                                   reconnect_in_progress, login_time_ref, cfg, runtime_state,
-                                   web_on_qrcode, web_state)
+            # Bug fix: 若上一次 force-fire / do_reconnect 仍在飞行中（典型场景是 QR 没人扫
+            # 导致 login_with_qrcode 卡在扫码超时之前），就退避而非立刻重试。否则下面
+            # first_wait=0 会让 timer 跟着 send_msg_safe 的超时节奏（~280ms）刷成 ~4 Hz
+            # 日志风暴（logs/clawbot_alice.log 2026-09-13 09:18:56+）。
+            if reconnect_in_progress[0]:
+                log_reconnect.debug("reconnect timer backing off reason=in_progress")
+                await asyncio.sleep(_RECONNECT_RECHECK_BACKOFF_SECS)
                 continue
 
-            remaining_h = remaining / 3600
-            warn_msg = f"[提醒] 连接还剩约 {remaining_h:.1f} 小时到期，是否现在重新连接？回复 Y 立即重连，N 稍后提醒"
-            log_reconnect.info("reconnect warning fired remaining_h=%.1f", remaining_h)
-            print(warn_msg)
+            elapsed = time.time() - login_time_ref[0]
+            # Bug fix: 当 elapsed 已经越过 warning_before 阈值时，原始公式
+            # `max(0, session_duration - warning_before - elapsed)` 退化成 0，外层 timer
+            # 会以事件循环最快速度空转。给一个 ≥ reminder_interval 的下限，保证哪怕 do_reconnect
+            # 短暂退场（极少见），我们也不会比正常提醒节奏更频繁地再 fire。
+            raw_wait = cfg["session_duration"] - cfg["warning_before"] - elapsed
+            first_wait = max(0, raw_wait)
+            if first_wait == 0:
+                first_wait = float(cfg.get("reminder_interval", 30 * 60))
+            await asyncio.sleep(first_wait)
+
+            # 后台静默策略：会话进入"接近到期"窗口后，仅在日志里记一行 armed，
+            # 不向用户发任何"提醒"消息；外层 warning_active 也保持 False，
+            # 让 message_loop 里 if warning_active[0] ... 那条分支不再被命中。
+            remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
+            log_reconnect.info("reconnect armed silently remaining_s=%.0f; awaiting force_before", remaining)
+
+            # 静默等到 force_before：每 5 分钟重算一次 remaining，
+            # 既不发任何用户消息，也不会让 timer 在 force_before 之前空转耗 CPU。
+            while True:
+                if remaining <= cfg["force_before"]:
+                    break
+                await asyncio.sleep(min(300.0, remaining - cfg["force_before"]))
+                remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
+
+            # force_before 触发：直接走 do_reconnect（QR 走 web/terminal，不打扰用户）。
+            log_reconnect.warning("reconnect force firing remaining_s=%.0f", remaining)
+            print("[自动] 连接即将到期，开始强制重新连接...")
             if not last_contact.get("from_id") or not last_contact.get("context_token"):
-                log_reconnect.info("reconnect reminder skipped reason=no_contact (warning)")
-                print("[提醒] 尚无最近联系人，跳过本轮连接到期提醒")
+                log_reconnect.info("reconnect force skipped reason=no_contact")
+                print("[自动] 尚无最近联系人，跳过本轮自动重连（仅 web/terminal 出 QR）")
                 login_time_ref[0] = time.time()
                 continue
-            await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                warn_msg, bot_token_ref, bot_base_url_ref)
-            warning_active[0] = True
-
-            while True:
-                remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-                if remaining <= cfg["force_before"]:
-                    force_msg = "[自动] 连接即将到期，开始强制重新连接..."
-                    log_reconnect.warning("reconnect force firing remaining_s=%.0f", remaining)
-                    print(force_msg)
-                    await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                        force_msg, bot_token_ref, bot_base_url_ref)
-                    await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                       typing_ticket_cache, reconnect_asked, warning_active,
-                                       reconnect_in_progress, login_time_ref, cfg, runtime_state,
-                                       web_on_qrcode, web_state)
-                    break
-
-                wait_secs = max(0.0, min(float(cfg["reminder_interval"]),
-                                         remaining - cfg["force_before"]))
-                try:
-                    await asyncio.wait_for(reconnect_asked.wait(), timeout=wait_secs)
-                    log_reconnect.info("reconnect user-confirmed via Y, dispatching")
-                    # 用户回 Y，执行重连
-                    await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                       typing_ticket_cache, reconnect_asked, warning_active,
-                                       reconnect_in_progress, login_time_ref, cfg, runtime_state,
-                                       web_on_qrcode, web_state)
-                    break
-                except asyncio.TimeoutError:
-                    remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-                    if remaining <= cfg["force_before"]:
-                        continue  # 下一轮循环走强制重连分支
-                    remaining_m = remaining / 60
-                    remind_msg = (f"[提醒] 连接还剩约 {remaining_m:.0f} 分钟，"
-                                  f"是否现在重新连接？回复 Y 立即重连，N 继续等待")
-                    print(remind_msg)
-                    # 用最新的 last_contact（可能已更新）
-                    if last_contact.get("from_id") and last_contact.get("context_token"):
-                        await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                            remind_msg, bot_token_ref, bot_base_url_ref)
+            await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
+                               typing_ticket_cache, reconnect_asked, warning_active,
+                               reconnect_in_progress, login_time_ref, cfg, runtime_state,
+                               web_on_qrcode, web_state)
         except asyncio.CancelledError:
             raise
         except ILinkAPIError as exc:
@@ -1614,6 +1601,9 @@ async def main():
                                         bot_token_ref, bot_base_url_ref)
                 return
 
+            # 后台静默策略（2026-09-14 改）：reconnect_timer_task 不再 set
+            # warning_active[0]，所以下面这条 if 永远不会为 True，保留仅为
+            # 历史兼容 / 未来恢复交互式提醒时启用。
             if warning_active[0] and normalized in ("Y", "N"):
                 log_msg.debug("handle reconnect warning reply from=%s choice=%s",
                               from_id[-8:], normalized)
