@@ -170,6 +170,7 @@ sudo nginx -t && sudo systemctl reload nginx
 - **First QR is fixed endpoint `BASE_URL = https://ilinkai.weixin.qq.com`**. After `scaned_but_redirect`, switch to the server-returned `baseurl`. This switch is one-way per session.
 - **Headers**: never set `Content-Length` manually (aiohttp computes it). The `X-WECHAT-UIN` is a fresh random uint32 → base64 per request. Each POST body includes `base_info: {channel_version: "2.4.6", bot_agent: "weixin-ClawBot-API/1.2.0 (python)"}` (sanitized via `sanitize_bot_agent`).
 - **Media messages are out of scope** for now: image / file / untranscribed voice return a capability hint and are not passed to AI. AES-128-ECB + CDN upload/download not implemented.
+- **Forwarded message text extraction** (`bot.py:821` `extract_message_text`): reads `text_item.text`, `voice_item.text`, `ref_msg.{title,message_item.text_item.text}`, `title` / `description` / `des`, `app_msg.{title,des}`, and `url` (rewritten as `[链接] url`) from every item in `item_list`. Deduplicates with `text not in parts` so quoted / ref_msg overlap doesn't double-feed the LLM. URL is treated as text only — never fetched. See `docs/FORWARDED_MESSAGES.md`.
 
 ## Logger namespace
 
@@ -192,6 +193,7 @@ User-facing output (banners, menu, command echo) stays on `print` — don't move
 
 - `README.md` — quickstart, `RECONNECT_CONFIG` table, OpenClaw protocol summary, 5-line diagnosis grep recipes for `logs/clawbot.log`.
 - `docs/IMA_KB.md` — ima integration sharp edges (keyword-match vs semantic, no body return, rerank behavior) + `list_ima_kb.py` usage.
+- `docs/FORWARDED_MESSAGES.md` — what `extract_message_text` reads from `item_list` (text / voice / ref_msg / app_msg / url), dedup strategy, 8-case smoke test patterns, URL is text-only (never fetched).
 - `docs/multi-user.md` — single-tenant limits, scenario A vs B, comparison with XTmai reference impl, recommended fixes (#2 broadcast, #3 gather, #4 retry) ranked by ROI.
 - `docs/PORTABLE.md` — PyInstaller `--onedir` build steps, USB layout, `noexec` mount workaround.
 - `docs/SESSION_2026-09-07_ima_pipeline.md` — chronological record of the IMA rewrite + 4 new knobs + KB bootstrap. **Read this before touching `_AIWithIma.chat`** — it documents the 3-state machine (`ima` / `local` / `llm_only`) and the reasons each knob exists.

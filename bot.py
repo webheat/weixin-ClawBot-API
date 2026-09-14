@@ -819,18 +819,82 @@ async def get_typing_ticket_safe(session, user_id, context_token, cache,
 
 
 def extract_message_text(msg: dict) -> str:
-    """遍历完整 item_list，提取文本/语音转写，避免只读取第一项。"""
-    parts = []
+    """遍历完整 item_list，提取文本/语音转写 / 转发卡片元数据。
+
+    协议字段来源：``weixin-openclaw-api-py-docs.md:1021``（``ref_msg`` 由
+    ``message_item`` + 摘要 ``title`` 组成）。覆盖的入站形态：
+
+    * 普通文字（``text_item.text``）
+    * 语音转写（``voice_item.text``）
+    * 转发/引用的聊天记录（多个 ``text_item`` 遍历 + ``ref_msg.message_item``）
+    * 链接 / 公众号文章 / 小程序卡片（``title`` / ``description`` / ``url`` /
+      ``app_msg.title`` / ``app_msg.des``）
+
+    不做的事：不解 CDN、不抓 URL 网页内容、不解析图片/文件/视频二进制。
+    """
+    parts: list[str] = []
+
+    def _add(text):
+        """去重 append：阻止文本在整个 parts 里重复出现。
+
+        为什么用 ``text not in parts`` 而不是 ``parts[-1] != text``：
+        引用回复场景下 ``text_item.text`` 与 ``ref_msg.message_item.text_item.text``
+        是同一字符串但被 ``ref_msg.title`` 等中间字段隔开，``parts[-1]`` 检查
+        会漏判；O(n²) 在单条消息最多 20 个 item 的场景下完全可接受。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        if text not in parts:
+            parts.append(text)
+
     for item in msg.get("item_list") or []:
         if not isinstance(item, dict):
             continue
+
+        # 1. 直接挂在 item 上的文本 / 语音转写
         text_item = item.get("text_item") or {}
         if text_item.get("text"):
-            parts.append(str(text_item["text"]))
-            continue
+            _add(str(text_item["text"]))
         voice_item = item.get("voice_item") or {}
         if voice_item.get("text"):
-            parts.append(str(voice_item["text"]))
+            _add(str(voice_item["text"]))
+
+        # 2. 转发 / 引用：被引用 item 里也可能再嵌一份完整副本
+        ref_msg = item.get("ref_msg") or {}
+        if isinstance(ref_msg, dict):
+            ref_title = ref_msg.get("title")
+            if ref_title:
+                _add(str(ref_title))
+            ref_inner = ref_msg.get("message_item") or {}
+            if isinstance(ref_inner, dict):
+                ref_text = (ref_inner.get("text_item") or {}).get("text")
+                if ref_text:
+                    _add(str(ref_text))
+
+        # 3. 链接 / 公众号 / 小程序卡片：标题、描述、URL
+        #    不同协议版本字段名不一致，列几个常见 key 容错读取。
+        for key in ("title", "description", "des"):
+            val = item.get(key)
+            if val:
+                _add(str(val))
+        app_msg = item.get("app_msg") or {}
+        if isinstance(app_msg, dict):
+            for key in ("title", "des", "description"):
+                val = app_msg.get(key)
+                if val:
+                    _add(str(val))
+        url = item.get("url")
+        if url:
+            _add(f"[链接] {url}")
+
+        # 4. 识别到任何转发/卡片元数据时打一条 debug，便于运维排查
+        if ref_msg or app_msg or item.get("url") or item.get("title"):
+            log_msg.debug("forwarded item extracted title=%r has_text=%s url=%s",
+                          (str(item.get("title"))[:40]) if item.get("title") else None,
+                          bool(text_item.get("text") or voice_item.get("text")),
+                          bool(item.get("url")))
+
     return "\n".join(parts).strip()
 
 
@@ -1633,7 +1697,8 @@ async def main():
             if not text:
                 await send_msg_safe(
                     session, from_id, context_token,
-                    "当前版本暂支持文字消息（语音转文字消息除外），图片/文件请稍后处理。",
+                    "当前版本支持：文字、语音转文字、链接/公众号/小程序卡片（标题+描述）。"
+                    "图片/视频/文件暂不支持处理。",
                     bot_token_ref, bot_base_url_ref,
                 )
                 return
