@@ -79,6 +79,11 @@ class SharedWebTests(AioHTTPTestCase):
         value = response.headers["Set-Cookie"]
         return re.search(r"clawbot_session=([^;]+)", value).group(1)
 
+    def _resume_cookie(self, response):
+        value = response.headers.getall("Set-Cookie")
+        joined = "\n".join(value)
+        return re.search(r"clawbot_session_resume=([^;]+)", joined).group(1)
+
     async def test_raw_user_id_cookie_cannot_cross_tenant(self):
         response = await self.client.get("/clawbot/state",
                                          headers={"Cookie": "clawbot_session=alice"})
@@ -195,6 +200,33 @@ class SharedWebTests(AioHTTPTestCase):
             await asyncio.sleep(0.35)
             self.assertIn(user_id, manager.sessions)
             self.assertEqual(await app["browser_sessions"].snapshot(), [])
+        finally:
+            await client.close()
+
+    async def test_expired_binding_recovers_original_session_with_opaque_cookie(self):
+        manager = FakeManager()
+        app = build_web_app(manager, prefix="/clawbot",
+                            config={"session_ttl": 0.1, "rate_limit": 5})
+        from aiohttp.test_utils import TestServer, TestClient
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            response = await client.post("/clawbot/ephemeral/start", allow_redirects=False)
+            self.assertEqual(response.status, 302)
+            user_id = next(iter(manager.sessions))
+            sid = self._cookie(response)
+            resume = self._resume_cookie(response)
+            await app["browser_sessions"].remove(sid)
+            response = await client.get(
+                "/clawbot/", headers={"Cookie": f"clawbot_session_resume={resume}"},
+                allow_redirects=False,
+            )
+            self.assertEqual(response.status, 302)
+            self.assertIn(user_id, manager.sessions)
+            self.assertNotIn(user_id, response.headers.get("Set-Cookie", ""))
+            self.assertRegex("\n".join(response.headers.getall("Set-Cookie")),
+                             r"clawbot_session=[^;]+")
         finally:
             await client.close()
 

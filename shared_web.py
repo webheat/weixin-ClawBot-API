@@ -37,6 +37,7 @@ DEFAULT_SESSION_TTL = 8 * 3600
 DEFAULT_EPHEMERAL_LIMIT = 100
 DEFAULT_RATE_LIMIT = 5
 DEFAULT_RATE_WINDOW = 60.0
+DEFAULT_RESUME_TTL = 30 * 24 * 3600
 
 
 @dataclass
@@ -58,9 +59,15 @@ class BrowserSessions:
     store with the same interface backed by a protected server-side database.
     """
 
-    def __init__(self, ttl: float = DEFAULT_SESSION_TTL):
+    def __init__(self, ttl: float = DEFAULT_SESSION_TTL,
+                 resume_ttl: float = DEFAULT_RESUME_TTL):
         self.ttl = max(0.01, float(ttl))
+        self.resume_ttl = max(self.ttl, float(resume_ttl))
         self._bindings: dict[str, BrowserBinding] = {}
+        # A separate opaque capability lets a browser recover the control
+        # binding after inactivity. It never contains the user id and is
+        # valid only while the background session still exists.
+        self._resume_tokens: dict[str, tuple[str, float]] = {}
         self._lock = asyncio.Lock()
 
     async def bind(self, user_id: str, *, ephemeral: bool = True) -> str:
@@ -91,6 +98,32 @@ class BrowserSessions:
             return None
         async with self._lock:
             return self._bindings.pop(sid, None)
+
+    async def issue_resume(self, user_id: str) -> str:
+        token = secrets.token_urlsafe(32)
+        async with self._lock:
+            self._resume_tokens[token] = (str(user_id), time.time() + self.resume_ttl)
+        return token
+
+    async def resolve_resume(self, token: Optional[str]) -> Optional[str]:
+        if not token:
+            return None
+        async with self._lock:
+            record = self._resume_tokens.get(token)
+            if record is None:
+                return None
+            user_id, expires_at = record
+            if time.time() >= expires_at:
+                self._resume_tokens.pop(token, None)
+                return None
+            return user_id
+
+    async def revoke_resume(self, user_id: str) -> None:
+        key = str(user_id)
+        async with self._lock:
+            for token, record in list(self._resume_tokens.items()):
+                if record[0] == key:
+                    self._resume_tokens.pop(token, None)
 
     async def snapshot(self) -> list[tuple[str, BrowserBinding]]:
         async with self._lock:
@@ -219,7 +252,7 @@ pattern=\\d{4,8} minlength=4 maxlength=8 placeholder=配对码 required><button>
 <p id=error class=err></p><button id=switch type=button style=display:none>切换用户</button></div>
 <script>
 const root=__ROOT__, csrf=__CSRF__;
-async function poll(){try{let r=await fetch(root+'/state',{cache:'no-store'});if(!r.ok)throw Error(r.status);render(await r.json())}
+async function poll(){try{let r=await fetch(root+'/state',{cache:'no-store'});if(r.status===401){location.reload();return}if(!r.ok)throw Error(r.status);render(await r.json())}
 catch(e){document.querySelector('#error').textContent='拉取状态失败：'+e}setTimeout(poll,1000)}
 function render(s){let st=document.querySelector('#status'),q=document.querySelector('#qr'),f=document.querySelector('#verify'),sw=document.querySelector('#switch');
  document.querySelector('#error').textContent=s.last_error||'';sw.style.display='inline-block';
@@ -244,7 +277,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
     """Build the shared-process aiohttp application.
 
     Config keys: ``session_ttl``, ``ephemeral_limit``, ``rate_limit``,
-    ``rate_window``, ``cookie_name``, and optional
+    ``rate_window``, ``cookie_name``, ``resume_ttl``, and optional
     ``session_config`` passed to ``manager.get_or_create``.
     """
     cfg = dict(config or {})
@@ -252,7 +285,11 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         raise ValueError("prefix contains unsafe characters")
     pfx = "/" + prefix.strip("/") if prefix and prefix.strip("/") else ""
     cookie_name = str(cfg.get("cookie_name", DEFAULT_COOKIE))
-    store = sessions or BrowserSessions(cfg.get("session_ttl", DEFAULT_SESSION_TTL))
+    resume_cookie_name = str(cfg.get("resume_cookie_name", cookie_name + "_resume"))
+    store = sessions or BrowserSessions(
+        cfg.get("session_ttl", DEFAULT_SESSION_TTL),
+        cfg.get("resume_ttl", DEFAULT_RESUME_TTL),
+    )
     limiter = SlidingRateLimiter(cfg.get("rate_limit", DEFAULT_RATE_LIMIT),
                                  cfg.get("rate_window", DEFAULT_RATE_WINDOW),
                                  cfg.get("rate_limit_max_keys", 10000))
@@ -269,6 +306,25 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             request, pfx, trust_proxy=_as_bool(cfg.get("trust_proxy"))
         )
 
+    def secure_cookie_for(request: web.Request) -> bool:
+        secure_setting = cfg.get("cookie_secure")
+        return (
+            request.secure
+            or (_as_bool(cfg.get("trust_proxy"))
+                and request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower() == "https")
+        ) if secure_setting is None else _as_bool(secure_setting)
+
+    def set_session_cookie(response: web.StreamResponse, request: web.Request,
+                           sid: str) -> None:
+        response.set_cookie(cookie_name, sid, max_age=int(store.ttl), httponly=True,
+                            samesite="Lax", secure=secure_cookie_for(request), path="/")
+
+    def set_resume_cookie(response: web.StreamResponse, request: web.Request,
+                          token: str) -> None:
+        resume_ttl = max(1, int(getattr(store, "resume_ttl", DEFAULT_RESUME_TTL)))
+        response.set_cookie(resume_cookie_name, token, max_age=resume_ttl, httponly=True,
+                            samesite="Lax", secure=secure_cookie_for(request), path="/")
+
     async def binding(request: web.Request) -> tuple[Optional[BrowserBinding], Optional[web.Response]]:
         b = await store.resolve(request.cookies.get(cookie_name))
         if b is None:
@@ -280,9 +336,32 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         await _maybe_await(getattr(manager, "touch", lambda _: None)(b.user_id))
         return b, None
 
+    async def resume_existing(request: web.Request) -> Optional[str]:
+        resolver = getattr(store, "resolve_resume", None)
+        token = request.cookies.get(resume_cookie_name)
+        if not callable(resolver) or not token:
+            return None
+        user_id = await _maybe_await(resolver(token))
+        if not user_id:
+            return None
+        if manager.get(user_id) is None and user_id not in pending_sessions:
+            revoke = getattr(store, "revoke_resume", None)
+            if callable(revoke):
+                await _maybe_await(revoke(user_id))
+            return None
+        sid = await store.bind(user_id)
+        await _maybe_await(getattr(manager, "touch", lambda _: None)(user_id))
+        return sid
+
     async def index(request: web.Request) -> web.Response:
         b, error = await binding(request)
         if error:
+            recovered_sid = await resume_existing(request)
+            if recovered_sid:
+                response = web.Response(status=302,
+                                        headers={"Location": root_for(request) + "/"})
+                set_session_cookie(response, request, recovered_sid)
+                return response
             # unauthenticated browser sees the login page, never a user list
             start = root_for(request) + "/ephemeral/start"
             response = web.Response(text=LOGIN_HTML.replace("__START__", escape(start)),
@@ -302,6 +381,12 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         if not allowed:
             return web.json_response({"error": "rate_limited", "retry_after": retry},
                                      status=429, headers={"Retry-After": str(max(1, int(retry)))})
+        recovered_sid = await resume_existing(request)
+        if recovered_sid:
+            response = web.Response(status=302,
+                                    headers={"Location": root_for(request) + "/"})
+            set_session_cookie(response, request, recovered_sid)
+            return response
         async with create_lock:
             existing = {b.user_id for _, b in await store.snapshot()}
             active = len(existing) + pending_creates
@@ -313,6 +398,11 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         # Bind before starting: BotSession.start() may block while waiting for
         # QR confirmation.  The browser must receive its cookie immediately.
         sid = await store.bind(user_id)
+        issue_resume = getattr(store, "issue_resume", None)
+        resume_token = (
+            await _maybe_await(issue_resume(user_id))
+            if callable(issue_resume) else ""
+        )
 
         async def create_when_ready() -> None:
             session_config = cfg.get("session_config")
@@ -344,6 +434,9 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                     await _maybe_await(manager.stop(user_id))
                 except Exception:
                     pass
+                revoke = getattr(store, "revoke_resume", None)
+                if callable(revoke):
+                    await _maybe_await(revoke(user_id))
                 raise
             finally:
                 pending_sessions.pop(user_id, None)
@@ -371,6 +464,9 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                 )
         except Exception as exc:
             await store.remove(sid)
+            revoke = getattr(store, "revoke_resume", None)
+            if callable(revoke):
+                await _maybe_await(revoke(user_id))
             log.warning("shared session create failed err=%s", exc)
             return web.json_response({"error": "session_create_failed"}, status=503)
         finally:
@@ -378,15 +474,9 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                 pending_creates -= 1
         response = web.Response(status=302,
                                 headers={"Location": root_for(request) + "/"})
-        secure_setting = cfg.get("cookie_secure")
-        secure_cookie = (
-            request.secure
-            or (_as_bool(cfg.get("trust_proxy"))
-                and request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower() == "https")
-        ) if secure_setting is None else _as_bool(secure_setting)
-        response.set_cookie(cookie_name, sid, max_age=int(store.ttl), httponly=True,
-                            samesite="Lax", secure=secure_cookie,
-                            path="/")
+        set_session_cookie(response, request, sid)
+        if resume_token:
+            set_resume_cookie(response, request, resume_token)
         return response
 
     async def state(request: web.Request) -> web.Response:

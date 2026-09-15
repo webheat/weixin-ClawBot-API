@@ -125,6 +125,11 @@ class BotSession:
         self._relogin_lock = asyncio.Lock()
         self._pending_relogin: asyncio.Future | None = None
         self._reconnect_lock = asyncio.Lock()
+        # Keep an authenticated session alive while its credential is being
+        # replaced.  _reconnect() intentionally clears bot_token before QR
+        # login, so the token alone cannot describe this transitional state.
+        self._reauthenticating = False
+        self._reauthentication_required = False
         self._initializing = False
         self._started = False
         self._stopped = False
@@ -145,7 +150,11 @@ class BotSession:
         returned a bot token, the connection is owned by the background
         session and must outlive an idle browser tab.
         """
-        return bool(str(self._token_ref[0] or self.bot_token or "").strip())
+        return bool(
+            str(self._token_ref[0] or self.bot_token or "").strip()
+            or self._reauthenticating
+            or self._reauthentication_required
+        )
 
     @staticmethod
     def _make_ai(config: dict[str, Any]) -> Any:
@@ -304,22 +313,46 @@ class BotSession:
         async with self._reconnect_lock:
             self.qr_state.is_regenerating = True
             self.qr_state.status = "qr_pending"
+            # Never pass a stale token back through local_token_list.  When
+            # iLink returns binded_redirect, login_with_qrcode may otherwise
+            # treat that token as reusable and complete a "relogin" with the
+            # same invalid credential forever.
             current = self.bot_token
+            current_base = self.baseurl
+            had_authenticated_connection = bool(
+                current or self._reauthentication_required
+            )
+            self._reauthenticating = had_authenticated_connection
+            self.bot_token = ""
+            self._token_ref[0] = ""
+            self.runtime_state["bot_token"] = ""
+            self.save_state()
             try:
                 result = await self._login(reconnect=True)
-                if result.get("already_connected") and current:
-                    result = {**result, "bot_token": current,
-                              "baseurl": self.baseurl,
-                              "ilink_bot_id": self.ilink_bot_id,
-                              "ilink_user_id": self.ilink_user_id}
+                if result.get("already_connected"):
+                    # Without a local token, binded_redirect is not a valid
+                    # login result.  login_with_qrcode normally regenerates
+                    # the QR; keep this guard for custom/test login hooks.
+                    raise RuntimeError("iLink 返回 binded_redirect，但没有可复用的本地 token")
+                if current:
+                    await notify_lifecycle(self.http, "ilink/bot/msg/notifystop",
+                                           current, current_base)
                 await self._apply_login(result)
+                self._reauthenticating = False
+                self._reauthentication_required = False
                 return result
             except Exception as exc:
+                # A failed QR attempt must remain recoverable from the web
+                # control plane.  Do not let browser-binding expiry reap a
+                # previously authenticated session while it has no token.
+                if had_authenticated_connection:
+                    self._reauthentication_required = True
                 self.qr_state.status = "error"
                 self.qr_state.last_error = str(exc)
                 await self._emit("relogin_failed", error=str(exc))
                 raise
             finally:
+                self._reauthenticating = False
                 self.qr_state.is_regenerating = False
 
     async def request_relogin(self, reason: str = "manual") -> dict[str, Any]:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from typing import Any
 
 import pytest
@@ -196,6 +197,96 @@ async def test_voice_without_transcript_has_no_misleading_reply(
 
     assert sess._contract_ai.calls == []
     assert not any("听不到" in item or "当前版本支持文字" in item for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_does_not_reuse_stale_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A -14 recovery must request a genuinely new iLink credential."""
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "stale-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+
+    observed: dict[str, Any] = {}
+
+    async def fake_login(*, reconnect: bool = False) -> dict[str, Any]:
+        observed["reconnect"] = reconnect
+        observed["token_during_login"] = sess.bot_token
+        observed["saved_token_during_login"] = sess.runtime_state.get("bot_token")
+        observed["persisted_token_during_login"] = json.loads(
+            sess.state_file.read_text(encoding="utf-8")
+        ).get("bot_token")
+        observed["authenticated_during_login"] = sess.has_authenticated_connection
+        return {
+            "bot_token": "fresh-token",
+            "baseurl": "https://new.invalid",
+            "ilink_bot_id": "bot-id",
+        }
+
+    async def fake_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(sess, "_login", fake_login)
+    import bot as protocol
+    monkeypatch.setattr(protocol, "notify_lifecycle", fake_notify)
+
+    result = await sess._reconnect()
+
+    assert observed == {
+        "reconnect": True,
+        "token_during_login": "",
+        "saved_token_during_login": "",
+        "persisted_token_during_login": "",
+        "authenticated_during_login": True,
+    }
+    assert result["bot_token"] == "fresh-token"
+    assert sess.bot_token == "fresh-token"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_relogin_requests_share_one_reconnect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "authenticated-token"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fake_reconnect() -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return {"bot_token": "fresh-token"}
+
+    monkeypatch.setattr(sess, "_reconnect", fake_reconnect)
+    listener = asyncio.create_task(sess._relogin_listener())
+    try:
+        first = asyncio.create_task(sess.request_relogin("stale-token"))
+        second = asyncio.create_task(sess.request_relogin("web switch"))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert calls == 1
+        release.set()
+        assert await asyncio.gather(first, second) == [
+            {"bot_token": "fresh-token"}, {"bot_token": "fresh-token"}
+        ]
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
+
+
+def test_only_explicit_minus_14_is_classified_as_stale_token() -> None:
+    from bot import ILinkAPIError
+
+    assert ILinkAPIError("stale", ret=-14).is_stale_token
+    for code in (-1, -13, 1, 500, None):
+        assert not ILinkAPIError("other", ret=code).is_stale_token
 
 
 @pytest.mark.asyncio

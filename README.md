@@ -144,7 +144,7 @@ python bot.py --user alice
 | `qrcode_scan_timeout` | `480` | 整体扫码等待上限（秒） |
 | `proactive_relogin` | `False` | 兼容旧版的本地计时主动扫码开关，生产不要开启 |
 
-`session_duration` / `warning_before` / `force_before` 不是服务端承诺的 token 生命周期；默认仅保留用于兼容 `/time` 等旧接口。网页会话 TTL 到期会回收网页绑定，但不会停止尚未失效的后台 BotSession；只有尚未扫码成功的临时会话才会被停止。
+`session_duration` / `warning_before` / `force_before` 不是服务端承诺的 token 生命周期；默认仅保留用于兼容 `/time` 等旧接口。网页会话 TTL 到期会回收网页绑定，但不会停止尚未失效的后台 BotSession；只有尚未扫码成功的临时会话才会被停止。临时登录同时保存独立的随机恢复 cookie（默认 30 天），控制页闲置后重新打开会自动绑定回原后台 session，不会把 `user_id` 放进 cookie。
 
 ## OpenClaw Weixin 2.4.6 协议要点
 
