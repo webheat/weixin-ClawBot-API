@@ -499,7 +499,12 @@ class BotSession:
                                 self._token_ref, self._base_url_ref)
         if not text:
             await self._send_reliable(
-                msg, from_id, context, "当前版本支持文字、语音转文字和链接卡片。", "empty-hint"
+                msg,
+                from_id,
+                context,
+                "当前版本支持：文字、语音转文字、链接/公众号/小程序卡片（标题+描述）。"
+                "图片/视频/文件暂不支持处理。",
+                "empty-hint",
             )
             return
         if normalized == "/HELP" or text == "/指令":
