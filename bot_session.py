@@ -296,6 +296,25 @@ class BotSession:
         if changed or initial:
             self.typing_ticket_cache.clear()
             await notify_lifecycle(self.http, "ilink/bot/msg/notifystart", self.bot_token, self.baseurl)
+        # Per-user IMA KB 绑定（docs/IMA_PER_USER_BINDING.md §3）：运行时**不**
+        # 写 ima_bindings.json —— 绑定只能由用户在 web UI 或 /bindkb 命令主动
+        # 设置。这里只读一次、记一行日志，便于排查"这个 owner 当前 KB 是什么"。
+        if self.ilink_user_id:
+            try:
+                from utils.ima_bindings import get_default_bindings as _get_bindings
+                from utils.logging_setup import get_logger as _get_logger
+                bindings = await _get_bindings()
+                existing = bindings.lookup(self.ilink_user_id)
+                _get_logger("ima_bindings").info(
+                    "apply_login user=%s kb=%s",
+                    self.ilink_user_id[-12:],
+                    (existing.get("kb_id") if existing else None) or "-",
+                )
+            except Exception as exc:  # 持久化层异常不影响登录流程
+                from utils.logging_setup import get_logger as _get_logger
+                _get_logger("ima_bindings").debug(
+                    "apply_login binding lookup skipped err=%s", exc
+                )
         await self._emit("logged_in", account_changed=account_changed)
 
     async def _login(self, *, reconnect: bool = False) -> dict[str, Any]:

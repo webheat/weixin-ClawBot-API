@@ -11,6 +11,10 @@ weixin_state.json
 config_*.json
 weixin_state_*.json
 
+# Per-user IMA KB 绑定（含 ilink_user_id → kb_id 映射，ilink_user_id 算敏感）
+ima_bindings.json
+ima_bindings_*.json
+
 # Runtime state files (含真实 openid / bot 启动信息)，不入库
 var/
 !var/.gitkeep

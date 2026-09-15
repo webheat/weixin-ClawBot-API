@@ -26,7 +26,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from html import escape
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from aiohttp import web
 
@@ -240,26 +240,117 @@ async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
+def _build_ima_client(ima_env: Mapping[str, str] | None) -> Optional[Any]:
+    """从 per-session ``ima_env`` 字典构造 ImaClient（共享凭据，不污染 os.environ）。
+
+    shared_runtime 已经把 ``/etc/clawbot/ima.env`` 解析成字典塞到
+    ``session_config["ima_env"]`` 里 —— 这里拿这份字典构造，避免 web 端去读
+    ``os.environ``（多账号场景下会拿错）。凭据缺失返回 ``None``。
+    """
+    if not ima_env:
+        return None
+    try:
+        from ima import ImaClient, ImaConfig
+
+        def _f(name: str, default: str) -> str:
+            v = str(ima_env.get(name) or "")
+            return v if v else default
+
+        def _bool(name: str) -> bool:
+            return str(ima_env.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+        def _int(name: str, default: int) -> int:
+            try:
+                return int(str(ima_env.get(name) or default))
+            except (TypeError, ValueError):
+                return default
+
+        def _float(name: str, default: float) -> float:
+            try:
+                v = float(str(ima_env.get(name) or ""))
+                return v if v > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        search_limit = max(1, _int("IMA_ILINK_SEARCH_LIMIT", 5))
+        cfg = ImaConfig(
+            base_url=_f("IMA_ILINK_BASE_URL", "https://ima.qq.com").rstrip("/"),
+            client_id=_f("IMA_ILINK_CLIENT_ID", ""),
+            api_key=_f("IMA_ILINK_API_KEY", ""),
+            default_knowledge_base_id=_f("IMA_ILINK_DEFAULT_KB", ""),
+            timeout=_float("IMA_ILINK_TIMEOUT", 15.0),
+            search_limit=search_limit,
+            rerank_enabled=_bool("IMA_ILINK_RERANK"),
+            rerank_top_k=max(1, min(_int("IMA_ILINK_RERANK_TOP_K", 3), search_limit)),
+            fetch_body=_bool("IMA_ILINK_FETCH_BODY"),
+            keyword_extract=_bool("IMA_ILINK_KEYWORD_EXTRACT"),
+        )
+        if not cfg.configured():
+            return None
+        return ImaClient(cfg)
+    except Exception as exc:  # 构造异常不能让 web UI 崩
+        log.warning("build_ima_client failed err=%s", exc)
+        return None
+
+
+def _wants_json(request: web.Request) -> bool:
+    """POST/PUT 后客户端期望 JSON 而非 HTML 时使用。"""
+    accept = request.headers.get("Accept", "")
+    return "application/json" in accept
+
+
 INDEX_HTML = """<!doctype html><html lang=zh-CN><meta charset=utf-8>
 <meta name=viewport content=\"width=device-width,initial-scale=1\"><title>ClawBot 登录</title>
 <style>body{font-family:system-ui,sans-serif;max-width:480px;margin:24px auto;padding:0 16px;color:#222}
-.card{border:1px solid #ddd;border-radius:12px;padding:20px;text-align:center}.qr{display:inline-block;
-padding:12px;min-width:220px;min-height:220px;line-height:220px}.qr img{max-width:280px}
-button{font-size:16px;padding:9px 18px;border:0;border-radius:6px;background:#07c160;color:#fff}
-input{font-size:18px;padding:8px;width:150px}.ok{color:#07c160;font-weight:600}.err{color:#c00}</style>
+.card{border:1px solid #ddd;border-radius:12px;padding:20px;text-align:center;margin-bottom:14px}
+.card.left{text-align:left}.qr{display:inline-block;padding:12px;min-width:220px;min-height:220px;line-height:220px}
+.qr img{max-width:280px}button{font-size:16px;padding:9px 18px;border:0;border-radius:6px;background:#07c160;color:#fff}
+button.gray{background:#888}input{font-size:18px;padding:8px;width:150px}.ok{color:#07c160;font-weight:600}.err{color:#c00}
+.kb-card{font-size:14px;line-height:1.6}.kb-card .kb-line{word-break:break-all}
+.kb-card .kb-name{font-weight:600;color:#222}.kb-actions{margin-top:10px}
+.kb-actions form, .kb-actions a{display:inline-block;margin-right:6px}
+.kb-actions button{font-size:13px;padding:6px 12px}
+.kb-actions .gray{background:#888}
+.kb-actions .red{background:#c0392b}
+</style>
 <body><h1>ClawBot 微信登录</h1><div class=card><div id=status>等待登录...</div>
 <div id=qr class=qr>—</div><form id=verify style=display:none><input id=code inputmode=numeric
 pattern=\\d{4,8} minlength=4 maxlength=8 placeholder=配对码 required><button>提交</button></form>
 <p id=error class=err></p><button id=switch type=button style=display:none>切换用户</button></div>
+<div id=kbcard class=card left kbcard style=display:none>
+  <div class=kb-card>
+    <div>当前知识库：</div>
+    <div class=kb-line><span id=kblabel class=kb-name>—</span></div>
+    <div class=kb-actions id=kbactions></div>
+  </div>
+</div>
 <script>
 const root=__ROOT__, csrf=__CSRF__;
 async function poll(){try{let r=await fetch(root+'/state',{cache:'no-store'});if(r.status===401){location.reload();return}if(!r.ok)throw Error(r.status);render(await r.json())}
 catch(e){document.querySelector('#error').textContent='拉取状态失败：'+e}setTimeout(poll,1000)}
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function render(s){let st=document.querySelector('#status'),q=document.querySelector('#qr'),f=document.querySelector('#verify'),sw=document.querySelector('#switch');
  document.querySelector('#error').textContent=s.last_error||'';sw.style.display='inline-block';
- if(s.status==='logged_in'){st.innerHTML='<span class=ok>登录成功 ✓</span>';q.innerHTML='✓';f.style.display='none';return}
- st.textContent=s.is_regenerating?'正在生成新二维码...':(s.status==='qr_pending'?'请用微信扫描下方二维码':(s.status==='scanned'?'已扫码，请在手机上确认...':s.status));
- q.innerHTML=s.is_regenerating?'⟳':(s.has_qr_png?'<img alt=QR src="'+root+'/qrcode.png?v='+s.qr_seq+'">':'—');f.style.display=s.verify_prompt?'flex':'none'}
+ if(s.status==='logged_in'){st.innerHTML='<span class=ok>登录成功 ✓</span>';q.innerHTML='✓';f.style.display='none';} else {
+   st.textContent=s.is_regenerating?'正在生成新二维码...':(s.status==='qr_pending'?'请用微信扫描下方二维码':(s.status==='scanned'?'已扫码，请在手机上确认...':s.status));
+   q.innerHTML=s.is_regenerating?'⟳':(s.has_qr_png?'<img alt=QR src="'+root+'/qrcode.png?v='+s.qr_seq+'">':'—');f.style.display=s.verify_prompt?'flex':'none';
+ }
+ renderKb(s);}
+function renderKb(s){
+ let card=document.querySelector('#kbcard'),label=document.querySelector('#kblabel'),actions=document.querySelector('#kbactions');
+ if(!s.ilink_user_id){card.style.display='none';return;}
+ card.style.display='block';
+ if(s.kb_binding && s.kb_binding.kb_id){
+   label.textContent=(s.kb_binding.kb_name||'(未命名)')+'（'+s.kb_binding.kb_id+'）';
+   actions.innerHTML=
+     '<a href="'+root+'/ima/bind"><button class=gray>更换</button></a>'+
+     '<form method=post action="'+root+'/ima/unbind" style=display:inline onsubmit="return true">'+
+     '<input type=hidden name=csrf value="'+escapeHtml(csrf)+'">'+
+     '<button type=submit class=red>解绑</button></form>';
+ } else {
+   label.textContent='未绑定（回退默认 IMA_ILINK_DEFAULT_KB）';
+   actions.innerHTML='<a href="'+root+'/ima/bind"><button>绑定</button></a>';
+ }}
  document.querySelector('#verify').onsubmit=async e=>{e.preventDefault();let c=document.querySelector('#code').value.trim();
  if(!/^\\d{4,8}$/.test(c))return;let r=await fetch(root+'/verify_code',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({code:c})});
  if(!r.ok)document.querySelector('#error').textContent='提交失败：'+r.status;else document.querySelector('#code').value=''};
@@ -270,6 +361,62 @@ LOGIN_HTML = """<!doctype html><meta charset=utf-8><meta name=viewport content=\
 <title>ClawBot 登录</title><style>body{font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0;background:#f6f7f9}
 .card{background:#fff;padding:48px;border-radius:12px;text-align:center;box-shadow:0 4px 20px #0001}button{padding:14px 32px;background:#07c160;color:#fff;border:0;border-radius:8px;font-size:16px}</style>
 <div class=card><h1>ClawBot 控制台</h1><p>扫码创建一个微信会话</p><form method=post action=\"__START__\"><button>扫码登录</button></form></div>"""
+
+
+BIND_HTML = """<!doctype html><html lang=zh-CN><meta charset=utf-8>
+<meta name=viewport content=\"width=device-width,initial-scale=1\"><title>选择 IMA 知识库</title>
+<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:24px auto;padding:0 16px;color:#222}
+.card{border:1px solid #ddd;border-radius:12px;padding:20px;margin-bottom:16px}
+h1{font-size:18px;margin:0 0 12px}.row{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #f3f3f3}
+.row:last-child{border-bottom:0}.row label{cursor:pointer;flex:1}
+.kb-id{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#888}
+.kb-type{font-size:11px;color:#fff;background:#07c160;padding:1px 6px;border-radius:4px;margin-left:6px}
+.kb-type.sub{background:#5b6cf2}
+.btns{margin-top:16px;display:flex;gap:8px}
+button{font-size:14px;padding:8px 16px;border:0;border-radius:6px;background:#07c160;color:#fff;cursor:pointer}
+button.gray{background:#999}
+.err{color:#c00;font-size:13px;margin-top:8px}.ok{color:#07c160;font-weight:600;font-size:13px;margin-top:8px}
+a{color:#07c160;text-decoration:none}
+</style>
+<body><h1>选择你的 IMA 知识库</h1>
+<div class=card>
+<form method=post action=\"__ACTION__\" id=bindform>
+<input type=hidden name=csrf value=\"__CSRF__\">
+__KBS__
+<div class=btns><button type=submit>提交</button>
+<a href=\"__ROOT__\" class=\"gray\" style=\"padding:8px 16px;background:#999;color:#fff;border-radius:6px\">取消</a></div>
+</form>
+<p class=err>__ERR__</p>
+</div>
+<div class=card style=\"font-size:13px;color:#666\">
+当前账号：<code>__OWNER__</code><br>
+当前绑定：__CUR__
+</div>
+</body></html>"""
+
+
+def _render_kb_rows(kbs: list[dict], current_kb_id: str = "") -> str:
+    """生成 KB 单选列表 HTML 行；空列表返提示文案。"""
+    if not kbs:
+        return "<p style='color:#c00'>暂无可绑定的知识库（账号下没有共享或订阅类 KB）。</p>"
+    rows = []
+    for kb in kbs:
+        type_label = "共享" if kb.get("kb_type") == 1002 else "订阅"
+        type_class = "sub" if kb.get("kb_type") != 1002 else ""
+        checked = " checked" if kb.get("kb_id") == current_kb_id and current_kb_id else ""
+        rows.append(
+            f'<div class=row><label><input type=radio name=kb_id value="{escape(kb["kb_id"])}"{checked}> '
+            f'{escape(kb.get("kb_name") or "(未命名)")}'
+            f'<span class="kb-type {type_class}">{type_label}</span><br>'
+            f'<span class=kb-id>{escape(kb["kb_id"])}</span></label></div>'
+        )
+    return "\n".join(rows)
+
+
+def _render_current_label(binding: Optional[dict]) -> str:
+    if not binding:
+        return "未绑定（回退默认 KB）"
+    return f"{escape(binding.get('kb_name') or '(未命名)')}（{escape(binding.get('kb_id') or '')}）"
 
 
 def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
@@ -487,8 +634,24 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         session = manager.get(b.user_id)  # type: ignore[union-attr]
         if session is None:
             return web.json_response({"status": "starting", "has_qr_png": False}, status=202)
-        return web.json_response(_state_dict(getattr(session, "qr_state", None)),
-                                 headers={"Cache-Control": "no-store"})
+        body = _state_dict(getattr(session, "qr_state", None))
+        # Per-user IMA KB 绑定（docs/IMA_PER_USER_BINDING.md）：让 /state
+        # 顺手带出当前 owner 和 binding，省一次独立接口。前端 polling
+        # 1 秒一次，IMABindings.lookup 是同步内存命中，不构成负担。
+        body["ilink_user_id"] = str(getattr(session, "ilink_user_id", "") or "")
+        try:
+            from utils.ima_bindings import get_default_bindings as _get_bindings
+            bindings = await _get_bindings()
+            current = (
+                bindings.lookup(body["ilink_user_id"]) if body["ilink_user_id"] else None
+            )
+            body["kb_binding"] = (
+                {"kb_id": current.get("kb_id", ""), "kb_name": current.get("kb_name", "")}
+                if current else None
+            )
+        except Exception:
+            body["kb_binding"] = None
+        return web.json_response(body, headers={"Cache-Control": "no-store"})
 
     async def qrcode(request: web.Request) -> web.Response:
         b, error = await binding(request)
@@ -563,6 +726,160 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             event.set()
         return web.json_response({"ok": True, "status": _state_dict(getattr(session, "qr_state", None)).get("status")})
 
+    # ========== Per-user IMA KB 绑定路由（docs/IMA_WEB_UI.md） ==========
+    async def _get_ima_env() -> dict[str, str]:
+        """从 ``session_config.ima_env`` 读 per-session IMA 凭据字典。"""
+        session_config = cfg.get("session_config") or {}
+        return dict(session_config.get("ima_env") or {})
+
+    async def _get_owner_ilink_id(b: BrowserBinding) -> str:
+        """查 BotSession 的 ilink_user_id；不依赖 BotSession.ilink_user_id 存在性。"""
+        session = manager.get(b.user_id)
+        return str(getattr(session, "ilink_user_id", "") or "")
+
+    async def ima_bind_get(request: web.Request) -> web.Response:
+        b, error = await binding(request)
+        if error:
+            return error
+        owner_id = await _get_owner_ilink_id(b)
+        if not owner_id:
+            return web.json_response({"error": "not_logged_in"}, status=412)
+        # 拉取可绑定 KB
+        ima_env = await _get_ima_env()
+        client = _build_ima_client(ima_env)
+        kbs: list[dict] = []
+        kb_error = ""
+        if client is None:
+            kb_error = "IMA 未配置（缺 IMA_ILINK_CLIENT_ID / API_KEY）。"
+        else:
+            try:
+                kbs = await asyncio.get_running_loop().run_in_executor(
+                    None, client.list_searchable_kbs
+                )
+            except Exception as exc:
+                kb_error = f"拉取 KB 失败：{exc}"
+                log.warning("ima_bind list_searchable_kbs failed err=%s", exc)
+        # 当前 binding
+        current_kb_id = ""
+        current_label = "未绑定（回退默认 KB）"
+        try:
+            from utils.ima_bindings import get_default_bindings as _get_bindings
+            bindings = await _get_bindings()
+            existing = bindings.lookup(owner_id)
+            if existing:
+                current_kb_id = str(existing.get("kb_id") or "")
+                current_label = _render_current_label(existing)
+        except Exception:
+            pass
+        root = root_for(request) or ""
+        action = root + "/ima/bind"
+        page = (
+            BIND_HTML
+            .replace("__ACTION__", escape(action))
+            .replace("__CSRF__", escape(b.csrf_token))
+            .replace("__KBS__", _render_kb_rows(kbs, current_kb_id))
+            .replace("__ROOT__", escape(root + "/"))
+            .replace("__OWNER__", escape(owner_id))
+            .replace("__CUR__", current_label)
+            .replace("__ERR__", escape(kb_error))
+        )
+        return web.Response(text=page, content_type="text/html")
+
+    async def ima_bind_post(request: web.Request) -> web.Response:
+        b, error = await binding(request)
+        if error:
+            return error
+        if not secrets.compare_digest(
+                request.headers.get("X-CSRF-Token", ""), b.csrf_token):
+            return web.json_response({"error": "csrf"}, status=403)
+        owner_id = await _get_owner_ilink_id(b)
+        if not owner_id:
+            return web.json_response({"error": "not_logged_in"}, status=412)
+        # 接受 JSON 或 form
+        kb_id = ""
+        kb_name = ""
+        kb_type = 0
+        try:
+            ctype = request.headers.get("Content-Type", "").lower()
+            if "application/json" in ctype:
+                payload = await request.json()
+                kb_id = str((payload or {}).get("kb_id") or "").strip()
+                kb_name = str((payload or {}).get("kb_name") or "").strip()
+                try:
+                    kb_type = int((payload or {}).get("kb_type") or 0)
+                except (TypeError, ValueError):
+                    kb_type = 0
+            else:
+                form = await request.post()
+                kb_id = str(form.get("kb_id") or "").strip()
+        except Exception:
+            return web.json_response({"error": "invalid body"}, status=400)
+        if not kb_id:
+            return web.json_response({"error": "kb_id required"}, status=400)
+        if kb_type not in (1002, 1004):
+            return web.json_response(
+                {"error": "kb_type must be 1002 (shared) or 1004 (subscribed)"},
+                status=400,
+            )
+        # 用真实列表再校验 kb_id 存在；防前端伪造
+        client = _build_ima_client(await _get_ima_env())
+        if client is not None:
+            try:
+                kbs = await asyncio.get_running_loop().run_in_executor(
+                    None, client.list_searchable_kbs
+                )
+                matched = next((kb for kb in kbs if kb.get("kb_id") == kb_id), None)
+                if matched is None:
+                    return web.json_response(
+                        {"error": "kb_id not in searchable list"}, status=400,
+                    )
+                # 用 IMA 服务端的真实 name / type 覆盖客户端字段（防 spoofing）
+                kb_id = str(matched.get("kb_id") or kb_id)
+                kb_name = str(matched.get("kb_name") or kb_name)
+                kb_type = int(matched.get("kb_type") or kb_type)
+            except Exception as exc:
+                # 校验失败时仍允许写入（高可用优先）；但记 warn
+                log.warning("ima_bind_post re-validate failed err=%s", exc)
+        try:
+            from utils.ima_bindings import get_default_bindings as _get_bindings
+            bindings = await _get_bindings()
+            bot_id_at_bind = ""
+            session = manager.get(b.user_id)
+            if session is not None:
+                bot_id_at_bind = str(getattr(session, "ilink_bot_id", "") or "")
+            await bindings.bind(
+                owner_id, kb_id, kb_name, kb_type,
+                bound_by="web",
+                bot_id_at_bind=bot_id_at_bind,
+            )
+        except Exception as exc:
+            log.warning("ima_bind_post bind failed err=%s", exc)
+            return web.json_response({"error": f"bind failed: {exc}"}, status=500)
+        if _wants_json(request):
+            return web.json_response({"ok": True, "kb_id": kb_id})
+        return web.HTTPFound(root_for(request) + "/")
+
+    async def ima_unbind_post(request: web.Request) -> web.Response:
+        b, error = await binding(request)
+        if error:
+            return error
+        if not secrets.compare_digest(
+                request.headers.get("X-CSRF-Token", ""), b.csrf_token):
+            return web.json_response({"error": "csrf"}, status=403)
+        owner_id = await _get_owner_ilink_id(b)
+        if not owner_id:
+            return web.json_response({"error": "not_logged_in"}, status=412)
+        try:
+            from utils.ima_bindings import get_default_bindings as _get_bindings
+            bindings = await _get_bindings()
+            removed = await bindings.unbind(owner_id)
+        except Exception as exc:
+            log.warning("ima_unbind_post failed err=%s", exc)
+            return web.json_response({"error": f"unbind failed: {exc}"}, status=500)
+        if _wants_json(request):
+            return web.json_response({"ok": True, "removed": removed})
+        return web.HTTPFound(root_for(request) + "/")
+
     async def healthz(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "shared_process": True})
 
@@ -616,6 +933,8 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         for suffix, method, handler in (("/", "GET", index), ("/state", "GET", state),
             ("/qrcode.png", "GET", qrcode), ("/verify_code", "POST", verify_code),
             ("/switch", "POST", switch),
+            ("/ima/bind", "GET", ima_bind_get), ("/ima/bind", "POST", ima_bind_post),
+            ("/ima/unbind", "POST", ima_unbind_post),
             ("/ephemeral/start", "POST", ephemeral_start), ("/healthz", "GET", healthz)):
             path = (base.rstrip("/") + suffix) or "/"
             app.router.add_route(method, path, handler)
@@ -624,6 +943,8 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         for suffix, method, handler in (("/", "GET", index), ("/state", "GET", state),
             ("/qrcode.png", "GET", qrcode), ("/verify_code", "POST", verify_code),
             ("/switch", "POST", switch),
+            ("/ima/bind", "GET", ima_bind_get), ("/ima/bind", "POST", ima_bind_post),
+            ("/ima/unbind", "POST", ima_unbind_post),
             ("/ephemeral/start", "POST", ephemeral_start), ("/healthz", "GET", healthz)):
             app.router.add_route(method, suffix, handler)
     return app

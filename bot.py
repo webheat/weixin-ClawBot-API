@@ -9,6 +9,7 @@ import re
 import secrets
 import time
 import urllib.request
+from functools import partial
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -22,6 +23,7 @@ from ima import ImaClient, ImaConfig, build_context_prompt as _ima_build_context
 from qr_web import QrFlowState, make_web_on_qrcode, wait_for_verify_code, web_enabled, start as qr_web_start
 from utils.local_kb import LocalKBIndex
 from utils.logging_setup import get_logger
+from utils.ima_bindings import get_default_bindings as _get_ima_bindings
 
 try:
     from utils.semantic_kb import SemanticKBIndex  # 4 档 mode: llm+semantic
@@ -2013,6 +2015,157 @@ async def main():
                     )
                 return
 
+            # ========== Per-user IMA KB 绑定命令（docs/IMA_WEB_UI.md §4.3） ==========
+            # 仅 bot 主人（from_id == ilink_user_id）可操作；他人拒绝。
+            owner_id_cmd = str(runtime_state.get("ilink_user_id") or "")
+            if text.startswith("/bindkb") or text in ("/unbindkb", "/mykb"):
+                if not owner_id_cmd:
+                    await send_msg_safe(
+                        session, from_id, context_token,
+                        "尚未绑定到 iLink 账号，请先完成扫码登录后再管理知识库。",
+                        bot_token_ref, bot_base_url_ref,
+                    )
+                    return
+                if from_id != owner_id_cmd:
+                    log_msg.warning(
+                        "ima cmd denied cmd=%s from=%s owner=%s",
+                        text.split()[0], from_id[-8:], owner_id_cmd[-8:],
+                    )
+                    await send_msg_safe(
+                        session, from_id, context_token,
+                        "❌ 权限不足：只有 bot 主人能管理知识库",
+                        bot_token_ref, bot_base_url_ref,
+                    )
+                    return
+                # 鉴权通过；进入分支
+                cmd_parts = text.split(maxsplit=1)
+                cmd = cmd_parts[0].upper()
+                arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+                log_msg.debug("handle command name=%s from=%s", cmd, from_id[-8:])
+                if cmd == "/MYKB":
+                    try:
+                        bindings = await _get_ima_bindings()
+                        b = bindings.lookup(owner_id_cmd)
+                    except Exception as exc:
+                        log_msg.warning("mykb lookup failed err=%s", exc)
+                        b = None
+                    if b:
+                        kb_label = b.get("kb_name") or "(未命名)"
+                        text_reply = (
+                            f"当前知识库：{kb_label}（{b.get('kb_id', '')}）\n"
+                            f"绑定时间：{b.get('bound_at', '')}"
+                        )
+                    else:
+                        text_reply = "当前知识库：未绑定（回退默认 IMA_ILINK_DEFAULT_KB）"
+                    await send_msg_safe(session, from_id, context_token, text_reply,
+                                        bot_token_ref, bot_base_url_ref)
+                    return
+                if cmd == "/UNBINDKB":
+                    try:
+                        bindings = await _get_ima_bindings()
+                        removed = await bindings.unbind(owner_id_cmd)
+                    except Exception as exc:
+                        log_msg.warning("unbindkb failed err=%s", exc)
+                        removed = False
+                    text_reply = (
+                        "✅ 已解绑知识库，后续问答将回退到默认 KB。"
+                        if removed else "当前没有绑定的知识库。"
+                    )
+                    await send_msg_safe(session, from_id, context_token, text_reply,
+                                        bot_token_ref, bot_base_url_ref)
+                    return
+                if cmd == "/BINDKB":
+                    # 构造 ImaClient 拿可绑定列表；与 bot_session._make_ai 同模式
+                    ima_cfg = ImaConfig.from_env()
+                    if not ima_cfg.configured():
+                        await send_msg_safe(
+                            session, from_id, context_token,
+                            "❌ IMA 未配置（缺 IMA_ILINK_CLIENT_ID / API_KEY），无法绑定。",
+                            bot_token_ref, bot_base_url_ref,
+                        )
+                        return
+                    try:
+                        client = ImaClient(ima_cfg)
+                        kbs = client.list_searchable_kbs()
+                    except Exception as exc:
+                        log_msg.warning("bindkb list_searchable_kbs failed err=%s", exc)
+                        await send_msg_safe(
+                            session, from_id, context_token,
+                            f"❌ 拉取 IMA 知识库列表失败：{_redact_text(exc)}",
+                            bot_token_ref, bot_base_url_ref,
+                        )
+                        return
+                    if not arg:
+                        # 无参数：列出可绑定 KB
+                        if not kbs:
+                            text_reply = "暂无可绑定的知识库（账号下没有共享或订阅类 KB）。"
+                        else:
+                            lines = ["可绑定的 IMA 知识库："]
+                            for idx, kb in enumerate(kbs, 1):
+                                type_label = "共享" if kb["kb_type"] == 1002 else "订阅"
+                                lines.append(
+                                    f"  {idx}. {kb['kb_name']} [{type_label}] "
+                                    f"({kb['kb_id'][:12]}…)"
+                                )
+                            lines.append("\n回复 /bindkb <kb_id> 完成绑定。")
+                            text_reply = "\n".join(lines)
+                        await send_msg_safe(session, from_id, context_token, text_reply,
+                                            bot_token_ref, bot_base_url_ref)
+                        return
+                    # 有参数：按 kb_id 查找并绑定
+                    matched = None
+                    for kb in kbs:
+                        if kb["kb_id"] == arg:
+                            matched = kb
+                            break
+                    if matched is None:
+                        # 接受前缀匹配（kb_id 可能被截断显示），但要求唯一命中
+                        prefix_matches = [kb for kb in kbs if kb["kb_id"].startswith(arg)]
+                        if len(prefix_matches) == 1:
+                            matched = prefix_matches[0]
+                        elif len(prefix_matches) > 1:
+                            text_reply = (
+                                f"❌ 前缀 {arg!r} 命中 {len(prefix_matches)} 个 KB，"
+                                "请提供完整 kb_id。"
+                            )
+                            await send_msg_safe(session, from_id, context_token, text_reply,
+                                                bot_token_ref, bot_base_url_ref)
+                            return
+                    if matched is None:
+                        text_reply = (
+                            f"❌ 未找到 kb_id={arg!r}。先发 /bindkb 查看可绑定列表。"
+                        )
+                        await send_msg_safe(session, from_id, context_token, text_reply,
+                                            bot_token_ref, bot_base_url_ref)
+                        return
+                    try:
+                        bindings = await _get_ima_bindings()
+                        await bindings.bind(
+                            owner_id_cmd,
+                            matched["kb_id"],
+                            matched["kb_name"],
+                            int(matched["kb_type"]),
+                            bound_by="wechat",
+                            bot_id_at_bind=str(
+                                runtime_state.get("ilink_bot_id") or ""
+                            ),
+                        )
+                    except Exception as exc:
+                        log_msg.warning("bindkb failed err=%s", exc)
+                        await send_msg_safe(
+                            session, from_id, context_token,
+                            f"❌ 绑定失败：{_redact_text(exc)}",
+                            bot_token_ref, bot_base_url_ref,
+                        )
+                        return
+                    text_reply = (
+                        f"✅ 已绑定 KB: {matched['kb_name']}（{matched['kb_id']}）\n"
+                        "下一条消息开始生效。"
+                    )
+                    await send_msg_safe(session, from_id, context_token, text_reply,
+                                        bot_token_ref, bot_base_url_ref)
+                    return
+
             typing_ticket = await get_typing_ticket_safe(
                 session,
                 from_id,
@@ -2026,13 +2179,29 @@ async def main():
             t_ai_start = time.perf_counter()
             log_ai.info("ai call start from=%s prompt_chars=%d",
                         from_id[-8:] if from_id else "-", len(text))
+            # Per-user IMA KB 绑定（docs/IMA_PER_USER_BINDING.md）：
+            # 按 ilink_user_id 查 ima_bindings.json，把命中的 kb_id 透传给
+            # _AIWithIma.chat；未命中走 IMA_ILINK_DEFAULT_KB 兜底。lookup 走
+            # 单例 IMABindings（asyncio.Lock 序列化 bind/unbind）。
+            owner_id = str(runtime_state.get("ilink_user_id") or "")
+            kb_id: Optional[str] = None
+            if owner_id:
+                try:
+                    bindings = await _get_ima_bindings()
+                    kb_id = bindings.lookup_kb_id(owner_id)
+                except Exception as exc:  # 持久化层异常不能让回复失败
+                    log_ai.warning("ima_bindings lookup failed user=%s err=%s",
+                                   owner_id[-8:], exc)
+                    kb_id = None
             try:
                 typing_started = await send_typing_safe(
                     session, from_id, typing_ticket, 1, bot_token_ref, bot_base_url_ref,
                 )
                 try:
                     loop = asyncio.get_running_loop()
-                    reply = await loop.run_in_executor(executor, ai.chat, text)
+                    reply = await loop.run_in_executor(
+                        executor, partial(ai.chat, text, kb_id=kb_id),
+                    )
                 except Exception as exc:
                     dur_ms = (time.perf_counter() - t_ai_start) * 1000
                     log_ai.warning("ai call failed from=%s dur_ms=%.0f err=%s",
@@ -2357,11 +2526,19 @@ class _AIWithIma:
                 break
         return terms[:3]
 
-    def _search_ima_merged(self, terms: list[str], limit: int) -> list:
+    def _search_ima_merged(
+        self,
+        terms: list[str],
+        limit: int,
+        *,
+        knowledge_base_id: Optional[str] = None,
+    ) -> list:
         """对一组关键词分别搜 IMA，合并 hits 并按 media_id 去重（保留先出现顺序）。
 
         第一个 term 通常是 LLM 判定的最强信号，其结果排前面；后续 term 补充召回。
         每个 term 单独 search 时 limit 自动收紧，避免一次 IMA 调用返回太多。
+        ``knowledge_base_id`` 透传到 :meth:`ImaClient.search_knowledge`；为 ``None``
+        时回落到 ``ImaConfig.default_knowledge_base_id``（ima.py:507-512 已处理）。
         """
         seen: set[str] = set()
         merged: list = []
@@ -2371,7 +2548,11 @@ class _AIWithIma:
             # 第一个 term 用完整 limit；后续 term 用更小的 limit 节省资源
             per_limit = limit if i == 0 else max(2, limit - i)
             try:
-                hits = self._ima.search_knowledge(term, limit=per_limit)
+                hits = self._ima.search_knowledge(
+                    term,
+                    limit=per_limit,
+                    knowledge_base_id=knowledge_base_id,
+                )
             except Exception as exc:  # 单 term 失败不阻塞其它
                 log_ima.warning("ai ima search term=%r failed err=%s", term, exc)
                 continue
@@ -2401,10 +2582,17 @@ class _AIWithIma:
           ``mode=llm+semantic reason=semantic-fallback``    IMA 0 + local 0，语义检索兜底
                                                             （SEMANTIC_KB_ENABLED=1）
         一行 ``[AI 路由] mode=...`` 同步打到终端，方便肉眼确认本次回答走了哪条路径。
+
+        新增 ``kb_id`` kwarg（per-user IMA 绑定，``docs/IMA_PER_USER_BINDING.md``）；
+        非空时透传给 ``ImaClient.search_knowledge``，为空时继续走
+        ``ImaConfig.default_knowledge_base_id`` 的 fallback。
         """
         prompt = kwargs.pop("prompt", None)
         if prompt is None:
             prompt = getattr(self.config, "prompt", "") or ""
+        # Per-user KB 绑定键：调用方（handle_message）从 IMABindings 查
+        # ilink_user_id 得到。None = 走 IMA_ILINK_DEFAULT_KB。
+        kb_id = kwargs.pop("kb_id", None)
 
         # 默认路由：仅 LLM（IMA 未配置）
         mode = "llm-only"
@@ -2442,10 +2630,15 @@ class _AIWithIma:
 
             try:
                 # 多个 term 逐个搜，合并去重（_search_ima_merged）
-                hits = self._search_ima_merged(search_terms, self._ima.cfg.search_limit)
+                hits = self._search_ima_merged(
+                    search_terms,
+                    self._ima.cfg.search_limit,
+                    knowledge_base_id=kb_id,
+                )
                 hits_count = len(hits)
                 query_log = " | ".join(search_terms)
                 print(f"[ima] query='{query_log[:60]}' hits={hits_count} "
+                      f"kb_id={kb_id or '-'} "
                       f"titles={[getattr(h, 'title', '')[:30] for h in hits[:3]]}",
                       flush=True)
                 log_ima.debug("ai ima inject prompt before=%d", len(prompt or ""))
@@ -2604,12 +2797,13 @@ class _AIWithIma:
 
         # 路由决策统一日志：INFO 级别，文件 + 终端同时出现；便于 grep
         log_ai.info(
-            "ai route mode=%s reason=%s msg_chars=%d hits=%d ctx_chars=%d",
+            "ai route mode=%s reason=%s msg_chars=%d hits=%d ctx_chars=%d kb_id=%s",
             mode, reason, len(message or ""), hits_count, ctx_chars,
+            (kb_id or "-"),
         )
         print(
             f"[AI 路由] mode={mode} reason={reason} "
-            f"hits={hits_count} ctx_chars={ctx_chars}",
+            f"hits={hits_count} ctx_chars={ctx_chars} kb_id={kb_id or '-'}",
             flush=True,
         )
 
