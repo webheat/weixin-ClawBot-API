@@ -484,6 +484,19 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                     if starter is not None and not starter.done():
                         starter.cancel()
                         await asyncio.gather(starter, return_exceptions=True)
+                    session = manager.get(expired_binding.user_id)
+                    authenticated = getattr(session, "has_authenticated_connection", None)
+                    if authenticated is None and session is not None:
+                        token = getattr(session, "bot_token", "")
+                        state = getattr(session, "runtime_state", {}) or {}
+                        authenticated = bool(token or state.get("bot_token"))
+                    if authenticated:
+                        # Browser control-plane expiry must not stop a live
+                        # WeChat data-plane connection.  getupdates remains
+                        # active and -14 still drives controlled QR recovery.
+                        log.info("expired browser binding retained authenticated session user=%s",
+                                 expired_binding.user_id)
+                        continue
                     try:
                         await _maybe_await(manager.stop(expired_binding.user_id))
                     except Exception as exc:

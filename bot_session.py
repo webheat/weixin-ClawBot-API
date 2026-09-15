@@ -137,6 +137,16 @@ class BotSession:
     def _base_url(self) -> str:
         return str(self.config.get("ilink_base_url") or "https://ilinkai.weixin.qq.com")
 
+    @property
+    def has_authenticated_connection(self) -> bool:
+        """Whether this session owns a token that can be kept alive.
+
+        The browser login page is only a control plane.  Once iLink has
+        returned a bot token, the connection is owned by the background
+        session and must outlive an idle browser tab.
+        """
+        return bool(str(self._token_ref[0] or self.bot_token or "").strip())
+
     @staticmethod
     def _make_ai(config: dict[str, Any]) -> Any:
         """Build one private AI/IMA stack without reading global credentials."""
@@ -405,7 +415,11 @@ class BotSession:
             await self._apply_login(result, initial=True)
         self._started = True
         self._tasks["message"] = self._supervised("message", self._message_loop())
-        self._tasks["timer"] = self._supervised("timer", self._timer_loop())
+        # getupdates is the protocol keepalive.  A local wall-clock timer
+        # must not force a user to scan a new QR while the token is valid.
+        from bot import RECONNECT_CONFIG
+        if RECONNECT_CONFIG.get("proactive_relogin", False):
+            self._tasks["timer"] = self._supervised("timer", self._timer_loop())
         await self._emit("started")
         return self
 
@@ -498,21 +512,25 @@ class BotSession:
             return
         if normalized == "/TIME":
             from bot import RECONNECT_CONFIG
-            remaining = max(
-                0.0,
-                self.login_time
-                + float(RECONNECT_CONFIG.get("session_duration", 86400))
-                - time.time(),
-            )
-            hours = int(remaining // 3600)
-            minutes = int((remaining % 3600) // 60)
-            seconds = int(remaining % 60)
-            display = (
-                f"{hours} 小时 {minutes} 分钟"
-                if hours else f"{minutes} 分钟 {seconds} 秒"
-            )
+            if RECONNECT_CONFIG.get("proactive_relogin", False):
+                remaining = max(
+                    0.0,
+                    self.login_time
+                    + float(RECONNECT_CONFIG.get("session_duration", 86400))
+                    - time.time(),
+                )
+                hours = int(remaining // 3600)
+                minutes = int((remaining % 3600) // 60)
+                seconds = int((remaining % 60))
+                display = (
+                    f"{hours} 小时 {minutes} 分钟"
+                    if hours else f"{minutes} 分钟 {seconds} 秒"
+                )
+                text_reply = f"当前连接剩余时间：{display}"
+            else:
+                text_reply = "当前连接由后台持续维护，服务端 token 失效时会自动恢复。"
             await self._send_reliable(
-                msg, from_id, context, f"当前连接剩余时间：{display}", "time"
+                msg, from_id, context, text_reply, "time"
             )
             return
         if text == "/重新连接":

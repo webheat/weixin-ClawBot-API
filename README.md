@@ -23,7 +23,7 @@
 - `getconfig`、输入状态和完整文本 `sendmessage` 流程
 - 校验 HTTP、JSON、`ret/errcode`，识别 `-14` 失效 token 并受控重新登录
 - 启动/停止时最佳努力调用 `notifystart` / `notifystop`
-- 连接到期前提醒、确认和自动重连
+- 服务端 token 失效后的受控自动恢复
 - DusAPI / DeepSeek provider 配置与 API Key 脱敏显示
 - 终端二维码渲染；缺少图像依赖时保留二维码链接
 
@@ -131,7 +131,9 @@ python bot.py --user alice
 
 ## 自动重连
 
-`bot.py` 顶部的 `RECONNECT_CONFIG` 可调整项目侧的提醒策略：
+`bot.py` 顶部的 `RECONNECT_CONFIG` 可调整兼容参数。正常运行时，
+`getupdates` 长轮询就是连接保活；只有 iLink 明确返回 `ret=-14` 或
+`errcode=-14` 才会进入二维码恢复流程，不会因为用户长时间不打开网页而退出。
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
@@ -140,8 +142,9 @@ python bot.py --user alice
 | `reminder_interval` | `30 * 60` | 用户回复 N 后再次提醒间隔（秒） |
 | `force_before` | `30 * 60` | 剩余时间低于此值时强制重连（秒） |
 | `qrcode_scan_timeout` | `480` | 整体扫码等待上限（秒） |
+| `proactive_relogin` | `False` | 兼容旧版的本地计时主动扫码开关，生产不要开启 |
 
-这些是客户端调度参数，不是服务端承诺的固定 token 生命周期。服务端明确返回 `ret=-14` 或 `errcode=-14` 时，程序会停止紧密轮询并重新走二维码登录。
+`session_duration` / `warning_before` / `force_before` 不是服务端承诺的 token 生命周期；默认仅保留用于兼容 `/time` 等旧接口。网页会话 TTL 到期会回收网页绑定，但不会停止尚未失效的后台 BotSession；只有尚未扫码成功的临时会话才会被停止。
 
 ## OpenClaw Weixin 2.4.6 协议要点
 

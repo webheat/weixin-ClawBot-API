@@ -251,7 +251,8 @@ async def main():
 1. 新建 `bot_session.py`，定义 `BotSession` 类，把 13 个闭包变量 + 7 个 `async def` 全部迁入（机械搬迁，self 取代所有闭包引用）。
 2. `bot.py` 的 `main()` 简化为：构造 `BotSession` → `await session.start()` → `await asyncio.Event().wait()`。
 3. `qr_web.py` 接收 `qr_state` 注入（已经是这样了，但要从单例改成 per-session 实例）。
-4. 跑通：alice 的 bot 用新代码启动，扫码登录、收发消息、24h 重连全过。
+4. 跑通：alice 的 bot 用新代码启动，扫码登录、收发消息；连接由 `getupdates`
+   长轮询持续保活，服务端返回 `-14` 时再验证受控重登。
 
 **风险**：搬迁漏一个变量就是 bug。**缓解**：diff 应该几乎全是"加 self."，没有逻辑改动；上 dev 用户灰度 24h。
 
@@ -358,7 +359,8 @@ class UserContext:
 
 - Phase 1：alice bot 用新代码跑 24h，对照旧代码看 reconnect / 收发消息 / 状态持久化日志
 - Phase 2：5 个并发 session（3 named + 2 ephemeral）跑 8h，看 iLink 服务端是否有限流
-- Phase 3：ephemeral TTL 触发 → session.stop() 优雅停机 → 新访客能分到新 session
+- Phase 3：未认证 ephemeral TTL 触发 → session.stop() 优雅停机；已认证 session
+  不因浏览器闲置停止，新的访客仍能分配新 session
 - Phase 4（可选）：named user 保留 systemd，portal 用单进程，跨机器场景文档化
 
 ---

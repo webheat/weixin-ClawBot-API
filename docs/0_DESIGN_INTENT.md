@@ -63,7 +63,7 @@
 | 2 · 切换用户 + 防抖 | ✅ **已实现** | `POST /switch` 使用 CSRF 校验和服务端 1.5 秒原子防抖，后台触发该 session 的新 QR，不阻塞 HTTP 请求。 |
 | 3 · 登录后文字对话 | ✅ **已实现** | 每个 session 独立长轮询；普通文字进入各自 AI/IMA 栈，再用该账号 token/context 回写。 |
 | 3 · 文本指令 | ✅ **保持兼容** | `/help`、`/time`、`/重新连接` 保留；首条普通问题在发送欢迎语后仍继续交给 AI。 |
-| 架构 · 新用户无 systemd unit | ✅ **已实现** | `/ephemeral/start` 只在当前进程注册 `eph_<hex>` session，不调用 launcher、systemctl 或 subprocess；TTL 到期执行 `session.stop()`。 |
+| 架构 · 新用户无 systemd unit | ✅ **已实现** | `/ephemeral/start` 只在当前进程注册 `eph_<hex>` session，不调用 launcher、systemctl 或 subprocess；网页 TTL 到期只停止未完成扫码的 session，已登录连接继续由后台维护。 |
 | 架构 · 单进程多任务并行 | ✅ **已实现** | 同用户并发创建去重，不同用户启动互不持锁；每个用户各自运行消息、定时和重连任务。 |
 
 ### 已落实的关键安全与可靠性约束
@@ -72,7 +72,7 @@
 2. `/switch` 与配对码提交必须携带绑定级 CSRF token；创建接口同时有 IP 限流和全局容量限制。
 3. 消息批次先持久化，回复确认成功后才记录 message id 并推进 `get_updates_buf`；重放使用稳定 client id。
 4. 启动任务和常驻任务受监督；失败 session 会从 Manager 摘除并优雅停止，避免僵尸会话。
-5. ephemeral 会话随浏览器 TTL 回收；不写 env、不占独立端口、不创建 systemd unit。
+5. 未完成扫码的 ephemeral 会话随浏览器 TTL 回收；已登录连接不受浏览器闲置影响；不写 env、不占独立端口、不创建 systemd unit。
 
 ### 哪些不需要改
 
