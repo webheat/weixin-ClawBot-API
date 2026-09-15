@@ -35,7 +35,7 @@
 
 **展开：**
 
-- 微信用户扫码登录后，私聊发文字 → bot 进程通过 iLink_bot `getupdates` 长轮询收到 → 转给 LLM（DeepSeek / Claude / GPT，可选）→ 回写 `sendmessage`。
+- 微信用户扫码登录后，私聊发文字或语音 → bot 进程通过 iLink_bot `getupdates` 长轮询收到；语音读取 `voice_item.text` 转写文本 → 与文字走同一条 LLM（DeepSeek / Claude / GPT，可选）→ 回写 `sendmessage`。
 - 全程文本透传，不做额外结构化（除非用户主动用 `/help` 等指令）。
 - 用户不需要知道有 LLM、IMA 知识库、四档路由这些实现细节——**只看到微信对话**。
 

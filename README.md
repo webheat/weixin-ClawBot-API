@@ -1,6 +1,6 @@
 # 微信 Claw Bot（Python）
 
-这是一个直接调用腾讯 [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin)（iLink Bot）接口的 Python 客户端示例。它无需部署 OpenClaw，即可通过扫码登录微信个人账号，并把收到的文字消息交给 DusAPI 或 DeepSeek 生成回复。
+这是一个直接调用腾讯 [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin)（iLink Bot）接口的 Python 客户端示例。它无需部署 OpenClaw，即可通过扫码登录微信个人账号，并把收到的文字或语音转写内容交给 DusAPI 或 DeepSeek 生成回复。
 
 当前运行代码按 [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin) 2.4.6 的公开 HTTP 行为对齐。协议细节和版本差异记录在 [weixin-openclaw-api-py-docs.md](weixin-openclaw-api-py-docs.md)。
 
@@ -124,10 +124,10 @@ python bot.py --user alice
 | 指令 | 说明 |
 |---|---|
 | `/help` 或 `/指令` | 查看指令列表 |
-| `/time` | 查询当前连接剩余时间 |
+| `/time` | 查询当前连接状态 |
 | `/重新连接` | 请求立即重连，随后回复 `Y` 或 `N` |
 
-非指令文字会转发给 AI。图片、文件和未提供文字转写的语音目前只会收到能力提示，不会被错误地送入 AI。
+文字和 iLink 提供的语音转写内容会走同一条命令/AI 路由。图片、文件以及没有语音转写文本的媒体会被忽略，不再发送不匹配的“听不到”类提示。
 
 ## 自动重连
 

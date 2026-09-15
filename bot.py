@@ -438,7 +438,7 @@ COMMANDS_MSG = (
     "\n"
     "直接发消息即可对话，常用指令：\n"
     "/help    查看全部指令\n"
-    "/time    查看当前连接剩余时间\n"
+    "/time    查看当前连接状态\n"
     "/重新连接 立即刷新连接"
 )
 
@@ -458,12 +458,12 @@ INTRO_DETAIL_MSG = (
     "  断网也能用本地知识库回答。\n"
     "• 多模态理解：文字、语音（自动转文字）、公众号 / 小程序卡片\n"
     "  （自动读标题和摘要）都能识别处理。\n"
-    "• 持续在线：单次连接约 24 小时，掉线自动重连，不需要您手动干预。\n"
+    "• 持续在线：后台持续维护连接，服务端 token 失效时自动进入恢复流程。\n"
     "\n"
     "⚙️ 常用指令\n"
     "\n"
     "• /help    · 查看全部指令\n"
-    "• /time    · 查看当前连接剩余时间\n"
+    "• /time    · 查看当前连接状态\n"
     "• /重新连接 · 立即刷新连接\n"
     "\n"
     "💡 小提示\n"
@@ -1881,11 +1881,18 @@ async def main():
                 print("[消息] 缺少 from_user_id/context_token，跳过")
                 return
             text = extract_message_text(msg)
-            log_msg.info("recv msg from=%s type=text len=%d preview=%r",
+            item_types = {
+                item.get("type") for item in (msg.get("item_list") or [])
+                if isinstance(item, dict)
+            }
+            input_kind = "voice_transcript" if 3 in item_types and text else "text"
+            log_msg.info("recv msg from=%s type=%s len=%d preview=%r",
                          from_id[-8:] if from_id else "-",
+                         input_kind,
                          len(text),
                          (text or "")[:30])
-            print(f"收到消息: {text or '[非文本消息]'}")
+            print(f"收到{('语音转写' if input_kind == 'voice_transcript' else '消息')}: "
+                  f"{text or '[无可用转写]'}")
 
             last_contact.update({"from_id": from_id, "context_token": context_token})
             runtime_state.setdefault("contexts", {})[from_id] = context_token
@@ -1934,23 +1941,18 @@ async def main():
                 welcomed_users.add(from_id)
                 await send_msg_safe(session, from_id, context_token, INTRO_DETAIL_MSG,
                                     bot_token_ref, bot_base_url_ref)
-                return
 
             if not text:
-                await send_msg_safe(
-                    session, from_id, context_token,
-                    "当前版本支持：文字、语音转文字、链接/公众号/小程序卡片（标题+描述）。"
-                    "图片/视频/文件暂不支持处理。",
-                    bot_token_ref, bot_base_url_ref,
-                )
+                log_msg.info("recv msg skipped reason=no_text_or_voice_transcript types=%s",
+                             sorted(str(item_type) for item_type in item_types))
                 return
 
-            if text in ("/help", "/指令"):
+            if normalized in ("/HELP", "/指令"):
                 log_msg.debug("handle command name=/help from=%s", from_id[-8:])
                 await send_msg_safe(session, from_id, context_token, COMMANDS_MSG,
                                     bot_token_ref, bot_base_url_ref)
                 return
-            if text == "/time":
+            if normalized == "/TIME":
                 log_msg.debug("handle command name=/time from=%s", from_id[-8:])
                 if RECONNECT_CONFIG.get("proactive_relogin", False):
                     remaining = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())

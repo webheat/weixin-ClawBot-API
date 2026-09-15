@@ -498,14 +498,9 @@ class BotSession:
             await send_msg_safe(self.http, from_id, context, INTRO_DETAIL_MSG,
                                 self._token_ref, self._base_url_ref)
         if not text:
-            await self._send_reliable(
-                msg,
-                from_id,
-                context,
-                "当前版本支持：文字、语音转文字、链接/公众号/小程序卡片（标题+描述）。"
-                "图片/视频/文件暂不支持处理。",
-                "empty-hint",
-            )
+            # iLink may deliver a voice item without a transcript (or a
+            # binary-only media item).  Do not send a misleading "can't hear"
+            # reply; only voice_item.text enters the normal command/AI route.
             return
         if normalized == "/HELP" or text == "/指令":
             await self._send_reliable(msg, from_id, context, COMMANDS_MSG, "help")

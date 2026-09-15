@@ -133,6 +133,72 @@ async def test_first_message_is_processed_instead_of_being_swallowed(
 
 
 @pytest.mark.asyncio
+async def test_voice_transcript_uses_the_same_ai_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """iLink voice_item.text is treated as the user's text input."""
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sent = _install_reply_spy(monkeypatch, sess)
+    voice_message = message("ignored raw placeholder")
+    voice_message["message_id"] = "voice-1"
+    voice_message["item_list"] = [{
+        "type": 3,
+        "voice_item": {
+            "encode_type": 6,
+            "text": "这是语音转写的问题",
+        },
+    }]
+
+    await sess.handle_message(voice_message)
+
+    assert sess._contract_ai.calls == ["这是语音转写的问题"]
+    assert any("AI reply" in item for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_voice_transcript_can_enter_command_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A slash command contained in voice transcription is still a command."""
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sent = _install_reply_spy(monkeypatch, sess)
+    voice_message = message("/help")
+    voice_message["message_id"] = "voice-help-1"
+    voice_message["item_list"] = [{
+        "type": 3,
+        "voice_item": {"text": "/help"},
+    }]
+
+    await sess.handle_message(voice_message)
+
+    assert sess._contract_ai.calls == []
+    assert any("指令" in item for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_voice_without_transcript_has_no_misleading_reply(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Binary-only voice/media must not emit the removed placeholder prompt."""
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sent = _install_reply_spy(monkeypatch, sess)
+    voice_message = message("ignored raw placeholder")
+    voice_message["message_id"] = "voice-no-transcript-1"
+    voice_message["item_list"] = [{
+        "type": 3,
+        "voice_item": {"encode_type": 6, "media": {"encrypt_query_param": "x"}},
+    }]
+
+    await sess.handle_message(voice_message)
+
+    assert sess._contract_ai.calls == []
+    assert not any("听不到" in item or "当前版本支持文字" in item for item in sent)
+
+
+@pytest.mark.asyncio
 async def test_lowercase_help_and_time_are_commands(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
@@ -146,7 +212,7 @@ async def test_lowercase_help_and_time_are_commands(
     await sess.handle_message(time_message)
     assert sess._contract_ai.calls == []
     assert any("指令" in item for item in sent)
-    assert any("剩余时间" in item for item in sent)
+    assert any("后台持续维护" in item for item in sent)
 
 
 def _find_batch_processor(sess: Any):
