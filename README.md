@@ -16,6 +16,8 @@
 
 ## 功能
 
+- 单个 `bot.py` 进程并发服务多个微信账号，每个账号拥有独立 token、上下文、QR 状态和持久化文件
+- 内置共享登录页：匿名访客获得不可猜测的临时会话，扫码后直接进入微信文字对话
 - 固定入口申请二维码，支持扫码状态长轮询、数字配对码和节点跳转
 - `getupdates` 长轮询收消息，并持久化 `get_updates_buf` 游标
 - `getconfig`、输入状态和完整文本 `sendmessage` 流程
@@ -30,6 +32,10 @@
 ```text
 .
 ├── bot.py              # Bot 主程序
+├── bot_session.py      # 单个微信账号的隔离状态与常驻任务
+├── bot_manager.py      # 多账号并发创建、查找、监督和停止
+├── shared_runtime.py   # 默认共享进程入口
+├── shared_web.py       # 共享 QR 登录页与临时会话生命周期
 ├── dusapi.py           # DusAPI 兼容封装
 ├── deepseek.py         # DeepSeek 兼容封装
 ├── ima.py              # 腾讯 ima 知识库 OpenAPI 客户端
@@ -51,13 +57,35 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-首次运行会选择 AI provider，并填写 API Key、接口地址、模型和系统提示词。也可以从 [Releases](https://github.com/SiverKing/weixin-ClawBot-API/releases) 下载打包版本。登录成功后会按账号保存连接状态，正常重启直接复用；服务端返回 `-14` 或手动执行重连时进入受控重新扫码。
+`python bot.py` 默认启动单进程多用户服务，监听
+`http://127.0.0.1:18300/clawbot/`。终端首次运行且缺少 `config.json`
+时仍会引导选择 AI provider；随后在网页点击“扫码登录”即可创建独立的临时微信会话。
+登录成功后按账号保存连接状态，正常重启可直接复用；服务端返回 `-14`
+或页面点击“切换用户”时进入受控重新扫码。
+
+旧的一账号一进程模式仅作为兼容入口保留：
+
+```bash
+python bot.py --legacy-single
+python bot.py --user alice
+```
+
+共享运行常用环境变量：`CLAWBOT_WEB_HOST`、`CLAWBOT_WEB_PORT`、
+`CLAWBOT_WEB_PREFIX`、`CLAWBOT_CONFIG_DIR`、`CLAWBOT_STATE_DIR`、
+`CLAWBOT_ENV_DIR`、`CLAWBOT_NAMED_USERS`、`CLAWBOT_SESSION_TTL` 和
+`CLAWBOT_EPHEMERAL_LIMIT`。Cookie 默认按请求是否为 HTTPS 自动决定 Secure；
+在可信 nginx 后部署时设置 `CLAWBOT_TRUST_PROXY=1`，也可用
+`CLAWBOT_COOKIE_SECURE=1` 强制开启。
+
+部署切换时不要同时运行旧 `qr_portal.py`：它与共享入口默认都使用 18300
+端口。systemd 的 `ExecStart` 应改为 `python bot.py`（不带 `--user`），nginx
+继续把 `/clawbot/` 转发到该唯一监听端口。
 
 首次登录或 token 失效后的登录步骤：
 
 1. 选择并确认 AI 配置。
-2. 使用手机微信扫描终端显示的二维码。
-3. 如果手机要求数字配对码，在终端输入配对码。
+2. 打开 `/clawbot/` 页面，使用手机微信扫描页面二维码。
+3. 如果手机要求数字配对码，在页面提交配对码。
 4. 登录成功后，在微信中发送消息；首次交互会收到指令列表。
 
 ## 配置文件

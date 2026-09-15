@@ -1,4 +1,8 @@
-# 多用户支持现状与未来规划
+# 多用户支持现状与未来规划（旧架构兼容文档）
+
+> 2026-09-15 起默认实现已切换为 `BotSession + BotManager` 单进程多用户，
+> 以 `docs/0_DESIGN_INTENT.md` 和 `docs/1_BOT_SESSION_ARCHITECTURE.md` 为准。
+> 本文的一用户一进程、端口分配和 systemd 模板只用于旧部署迁移参考。
 
 ## 当前架构（单租户）
 

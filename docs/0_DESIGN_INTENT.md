@@ -53,26 +53,26 @@
 
 ---
 
-## 当前实现状态（2026-09-15 盘点）
+## 当前实现状态（2026-09-15 改造后）
 
 | 预期 | 实现状态 | 差距 |
 |---|---|---|
-| 1 · 多用户共享进程 | ❌ **未实现** | 当前是 **一用户一进程**：`bot.py --user alice` 起一个进程，独占 `bot_token` / 端口 / state 文件。多个用户 = 多个 `clawbot@<user>.service` 单元。`bot.py` 内部状态都是单租户闭包（`bot_token_ref[0]` / `last_contact` / `welcomed_users` 全是单值，不是 dict）。 |
-| 1 · 数据隔离 | ✅ **已实现**（在多进程前提下） | 每个 `--user` 进程独享 `weixin_state_<name>.json` / `config_<name>.json` / `logs/clawbot_<name>.log` / 端口。OAuth 绑定的 bot 永不被 GC（`utils/bot_launcher.py:reap_ephemeral`）。 |
-| 2 · 页面 QR + 登录成功 | ✅ **已实现** | QR 来自 `ilink/bot/get_bot_qrcode`；扫码成功 `do_reconnect` 末尾同步 `web_state.status = "logged_in"`（`bot.py:1099-1102`）；前端 `render(s)` 看到 `status === "logged_in"` 渲染"登录成功 ✓"。 |
-| 2 · 切换用户 + 防抖 | ✅ **已实现** | portal 注入右上角"切换账号"按钮 → `/switch` → `POST /relink`；`handle_relink` 有 1.5s 防抖（`qr_web.py:418-424`）。 |
-| 3 · 登录后文字对话 | ✅ **已实现** | `message_loop` 长轮询 → `handle_message` 抽文本 → `_AIWithIma` 4 档路由 → `sendmessage` 回写。 |
-| 3 · 文本指令 | ⚠️ **部分** | 大部分普通消息走 AI；`/help` / `/time` / `/重新连接` 等斜杠指令直发预定义文本（不经 AI）。但**没有**"结构化指令"层 —— 用户说"打开灯"是 LLM 自由回答，不是预定义动作。 |
-| 架构 · 新用户无 systemd unit | ❌ **未实现** | 当前 ephemeral 路径也要 `systemctl start clawbot@eph_<hex>.service`（`utils/bot_launcher.py:_start_systemd`）。共享进程改造后这里会消失。 |
-| 架构 · 单进程多任务并行 | ⚠️ **半实现** | 单进程内**已经**是 asyncio 并行（`message_loop` + `reconnect_timer_task` + `relogin_listener` + `web_task` 一起 `asyncio.gather`），但只服务 1 个用户。要扩到 N 个用户 = N 倍的这些协程。 |
+| 1 · 多用户共享进程 | ✅ **已实现** | `python bot.py` 默认进入 `shared_runtime`；一个 `BotManager` 管理 N 个 `BotSession`，共享一个无 Cookie 的 HTTP 连接池。旧 `--user` 路径只作兼容。 |
+| 1 · 数据隔离 | ✅ **已实现** | token、baseurl、上下文、QR、AI/IMA 配置、游标和 state 均为 session 私有；文件名防碰撞，状态原子落盘；共享日志带 `user` 维度。 |
+| 2 · 页面 QR + 登录成功 | ✅ **已实现** | `shared_web` 直接读取对应 session 的 `QrFlowState`，同时兼容保留或剥离 `/clawbot` 前缀的 nginx 配置。 |
+| 2 · 切换用户 + 防抖 | ✅ **已实现** | `POST /switch` 使用 CSRF 校验和服务端 1.5 秒原子防抖，后台触发该 session 的新 QR，不阻塞 HTTP 请求。 |
+| 3 · 登录后文字对话 | ✅ **已实现** | 每个 session 独立长轮询；普通文字进入各自 AI/IMA 栈，再用该账号 token/context 回写。 |
+| 3 · 文本指令 | ✅ **保持兼容** | `/help`、`/time`、`/重新连接` 保留；首条普通问题在发送欢迎语后仍继续交给 AI。 |
+| 架构 · 新用户无 systemd unit | ✅ **已实现** | `/ephemeral/start` 只在当前进程注册 `eph_<hex>` session，不调用 launcher、systemctl 或 subprocess；TTL 到期执行 `session.stop()`。 |
+| 架构 · 单进程多任务并行 | ✅ **已实现** | 同用户并发创建去重，不同用户启动互不持锁；每个用户各自运行消息、定时和重连任务。 |
 
-### 关键差距（按重要性排序）
+### 已落实的关键安全与可靠性约束
 
-1. **`bot.py` 单租户 → 多租户**。最核心。所有单值闭包（`bot_token_ref[0]` / `last_contact` / `welcomed_users` / `qr_state` / `web_on_qrcode`）要改造成 `dict[user_id, ...]`。`message_loop` 要按 user 维度 N 份。
-2. **`utils/bot_launcher.py` 的 systemd 路径对 ephemeral 失去意义**。共享进程里没有"启新进程"这回事，新用户只是进程内一个新协程。详见 `docs/EPHEMERAL_BOT_LIFECYCLE.md`。
-3. **`qr_portal.py` 的反代**目前直接转发到 `:port`（用户进程）。多租户后不需要反代，portal 直接调用共享进程的内部 API（HTTP 或 in-process）。
-4. **`/etc/clawbot/*.env`** 多租户后只剩命名用户（alice / bob）的持久配置；ephemeral 不再写 env。
-5. **`/switch` 语义不变**（保留 cookie 触发同 user 的新一轮 QR），但实现路径从"调另一个端口"变成"调共享进程的某个 endpoint"。
+1. 浏览器只持有随机 opaque session id；不能把 cookie 伪造成 user id 越权访问别人的 QR。
+2. `/switch` 与配对码提交必须携带绑定级 CSRF token；创建接口同时有 IP 限流和全局容量限制。
+3. 消息批次先持久化，回复确认成功后才记录 message id 并推进 `get_updates_buf`；重放使用稳定 client id。
+4. 启动任务和常驻任务受监督；失败 session 会从 Manager 摘除并优雅停止，避免僵尸会话。
+5. ephemeral 会话随浏览器 TTL 回收；不写 env、不占独立端口、不创建 systemd unit。
 
 ### 哪些不需要改
 
@@ -117,3 +117,4 @@
 ## 变更日志
 
 - 2026-09-15 · 初版，3 条设计预期 + 当前实现盘点
+- 2026-09-15 · 完成 `BotSession + BotManager + shared_web + shared_runtime` 单进程多租户改造

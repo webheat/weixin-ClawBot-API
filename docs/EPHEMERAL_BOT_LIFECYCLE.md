@@ -1,4 +1,8 @@
-# Ephemeral bot lifecycle & systemd dependency analysis
+# Ephemeral bot lifecycle & systemd dependency analysis（旧架构兼容文档）
+
+> 2026-09-15 起默认共享运行时直接在 `BotManager` 内创建和回收 ephemeral
+> session，不再分配端口、写 env、启动子进程或 systemd unit。本文保留为旧
+> `qr_portal.py + BotLauncher` 部署的迁移参考。
 
 2026-09-15 · 写于排查 `/switch` QR 互踩 bug 之后
 
