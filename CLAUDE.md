@@ -175,7 +175,7 @@ sudo nginx -t && sudo systemctl reload nginx
 - **Portal never leaks user list (privacy)**: 无 cookie 访客的页面**必须**是单一登录按钮（OAuth / ephemeral / 错误页），**不得**渲染任何用户、端口、env 文件路径、bot 状态。`/healthz` 只返 `{ok: True, login_mode: ...}` 不带 `users` 字段。proxy 502 fallback 不暴露 name/port/exception。`/select` 已删除（OAuth 模式下任何人 GET `/select?name=` 已知用户即拿到 cookie = 账号劫持；现在 cookie 只能由 `/oauth/cb` 或 `/ephemeral/start` 设置）。
 - **First QR is fixed endpoint `BASE_URL = https://ilinkai.weixin.qq.com`**. After `scaned_but_redirect`, switch to the server-returned `baseurl`. This switch is one-way per session.
 - **Headers**: never set `Content-Length` manually (aiohttp computes it). The `X-WECHAT-UIN` is a fresh random uint32 → base64 per request. Each POST body includes `base_info: {channel_version: "2.4.6", bot_agent: "weixin-ClawBot-API/1.2.0 (python)"}` (sanitized via `sanitize_bot_agent`).
-- **Media messages are out of scope** for now: image / file / untranscribed voice return a capability hint and are not passed to AI. AES-128-ECB + CDN upload/download not implemented.
+- **Media messages are out of scope** for now: image / file are not passed to AI; an untranscribed voice gets an actionable retry/“转文字” prompt and is not passed to AI. AES-128-ECB + CDN upload/download not implemented.
 - **Forwarded message text extraction** (`bot.py:821` `extract_message_text`): reads `text_item.text`, `voice_item.text`, `ref_msg.{title,message_item.text_item.text}`, `title` / `description` / `des`, `app_msg.{title,des}`, and `url` (rewritten as `[链接] url`) from every item in `item_list`. Deduplicates with `text not in parts` so quoted / ref_msg overlap doesn't double-feed the LLM. URL is treated as text only — never fetched. See `docs/FORWARDED_MESSAGES.md`.
 
 ## Logger namespace

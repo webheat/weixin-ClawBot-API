@@ -144,7 +144,7 @@ https://bx.mengxa.com/clawbot/
 `send_msg_safe` 只用在 4 类消息：
 - 首次欢迎语（`COMMANDS_MSG`）
 - `/help` / `/指令` 回复
-- 无语音转写文本的媒体消息处理
+- 无语音转写文本的语音媒体处理（当前会提示用户重试/使用“转文字”，仍未进入 AI）
 - `reconnect_timer_task` / `do_reconnect` 的重连通知
 
 这些非核心消息被吞后，用户感知"命令列表不显示""重连没人提醒"，不影响对话主链路。

@@ -155,6 +155,29 @@ async def test_voice_transcript_uses_the_same_ai_route(
 
     assert sess._contract_ai.calls == ["这是语音转写的问题"]
     assert any("AI reply" in item for item in sent)
+    assert not any("翼claw" in item for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_voice_transcript_does_not_break_forwarded_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A standard voice transcript plus card metadata still uses the AI route."""
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sent = _install_reply_spy(monkeypatch, sess)
+    voice_message = message("ignored raw placeholder")
+    voice_message["message_id"] = "voice-compat-1"
+    voice_message["item_list"] = [{
+        "type": 3,
+        "voice_item": {"text": "语音问题"},
+        "title": "附带卡片标题",
+    }]
+
+    await sess.handle_message(voice_message)
+
+    assert sess._contract_ai.calls == ["语音问题\n附带卡片标题"]
+    assert any("AI reply" in item for item in sent)
 
 
 @pytest.mark.asyncio
@@ -179,10 +202,10 @@ async def test_voice_transcript_can_enter_command_route(
 
 
 @pytest.mark.asyncio
-async def test_voice_without_transcript_has_no_misleading_reply(
+async def test_voice_without_transcript_gets_actionable_feedback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
-    """Binary-only voice/media must not emit the removed placeholder prompt."""
+    """A voice without iLink ASR text gets a useful retry instruction."""
 
     sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
     sent = _install_reply_spy(monkeypatch, sess)
@@ -196,7 +219,31 @@ async def test_voice_without_transcript_has_no_misleading_reply(
     await sess.handle_message(voice_message)
 
     assert sess._contract_ai.calls == []
-    assert not any("听不到" in item or "当前版本支持文字" in item for item in sent)
+    assert any("重新发送一次语音" in item and "转文字" in item for item in sent)
+    assert not any("当前版本支持文字" in item for item in sent)
+    assert not any("翼claw" in item for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_untranscribed_voice_with_metadata_still_gets_feedback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Card metadata must not make an untranscribed voice look transcribed."""
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sent = _install_reply_spy(monkeypatch, sess)
+    voice_message = message("ignored raw placeholder")
+    voice_message["message_id"] = "voice-no-transcript-metadata-1"
+    voice_message["item_list"] = [{
+        "type": 3,
+        "voice_item": {"media": {"encrypt_query_param": "x"}},
+        "title": "附带标题",
+    }]
+
+    await sess.handle_message(voice_message)
+
+    assert sess._contract_ai.calls == []
+    assert any("重新发送一次语音" in item for item in sent)
 
 
 @pytest.mark.asyncio

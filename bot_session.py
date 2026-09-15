@@ -501,14 +501,39 @@ class BotSession:
         ensure_business_success(result, "sendmessage")
 
     async def _handle_message(self, msg: dict[str, Any]) -> None:
-        from bot import COMMANDS_MSG, INTRO_DETAIL_MSG, extract_message_text
+        from bot import (
+            COMMANDS_MSG,
+            INTRO_DETAIL_MSG,
+            VOICE_TRANSCRIPT_UNAVAILABLE_MSG,
+            extract_message_text,
+            extract_voice_transcript,
+            is_voice_message,
+        )
         if not isinstance(msg, dict) or msg.get("message_type") != 1:
             return
         from_id = str(msg.get("from_user_id") or "")
         context = str(msg.get("context_token") or "")
         if not from_id or not context:
             return
+        # iLink's voice_item.text is its server-side ASR result.  Once it is
+        # present, this deliberately follows the exact same command/LLM path
+        # as ordinary text; no voice capability explanation is sent.
         text = extract_message_text(msg).strip()
+        has_voice = is_voice_message(msg)
+        voice_text = extract_voice_transcript(msg).strip() if has_voice else ""
+        if has_voice:
+            from bot import log_msg
+            log_msg.info(
+                "recv msg from=%s type=%s len=%d preview=%r",
+                from_id[-8:] if from_id else "-",
+                "voice_transcript" if voice_text else "voice_without_transcript",
+                len(text),
+                text[:30],
+            )
+            # A voice message gets either the LLM answer or the actionable
+            # missing-transcript feedback.  It must not be prefixed with the
+            # long first-contact welcome message.
+            self.welcomed_users.add(from_id)
         self.last_contact = {"from_id": from_id, "context_token": context}
         self.contexts[from_id] = context
         self.runtime_state["last_contact"] = dict(self.last_contact)
@@ -525,16 +550,22 @@ class BotSession:
             if normalized == "Y":
                 await self.request_relogin("manual")
             return
+        if has_voice and not voice_text:
+            await self._send_reliable(
+                msg, from_id, context,
+                VOICE_TRANSCRIPT_UNAVAILABLE_MSG,
+                "voice-transcript-missing",
+            )
+            return
+
+        if not text:
+            return
+
         # Welcome is additive: the first user message must still reach the AI.
         if from_id not in self.welcomed_users:
             self.welcomed_users.add(from_id)
             await send_msg_safe(self.http, from_id, context, INTRO_DETAIL_MSG,
                                 self._token_ref, self._base_url_ref)
-        if not text:
-            # iLink may deliver a voice item without a transcript (or a
-            # binary-only media item).  Do not send a misleading "can't hear"
-            # reply; only voice_item.text enters the normal command/AI route.
-            return
         if normalized == "/HELP" or text == "/指令":
             await self._send_reliable(msg, from_id, context, COMMANDS_MSG, "help")
             return

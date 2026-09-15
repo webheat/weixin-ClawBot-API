@@ -442,6 +442,11 @@ COMMANDS_MSG = (
     "/重新连接 立即刷新连接"
 )
 
+VOICE_TRANSCRIPT_UNAVAILABLE_MSG = (
+    "这条语音的文字内容没有成功传到我这里，暂时无法理解。"
+    "请重新发送一次语音；如果仍未识别，请在微信里点击“转文字”后发送，或直接发文字。"
+)
+
 INTRO_DETAIL_MSG = (
     "🪶 翼claw · 您的个人微信专属智能助理\n"
     "\n"
@@ -849,6 +854,52 @@ async def get_typing_ticket_safe(session, user_id, context_token, cache,
     return str(cached.get("typing_ticket") or "")
 
 
+def _voice_transcript(voice_item) -> str:
+    """Return the transcript emitted by iLink for one voice item.
+
+    The documented wire shape is ``voice_item.text``.  We intentionally do
+    not treat the encrypted media payload as text: the configured LLM must
+    receive the server ASR result, not a placeholder such as "[语音]".
+    """
+    if not isinstance(voice_item, dict):
+        return ""
+    value = voice_item.get("text")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def is_voice_message(msg: dict) -> bool:
+    """Whether an inbound iLink message contains a voice item.
+
+    ``type`` is numeric in the official schema, but JSON bridges occasionally
+    serialize it as a string or omit it and rely on the payload key.
+    """
+    if not isinstance(msg, dict):
+        return False
+    for item in msg.get("item_list") or []:
+        if not isinstance(item, dict):
+            continue
+        if (
+            item.get("type") in (3, "3")
+            or "voice_item" in item
+        ) and isinstance(item.get("voice_item"), dict):
+            return True
+    return False
+
+
+def extract_voice_transcript(msg: dict) -> str:
+    """Extract iLink's server-side ASR text without inventing voice content."""
+    if not isinstance(msg, dict):
+        return ""
+    items = msg.get("item_list") or []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        transcript = _voice_transcript(item.get("voice_item"))
+        if transcript:
+            return transcript
+    return ""
+
+
 def extract_message_text(msg: dict) -> str:
     """遍历完整 item_list，提取文本/语音转写 / 转发卡片元数据。
 
@@ -887,9 +938,9 @@ def extract_message_text(msg: dict) -> str:
         text_item = item.get("text_item") or {}
         if text_item.get("text"):
             _add(str(text_item["text"]))
-        voice_item = item.get("voice_item") or {}
-        if voice_item.get("text"):
-            _add(str(voice_item["text"]))
+        voice_text = _voice_transcript(item.get("voice_item"))
+        if voice_text:
+            _add(voice_text)
 
         # 2. 转发 / 引用：被引用 item 里也可能再嵌一份完整副本
         ref_msg = item.get("ref_msg") or {}
@@ -923,7 +974,7 @@ def extract_message_text(msg: dict) -> str:
         if ref_msg or app_msg or item.get("url") or item.get("title"):
             log_msg.debug("forwarded item extracted title=%r has_text=%s url=%s",
                           (str(item.get("title"))[:40]) if item.get("title") else None,
-                          bool(text_item.get("text") or voice_item.get("text")),
+                          bool(text_item.get("text") or voice_text),
                           bool(item.get("url")))
 
     return "\n".join(parts).strip()
@@ -1885,7 +1936,13 @@ async def main():
                 item.get("type") for item in (msg.get("item_list") or [])
                 if isinstance(item, dict)
             }
-            input_kind = "voice_transcript" if 3 in item_types and text else "text"
+            has_voice = is_voice_message(msg)
+            voice_text = extract_voice_transcript(msg).strip() if has_voice else ""
+            input_kind = (
+                "voice_transcript" if voice_text
+                else "voice_without_transcript" if has_voice
+                else "text"
+            )
             log_msg.info("recv msg from=%s type=%s len=%d preview=%r",
                          from_id[-8:] if from_id else "-",
                          input_kind,
@@ -1898,6 +1955,13 @@ async def main():
             runtime_state.setdefault("contexts", {})[from_id] = context_token
             runtime_state["last_contact"] = dict(last_contact)
             save_runtime_state(runtime_state)
+
+            # Voice messages already have their own conversational response:
+            # either the LLM answer based on iLink's transcript or the
+            # actionable missing-transcript feedback.  Do not prepend the
+            # first-contact welcome message to either voice path.
+            if has_voice:
+                welcomed_users.add(from_id)
 
             normalized = text.strip().upper()
             if manual_reconnect_pending.get(from_id) and normalized in ("Y", "N"):
@@ -1936,16 +2000,28 @@ async def main():
                                         bot_token_ref, bot_base_url_ref)
                 return
 
-            if from_id not in welcomed_users:
-                log_msg.debug("handle welcome from=%s", from_id[-8:])
-                welcomed_users.add(from_id)
-                await send_msg_safe(session, from_id, context_token, INTRO_DETAIL_MSG,
-                                    bot_token_ref, bot_base_url_ref)
+            if has_voice and not voice_text:
+                log_msg.info(
+                    "voice transcript unavailable; sending actionable feedback from=%s",
+                    from_id[-8:],
+                )
+                await send_msg_safe(
+                    session, from_id, context_token,
+                    VOICE_TRANSCRIPT_UNAVAILABLE_MSG,
+                    bot_token_ref, bot_base_url_ref,
+                )
+                return
 
             if not text:
                 log_msg.info("recv msg skipped reason=no_text_or_voice_transcript types=%s",
                              sorted(str(item_type) for item_type in item_types))
                 return
+
+            if from_id not in welcomed_users:
+                log_msg.debug("handle welcome from=%s", from_id[-8:])
+                welcomed_users.add(from_id)
+                await send_msg_safe(session, from_id, context_token, INTRO_DETAIL_MSG,
+                                    bot_token_ref, bot_base_url_ref)
 
             if normalized in ("/HELP", "/指令"):
                 log_msg.debug("handle command name=/help from=%s", from_id[-8:])
