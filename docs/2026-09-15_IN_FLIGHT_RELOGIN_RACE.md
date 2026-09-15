@@ -340,17 +340,26 @@ grep -c "request_relogin reason=" logs/clawbot_shared.log
 2. 点页面上的 **「切换用户」** 按钮（id=`#switch`）
    → 触发 `request_relogin("web switch")` → `_relogin_listener` 重新进入 QR 轮询（refresh_count 归零）
 3. 用绑定的微信扫描新 QR
-   → WeChat 返回**同一** `ilink_bot_id=077b77e37683@im.bot`（同账号）→ `_apply_login` 不会清 `pending_messages`
-4. 重连成功后，把**这次的 msg #2 当作「已丢」** —— 重新发问即可
+   → iLink 对同一微信用户**也会分配新的** `ilink_bot_id`（详见 §10 复盘后追加）→ `_apply_login` 走 `account_changed=True` 分支 → 自动清 `pending_messages` / `processed_message_ids` / `contexts` / `welcomed_users`
+4. 重连成功后，**这次事故的 msg #2 当作「已丢」** —— 重新发问即可；用户也会**重新收到 `INTRO_DETAIL_MSG` 欢迎语**（`welcomed_users` 被清空）
 
-**服务端清理步骤**（我这边执行）：
+**服务端清理步骤**（**通常不需要**，详见 §10）：
 
-> 时序关键：必须在 `_message_loop` 拿到新 token 后**第一次 `getupdates` 之前**完成，否则 bot 会按 startup hook 之外的逻辑（实际上不会）或者干脆没机会 replay。
+> **边界条件**：iLink 默认在 reauth 时把 per-account state 全部清掉，**所以正常情况下** 上面那段 atomic 脚本是 no-op。**仅在 `ilink_bot_id` 未变**的边缘场景（同 bot 实体复用，目前仅在 named 用户 + iLink 后端 keep-alive 路径下待核实，详见 §10）下，stale `pending_messages` 才会真正留下来需要手动清理。
 
 ```bash
 # 等到 log 里看到：
-#   poll status=confirmed bot_id=077b77e3
-# 之后立即执行（一行原子重写）：
+#   poll status=confirmed bot_id=...
+# 之后**先判断 ilink_bot_id 是否变了**：
+grep "eph_656ef35f563969087b7c6459f48b8b68.*poll status=confirmed" /opt/weixin-ClawBot-API/logs/clawbot_shared.log | tail -1
+# 拿最新一次 confirmed 响应里的 ilink_bot_id，和 state 文件里的对比：
+python3 -c "
+import json, re, subprocess
+p = '/opt/weixin-ClawBot-API/weixin_state_eph_656ef35f563969087b7c6459f48b8b68.json'
+print('state ilink_bot_id =', json.load(open(p)).get('ilink_bot_id'))
+# 也可手工看 log 末尾 ilink_bot_id 字段
+"
+# 如果一致（同 bot 复用），才跑下面这段（idempotent，重复跑也安全）：
 python - <<'PY'
 import json, os
 p = "/opt/weixin-ClawBot-API/weixin_state_eph_656ef35f563969087b7c6459f48b8b68.json"
@@ -364,7 +373,7 @@ print("cleaned: pending_messages=[], pending_cursor=''; processed_message_ids pr
 PY
 ```
 
-如果第 4 步用户扫码时换了微信号（`ilink_bot_id` 变了），`_apply_login` 自己会清 `pending_messages`，不需要我们手动处理 —— 但用户会失去之前的对话上下文。
+如果第 4 步用户扫码时换了微信号（`ilink_user_id` 也变），`_apply_login` 走 `account_changed=True` 分支，state 全部清空 —— 但用户同样失去之前的对话上下文。
 
 ## 8. 相关问题 / 后续
 
@@ -380,6 +389,35 @@ PY
 - 18f0f83 `fix(voice): separate transcript from message text` —— 加重了 `voice_item.text` 路径；该路径走的就是 `ai.chat`，**所以本 bug 第一次能被用户感知到是在语音功能上线之后**
 - `docs/2026-09-15_SESSION_CONNECTION_KEEPALIVE.md` —— 上一轮「连接保活」的设计文档；本 doc 是其续篇，**专门处理受控重连与消息处理的并发**
 
+## 10. 复盘后追加：iLink 对「同微信号」会分配新 `ilink_bot_id`
+
+**触发**：本次事故恢复时（18:56:51）观察到 `poll status=confirmed` 返回的 `ilink_bot_id` **与重连前不同**：
+
+```
+旧（18:42:43 首次扫码）：ilink_bot_id = 077b77e37683@im.bot
+新（18:56:51 重连扫码）：ilink_bot_id = f1fe601566ec@im.bot
+                         ilink_user_id = o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat  ← 同一微信号
+```
+
+也就是说 §7 第 3 步原本预测的「WeChat 返回**同一** `ilink_bot_id`」是**错的**。iLink 的 `ilink_bot_id` 不是一个稳定的 user-bound 标识，而是**每个 QR 生命周期独立生成**的 bot 实体 —— 同一微信号连续两次扫码，iLink 分配的是两个不同的 bot 实体。
+
+**对原事故分析的影响**：
+- **事故根因（`request_relogin` 中途清空 token 与 in-flight handler 竞态）不变**
+- 5.1 / 5.2 / 5.3 的修复**仍然全部有效**，且因为 `account_changed=True` 默认触发 stale 清理，**stale `pending_messages` 风险被 iLink 自己消化了一部分** —— 5.2 互斥的紧迫性略微降低，但**不可省**（仍存在同 bot 复用的边缘场景，见下文）
+- §7 的服务端清理脚本从「必跑」**降级为「可选」**：仅当 `ilink_bot_id` 未变（同 bot 实体复用）时才需要
+
+**对周边设计的影响**：
+- **CLAUDE.md「Active P0 — per-user conversation history」**的实现假设需要重新审视。原本规划用 `from_id`（即 `ilink_user_id`）做 key 持久化历史 —— 这个 key 选得**对**，因为 `ilink_user_id` 是微信号级稳定标识；`ilink_bot_id` 不能用，会随 QR 循环变。
+- **CLAUDE.md「Critical invariants — Account switch clears ...」** 的措辞需要补充：「包括同微信号连续扫码触发的隐式 account switch」。这条 invariant 实际上比文档描述的更激进。
+- **`docs/2026-09-15_SESSION_CONNECTION_KEEPALIVE.md`** 隐含假设「受控重连后能恢复 session 上下文（`welcomed_users` / `contexts`）」。结合本发现，**这个假设只在同 bot 复用时成立**；对绝大多数用户（`eph_*` / 每次扫码都换 bot）重连后是「**全新用户**」体验。这与该 doc §3 「wechat 数据面...独立于浏览器页面继续运行」的设计意图**部分冲突** —— 浏览器 / QR 控制面和微信数据面解耦了，但 QR 循环本身仍然在切断数据面上下文。
+
+**待核实 / 后续实验**：
+1. iLink 给同微信号分配新 `ilink_bot_id` 是**协议层通用行为**还是**仅对 anonymous ephemeral** 如此？named 用户（`/etc/clawbot/alice.env`）扫码后 `ilink_bot_id` 是否会保持不变？需要拉一次 named 用户的重连日志（`logs/clawbot_alice.log`）做对照。
+2. 如果 named 用户能保持 `ilink_bot_id` 不变，那么 §7 的手动清理脚本**对 named 用户仍然必要**（5.2 互斥也仍然必要），应该作为「named 用户专用风险」单独标注。
+3. `account_changed=True` 分支目前**无条件**清 `contexts` / `welcomed_users`，对 named 用户是「丢失了与该 named user 已经建立的关系」—— 这与「重连保活」的设计意图**正面冲突**。需要和上一轮 `_reconnect` 的受控重连设计一起 review，看是否应该加一个 `keep_contexts=True` 的开关供 named 用户使用。
+
 ---
 
 **结论**：本事故是受控重连路径与消息处理路径的**第一类竞态**。Phase 1（加日志）即可在下次复发时把定位时间从「排除 3 个不可能」缩短到「1 行 grep」；Phase 2（互斥）才是根治，且实现量不大（~30 行 + 一个 lock）。建议两个 commit 分开发，Phase 1 立刻合，Phase 2 等 review。
+
+**§10 复盘修正**：「iLink 给同微信号也分配新 `ilink_bot_id`」这一发现让本事故的影响面**收窄**（stale state 风险被 iLink 自动消化），但同时**暴露出**「受控重连保活」与「per-account state 隔离」两条设计原则的潜在冲突，需要单独 review 解决。
