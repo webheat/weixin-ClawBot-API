@@ -33,6 +33,7 @@ class FakeSession:
     def __init__(self):
         self.qr_state = FakeState()
         self.relogin_count = 0
+        self.bot_token = ""
 
     async def request_relogin(self, reason):
         self.relogin_count += 1
@@ -175,6 +176,25 @@ class SharedWebTests(AioHTTPTestCase):
             self.assertEqual(response.status, 302)
             await asyncio.sleep(0.35)
             self.assertEqual(manager.sessions, {})
+        finally:
+            await client.close()
+
+    async def test_expired_browser_binding_keeps_authenticated_bot_alive(self):
+        manager = FakeManager()
+        app = build_web_app(manager, prefix="/clawbot",
+                            config={"session_ttl": 0.1, "rate_limit": 5})
+        from aiohttp.test_utils import TestServer, TestClient
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            response = await client.post("/clawbot/ephemeral/start", allow_redirects=False)
+            self.assertEqual(response.status, 302)
+            user_id = next(iter(manager.sessions))
+            manager.sessions[user_id].bot_token = "authenticated-token"
+            await asyncio.sleep(0.35)
+            self.assertIn(user_id, manager.sessions)
+            self.assertEqual(await app["browser_sessions"].snapshot(), [])
         finally:
             await client.close()
 

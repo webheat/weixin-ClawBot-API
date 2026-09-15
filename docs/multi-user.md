@@ -122,9 +122,10 @@ https://bx.mengxa.com/clawbot/
 
 **2. `last_contact` 单值，重连通知只发给最近一个用户**
 
-`bot.py:1264` 只跟踪"最近一个发消息的人"；`reconnect_timer_task:868` 倒计时 2h 警告 → 只发 `last_contact`。其他活跃用户完全不知道 bot 即将到期；到点被强制踢下线，没人收到提醒。
+旧版曾由 `reconnect_timer_task` 按本地 24 小时倒计时并强制扫码，导致用户长时间不打开网页时连接中断。当前默认由 iLink `getupdates` 长轮询保活，仅在服务端明确返回 `-14` 时受控重登；`proactive_relogin=True` 才启用旧兼容行为。
 
-多人共享场景下，必须改成"24h 内所有活跃用户都通知"才合理。
+多人共享场景下，不再按本地 24h 给用户发通知或强制扫码；每个 BotSession 的
+`getupdates` 独立保活，服务端返回 `-14` 时才由对应 session 单独恢复。
 
 ### P1 — 影响多人并发体验
 

@@ -92,19 +92,17 @@ ai = None  # 启动时从配置文件加载后初始化
 #   "session_duration": 300, "warning_before": 60, "reminder_interval": 30,
 #   "force_before": 60, "qrcode_scan_timeout": 120
 #
-# 策略（2026-09-14 改）：后台静默重连 + 终态单条通知。
-# - `warning_before` / `reminder_interval` 字段保留仅为历史兼容，运行时不再触发任何
-#   用户消息；会话到期前的"提醒"已下线。
-# - 真正起作用的字段：`session_duration`（会话音命）、`force_before`（最后多久触发
-#   do_reconnect）、`qrcode_scan_timeout`（扫码整体超时）。
-# - QR 仅通过 web (`https://bx.mengxa.com/clawbot/`) 和终端渲染；用户收件箱只在
-#   do_reconnect 成功或失败时收到一条终态通知，期间绝不打扰。
+# 策略：长轮询负责连接保活，服务端明确返回 stale token（-14）时才扫码恢复。
+# 旧版本按本地 24 小时计时器主动发起二维码登录，这会把仍然有效的连接误判为
+# 已退出，且用户不在网页旁边时无法完成扫码。保留 proactive_relogin 仅作紧急
+# 兼容开关，生产默认关闭。
 RECONNECT_CONFIG = {
     "session_duration":    24 * 3600,  # 会话总时长（秒）
     "warning_before":       2 * 3600,  # 提前多久发出警告（秒）
     "reminder_interval":      30 * 60, # 用户回 N 后多久再问（秒）
     "force_before":           30 * 60, # 最后多久强制重连（秒）
     "qrcode_scan_timeout":       480,  # 官方客户端默认整体等待时长（秒）
+    "proactive_relogin":       False,  # 仅兼容旧行为；默认由 getupdates 保活
 }
 # 当 do_reconnect 还在 QR 扫描/登录流程里、或 elapsed 已越过 warning_before 但仍未成功
 # 重连时，timer 任务的下一次 recheck 至少等这么秒；避免 sendmessage 失败 + do_reconnect 挂
@@ -1954,10 +1952,14 @@ async def main():
                 return
             if text == "/time":
                 log_msg.debug("handle command name=/time from=%s", from_id[-8:])
-                remaining = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())
-                hours, minutes, seconds = int(remaining // 3600), int((remaining % 3600) // 60), int(remaining % 60)
-                display = f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟 {seconds} 秒"
-                await send_msg_safe(session, from_id, context_token, f"当前连接剩余时间：{display}",
+                if RECONNECT_CONFIG.get("proactive_relogin", False):
+                    remaining = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())
+                    hours, minutes, seconds = int(remaining // 3600), int((remaining % 3600) // 60), int(remaining % 60)
+                    display = f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟 {seconds} 秒"
+                    text_reply = f"当前连接剩余时间：{display}"
+                else:
+                    text_reply = "当前连接由后台持续维护，服务端 token 失效时会自动恢复。"
+                await send_msg_safe(session, from_id, context_token, text_reply,
                                     bot_token_ref, bot_base_url_ref)
                 return
             if text == "/重新连接":
@@ -2156,19 +2158,23 @@ async def main():
                     print(f"[消息循环] 未分类异常: {_redact_text(exc)}；{delay}s 后重试")
                     await asyncio.sleep(delay)
 
-        timer_task = asyncio.create_task(reconnect_timer_task(
-            session, bot_token_ref, bot_base_url_ref, last_contact,
-            typing_ticket_cache, reconnect_asked, warning_active,
-            reconnect_in_progress, login_time_ref, RECONNECT_CONFIG, runtime_state,
-            web_on_qrcode=web_on_qrcode,
-            web_state=qr_state,
-        ))
+        timer_task = None
+        if RECONNECT_CONFIG.get("proactive_relogin", False):
+            timer_task = asyncio.create_task(reconnect_timer_task(
+                session, bot_token_ref, bot_base_url_ref, last_contact,
+                typing_ticket_cache, reconnect_asked, warning_active,
+                reconnect_in_progress, login_time_ref, RECONNECT_CONFIG, runtime_state,
+                web_on_qrcode=web_on_qrcode,
+                web_state=qr_state,
+            ))
 
         message_task = asyncio.create_task(message_loop())
         try:
             await message_task
         finally:
-            all_tasks = [message_task, timer_task, relogin_task]
+            all_tasks = [message_task, relogin_task]
+            if timer_task is not None:
+                all_tasks.append(timer_task)
             if web_task is not None:
                 all_tasks.append(web_task)
             for task in all_tasks:
