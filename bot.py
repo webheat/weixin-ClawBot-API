@@ -1447,7 +1447,8 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
 
 
 async def login_with_qrcode(session, local_token_list=None, existing_state=None,
-                            on_qrcode=None, web_state=None, cancel_event=None):
+                            on_qrcode=None, web_state=None, cancel_event=None,
+                            save_qr_artifact=True):
     """执行官方二维码登录，最多展示 MAX_QR_REFRESH_COUNT 个二维码。
 
     Args:
@@ -1482,11 +1483,12 @@ async def login_with_qrcode(session, local_token_list=None, existing_state=None,
         log_qr.info("qr cycle refresh=%d qr_len=%d img_content_present=%s",
                     refresh_count, len(str(qrcode)), bool(qrcode_img_content))
         qr_content = str(qrcode_img_content or qrcode)
-        try:
-            save_qrcode_content(qr_content)
-        except Exception as exc:
-            log_qr.warning("qr save failed err=%s, falling back to link", _redact_text(exc))
-            print(f"二维码保存失败，将继续使用链接: {_redact_text(exc)}")
+        if save_qr_artifact:
+            try:
+                save_qrcode_content(qr_content)
+            except Exception as exc:
+                log_qr.warning("qr save failed err=%s, falling back to link", _redact_text(exc))
+                print(f"二维码保存失败，将继续使用链接: {_redact_text(exc)}")
         if on_qrcode:
             callback_result = on_qrcode(qr_content)
             if inspect.isawaitable(callback_result):
@@ -2204,9 +2206,10 @@ class _AIWithIma:
     为空，等价于直通到底层 ``_base``。
     """
 
-    def __init__(self, base, ima_client: ImaClient):
+    def __init__(self, base, ima_client: ImaClient, environ=None):
         self._base = base
         self._ima = ima_client
+        self._env = os.environ if environ is None else dict(environ)
         self.config = base.config  # 保持 ai.config.prompt 等属性可访问
         # 本地 Markdown KB 兜底索引（lazy：只有命中 IMA 0 条时才会建索引）
         self._local_kb: Optional[LocalKBIndex] = None
@@ -2222,11 +2225,11 @@ class _AIWithIma:
         if self._local_kb_attempted:
             return self._local_kb
         self._local_kb_attempted = True
-        if os.environ.get("CLAWBOT_LOCAL_FALLBACK", "").strip().lower() not in (
+        if self._env.get("CLAWBOT_LOCAL_FALLBACK", "").strip().lower() not in (
             "1", "true", "yes", "on",
         ):
             return None
-        kb_dir = os.environ.get("CLAWBOT_LOCAL_KB_DIR", "docs/knowledge")
+        kb_dir = self._env.get("CLAWBOT_LOCAL_KB_DIR", "docs/knowledge")
         try:
             self._local_kb = LocalKBIndex(kb_dir)
         except Exception as exc:  # 路径/权限异常不能让回复失败
@@ -2251,13 +2254,13 @@ class _AIWithIma:
                 "先 pip install fastembed"
             )
             return None
-        if os.environ.get("SEMANTIC_KB_ENABLED", "").strip().lower() not in (
+        if self._env.get("SEMANTIC_KB_ENABLED", "").strip().lower() not in (
             "1", "true", "yes", "on",
         ):
             return None
-        kb_dir = os.environ.get("SEMANTIC_KB_DIR", "docs/knowledge")
+        kb_dir = self._env.get("SEMANTIC_KB_DIR", "docs/knowledge")
         try:
-            min_score_raw = os.environ.get("SEMANTIC_KB_MIN_SCORE", "").strip()
+            min_score_raw = self._env.get("SEMANTIC_KB_MIN_SCORE", "").strip()
             min_score = float(min_score_raw) if min_score_raw else 0.0
             self._semantic_kb = SemanticKBIndex(
                 kb_dir, min_score=min_score,
@@ -2571,7 +2574,7 @@ class _AIWithIma:
         if (
             mode == "llm-only"
             and ctx_chars == 0
-            and os.environ.get("CLAWBOT_LLM_CAVEAT", "1").strip().lower()
+            and self._env.get("CLAWBOT_LLM_CAVEAT", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
             prompt = (prompt + "\n\n" + _LLM_ONLY_CAVEAT_PROMPT) if prompt else _LLM_ONLY_CAVEAT_PROMPT
@@ -2598,6 +2601,18 @@ def create_ai_client(raw_cfg: dict):
 
 
 if __name__ == "__main__":
+    # The design-intent default is one process serving N accounts.  Keep the
+    # former single-account runner only behind an explicit compatibility flag
+    # or the historical --user form.
+    import sys
+    _legacy_user_arg = any(
+        arg == "--user" or arg.startswith("--user=") for arg in sys.argv[1:]
+    )
+    if "--legacy-single" not in sys.argv[1:] and not _legacy_user_arg:
+        from shared_runtime import main as shared_main
+        shared_main(sys.argv[1:])
+        raise SystemExit(0)
+
     # 1) 解析 CLI 参数（决定文件命名空间 + 日志路径）
     parser = argparse.ArgumentParser(
         prog="bot.py",
@@ -2609,6 +2624,10 @@ if __name__ == "__main__":
              "会切换到 config_<user>.json / weixin_state_<user>.json / "
              "logs/clawbot_<user>.log，并从 /etc/clawbot/<user>.env + "
              "/etc/clawbot/ima.env 加载凭据。不传则单租户旧行为。",
+    )
+    parser.add_argument(
+        "--legacy-single", action="store_true",
+        help="兼容模式：按旧架构只运行一个微信账号。",
     )
     args = parser.parse_args()
     paths = _resolve_user_paths(args.user)

@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from contextvars import ContextVar
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Callable, Optional
@@ -35,17 +36,18 @@ DEFAULT_LOG_FILE = DEFAULT_LOG_DIR / "clawbot.log"
 DEFAULT_BACKUPS = 3
 
 # 终端格式：短时间戳，刷屏不刺眼
-_FMT_CONSOLE = "%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
+_FMT_CONSOLE = "%(asctime)s %(levelname)-5s [%(name)s] [user=%(user_id)s] %(message)s"
 _DATEFMT_CONSOLE = "%H:%M:%S"
 
 # 文件格式：精确到毫秒 + 完整时间，便于和 aiohttp trace / iLink 时间戳对齐
 _FMT_FILE = (
-    "%(asctime)s.%(msecs)03d %(levelname)-5s [%(name)s] %(message)s"
+    "%(asctime)s.%(msecs)03d %(levelname)-5s [%(name)s] [user=%(user_id)s] %(message)s"
 )
 _DATEFMT_FILE = "%Y-%m-%d %H:%M:%S"
 
 
 _INITIALIZED = False
+USER_LOG_CONTEXT: ContextVar[str] = ContextVar("clawbot_user_id", default="-")
 
 
 class RedactFilter(logging.Filter):
@@ -60,6 +62,7 @@ class RedactFilter(logging.Filter):
         self._redactor = redactor
 
     def filter(self, record: logging.LogRecord) -> bool:
+        record.user_id = USER_LOG_CONTEXT.get()
         if self._redactor is None:
             return True
         try:
@@ -131,16 +134,18 @@ def setup_logging(
     global _INITIALIZED
     if _INITIALIZED:
         return
-    _INITIALIZED = True
 
     lvl = (level or os.getenv("CLAWBOT_LOG_LEVEL", "INFO")).upper()
     if lvl not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         lvl = "INFO"
 
     log_dir = log_dir or Path(os.getenv("CLAWBOT_LOG_DIR", str(DEFAULT_LOG_DIR)))
-    backups = backups if backups is not None else int(
-        os.getenv("CLAWBOT_LOG_BACKUPS", str(DEFAULT_BACKUPS))
-    )
+    if backups is None:
+        try:
+            backups = int(os.getenv("CLAWBOT_LOG_BACKUPS", str(DEFAULT_BACKUPS)))
+        except (TypeError, ValueError):
+            backups = DEFAULT_BACKUPS
+    backups = max(0, backups)
     log_file = log_file or (log_dir / DEFAULT_LOG_FILE.name)
 
     console = _build_console_handler(lvl)
@@ -158,3 +163,4 @@ def setup_logging(
         root.addHandler(file_h)
     root.setLevel(logging.DEBUG)  # 子 logger 各自决定是否 emit
     root.propagate = False
+    _INITIALIZED = True
