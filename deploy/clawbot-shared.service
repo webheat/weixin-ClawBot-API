@@ -14,10 +14,10 @@ WorkingDirectory=/opt/weixin-ClawBot-API
 # 共享 runtime 启动时由 shared_runtime.load_config() 读取并按用户维度隔离。
 EnvironmentFile=/opt/weixin-ClawBot-API/.env
 
-# 入口：python -u bot.py（无 --user）→ bot.py:2611 路由到 shared_runtime.main()
+# 入口：python -u bot.py → 路由到 shared_runtime.main()
 # shared_runtime 内部:
 #   1. 构造 aiohttp.ClientSession（共享 HTTP 连接池，所有 BotSession 复用）
-#   2. 构造 BotManager 并启动命名用户（/etc/clawbot/<name>.env 中配置）
+#   2. 构造 BotManager 与 shared_web 监听，ephemeral 用户由 POST /ephemeral/start 按需创建
 #   3. 启动 shared_web (aiohttp) 绑 :18300
 #   4. 拉起 ephemeral GC sweeper（每 5 分钟清超期 eph_* session）
 ExecStart=/opt/weixin-ClawBot-API/venv/bin/python -u bot.py

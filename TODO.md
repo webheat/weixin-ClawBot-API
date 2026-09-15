@@ -46,18 +46,17 @@
 ## 已完成
 
 - [x] **多用户支持（场景 B）—— portal 单入口** — 所有用户共用 `https://bx.mengxa.com/clawbot/`，portal 根据 cookie 派发
-  - `bot.py` 加 `--user <name>` 参数（向后兼容：不传 = 单租户旧行为）
+  - `bot.py` 加 `--user <name>` 参数（向后兼容：不传 = 单租户旧行为）— **已于 2026-09-15 ephemeral-only 清理时移除**
   - `_resolve_user_paths()` 推导 `config_<user>.json` / `weixin_state_<user>.json` / `logs/clawbot_<user>.log`；非法字符（除 `_.-` 外）自动替换为 `_`
   - `ImaConfig.from_env(env_files=list)` 支持按顺序 `override=False` 加载；默认 `None` 跳过文件加载，env 由 `bot.py` 提前装好
   - `setup_logging(log_file=...)` 接受完整日志路径，覆盖默认 `logs/clawbot.log`
-  - **`qr_portal.py` 单入口 portal**（`:18300`）：picker 页 + cookie 派发 + 反代到 `qr_web.py` + HTML 注入"切换用户"按钮
+  - **`qr_portal.py` 单入口 portal**（`:18300`）：picker 页 + cookie 派发 + 反代到 `qr_web.py` + HTML 注入"切换用户"按钮 — **已删除（2026-09-15）**
   - `/etc/clawbot/ima.env` —— 共享 ima 凭据（兜底）
-  - `/etc/clawbot/user.env.example` —— 用户 env 模板
-  - `/etc/systemd/system/clawbot@.service` —— per-user systemd 模板，`EnvironmentFile=/etc/clawbot/%i.env`，`ExecStart=... bot.py --user %i`
-  - `/etc/systemd/system/clawbot-portal.service` —— portal systemd 单元
+  - `/etc/systemd/system/clawbot@.service` —— per-user systemd 模板，`EnvironmentFile=/etc/clawbot/%i.env`，`ExecStart=... bot.py --user %i` — **已删除（2026-09-15）**
+  - `/etc/systemd/system/clawbot-portal.service` —— portal systemd 单元 — **已删除（2026-09-15）**
   - nginx `/clawbot/` location 恢复单一 `proxy_pass :18300`（撤销前一轮的 map）
   - IMA 独立：用户在 `<user>.env` 写 `IMA_ILINK_*` 即可覆盖；不写则用 `/etc/clawbot/ima.env` 共享
-  - `docs/multi-user.md` 场景 B 章节"+ portal 单入口"+ 完整部署步骤
+  - `docs/multi-user.md` 场景 B 章节"+ portal 单入口"+ 完整部署步骤 — **已删除（2026-09-15）**
 - [x] 接入数据链路关键节点日志
   - 新建 `utils/logging_setup.py`：标准库 `logging`，终端 + `logs/clawbot.log` 按天滚动，保留 7 天；`CLAWBOT_LOG_LEVEL` / `CLAWBOT_LOG_DIR` / `CLAWBOT_LOG_BACKUPS` 环境变量可覆盖
   - 8 个子 logger：`clawbot.web` / `clawbot.qr` / `clawbot.message` / `clawbot.reconnect` / `clawbot.ai` / `clawbot.api` / `clawbot.state` / `clawbot.ima`

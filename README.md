@@ -63,23 +63,12 @@ python bot.py
 登录成功后按账号保存连接状态，正常重启可直接复用；服务端返回 `-14`
 或页面点击“切换用户”时进入受控重新扫码。
 
-旧的一账号一进程模式仅作为兼容入口保留：
-
-```bash
-python bot.py --legacy-single
-python bot.py --user alice
-```
-
 共享运行常用环境变量：`CLAWBOT_WEB_HOST`、`CLAWBOT_WEB_PORT`、
 `CLAWBOT_WEB_PREFIX`、`CLAWBOT_CONFIG_DIR`、`CLAWBOT_STATE_DIR`、
-`CLAWBOT_ENV_DIR`、`CLAWBOT_NAMED_USERS`、`CLAWBOT_SESSION_TTL` 和
+`CLAWBOT_ENV_DIR`、`CLAWBOT_SESSION_TTL` 和
 `CLAWBOT_EPHEMERAL_LIMIT`。Cookie 默认按请求是否为 HTTPS 自动决定 Secure；
 在可信 nginx 后部署时设置 `CLAWBOT_TRUST_PROXY=1`，也可用
 `CLAWBOT_COOKIE_SECURE=1` 强制开启。
-
-部署切换时不要同时运行旧 `qr_portal.py`：它与共享入口默认都使用 18300
-端口。systemd 的 `ExecStart` 应改为 `python bot.py`（不带 `--user`），nginx
-继续把 `/clawbot/` 转发到该唯一监听端口。
 
 首次登录或 token 失效后的登录步骤：
 

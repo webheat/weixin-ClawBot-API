@@ -49,7 +49,7 @@
 | **多进程并行** | 在**一个进程内**通过 asyncio 并行处理 N 个用户的长轮询 / 收发消息 / 定时重连（协程级并行） |
 | **数据隔离** | 每个用户的 `bot_token` / `contexts` / 持久化文件按 user 维度独立，互不可见 |
 | **iLink_bot 协议** | Tencent OpenClaw iLink 2.4.6 HTTP（`get_bot_qrcode` / `getupdates` / `sendmessage` 等） |
-| **新用户接入** | portal 给新用户分配一个 user_id（如 `alice` / `bob` / `eph_xxx`），进程内为该 user_id 启动一个长轮询协程，**不**新开 systemd unit |
+| **新用户接入** | 访客进入 `/clawbot/` 后由 shared_web 分配一个不透明 cookie 映射的 `eph_<hex>` session_id，进程内为该 session 启动一个长轮询协程，**不**新开 systemd unit、不占独立端口、不创建子进程 |
 
 ---
 
@@ -57,7 +57,7 @@
 
 | 预期 | 实现状态 | 差距 |
 |---|---|---|
-| 1 · 多用户共享进程 | ✅ **已实现** | `python bot.py` 默认进入 `shared_runtime`；一个 `BotManager` 管理 N 个 `BotSession`，共享一个无 Cookie 的 HTTP 连接池。旧 `--user` 路径只作兼容。 |
+| 1 · 多用户共享进程 | ✅ **已实现** | `python bot.py` 默认进入 `shared_runtime`；一个 `BotManager` 管理 N 个 `BotSession`，共享一个无 Cookie 的 HTTP 连接池。 |
 | 1 · 数据隔离 | ✅ **已实现** | token、baseurl、上下文、QR、AI/IMA 配置、游标和 state 均为 session 私有；文件名防碰撞，状态原子落盘；共享日志带 `user` 维度。 |
 | 2 · 页面 QR + 登录成功 | ✅ **已实现** | `shared_web` 直接读取对应 session 的 `QrFlowState`，同时兼容保留或剥离 `/clawbot` 前缀的 nginx 配置。 |
 | 2 · 切换用户 + 防抖 | ✅ **已实现** | `POST /switch` 使用 CSRF 校验和服务端 1.5 秒原子防抖，后台触发该 session 的新 QR，不阻塞 HTTP 请求。 |
@@ -83,33 +83,25 @@
 
 ---
 
-## 改造路径（如果要走多租户）
+## 改造路径（已完成）
 
-> 详见后续专门的设计文档，本节只是总览。
+> 2026-09-15 已落地。下面只是历史回顾，方便阅读代码时知道"为什么是这样"。
 
 ```
-现状（一用户一进程）：
-  portal (:18300) → 反代 → bot --user alice (:18301)
-                  → 反代 → bot --user bob   (:18302)
-                  → 反代 → bot --user eph_xxx (:18xxx)
-
-目标（一进程多用户）：
-  portal (:18300) → 内部 API → bot.py 单进程
-                              ├─ user "alice" 长轮询协程
-                              ├─ user "bob"   长轮询协程
-                              └─ user "eph_xxx" 长轮询协程
+现状（共享进程 / ephemeral-only）：
+  shared_web (:18300) ── opaque cookie 映射 ── BotManager (单进程)
+                                              ├─ eph_<hex> 长轮询协程 (anonymous web visitor)
+                                              └─ eph_<hex> 长轮询协程 (另一个 web visitor)
+  无 named user、无 systemd 模板、无子进程、无 per-user 端口。
 ```
 
-代码改造量：~~中等~~。`bot.py` 状态机要重写（单例闭包 → dict-per-user），`utils/bot_launcher.py` 可以删半，`qr_portal.py` 的反代逻辑换成进程内调用。**不动 iLink 协议层、不动 AI 层**。
+代码改造：`bot.py` 的单租户闭包状态机已重写为 `BotSession + BotManager`；`qr_portal.py` / `utils/bot_launcher.py` / OAuth 路径已全部删除，只保留 `shared_web.py` + `qr_web.py` 的共享入口 + ephemeral 会话生命周期。**iLink 协议层 / AI 层 / 持久化格式 / 日志结构均未改**。
 
 ---
 
 ## 相关文档
 
 - `CLAUDE.md` — 项目总览（本文档优先）
-- `docs/EPHEMERAL_BOT_LIFECYCLE.md` — ephemeral 与 systemd 依赖（共享进程改造的伏笔）
-- `docs/multi-user.md` — 当前多用户架构（**只是过渡形态**）
-- `docs/WECHAT_OAUTH.md` — OAuth 接入
 - `docs/IMA_KB.md` — 知识库
 
 ---

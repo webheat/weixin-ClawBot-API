@@ -23,7 +23,7 @@ import re
 import signal
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import aiohttp
 from aiohttp import web
@@ -39,17 +39,6 @@ DEFAULT_PREFIX = "/clawbot"
 DEFAULT_ENV_DIR = "/etc/clawbot"
 DEFAULT_CONFIG_DIR = "."
 DEFAULT_STATE_DIR = "."
-
-
-def _safe_user(user_id: str) -> str:
-    """Return the filename-safe account namespace used by the old CLI."""
-    raw = str(user_id or "")
-    if raw and re.fullmatch(r"[A-Za-z0-9_.-]+", raw):
-        return raw
-    import hashlib
-    slug = re.sub(r"[^A-Za-z0-9_.-]", "_", raw).strip("._-") or "user"
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return f"{slug[:48]}_{digest}"
 
 
 def _parse_env_value(value: str) -> str:
@@ -141,53 +130,6 @@ def _merge_llm_env(config: dict[str, Any], env: Mapping[str, str]) -> None:
         config.update({key: value for key, value in overrides.items() if key != "provider"})
 
 
-def _environment_for_user(user_id: str, *, env_dir: Path) -> dict[str, str]:
-    """Merge env files from lowest to highest precedence.
-
-    ``llm.env`` is the lowest shared fallback, then ``ima.env``, then the
-    account file.  This preserves the documented old CLI precedence while
-    keeping all values in a per-session dictionary.
-    """
-
-    merged: dict[str, str] = {}
-    for path in (env_dir / "llm.env", env_dir / "ima.env",
-                 env_dir / f"{_safe_user(user_id)}.env"):
-        merged.update(parse_env_file(path))
-    return merged
-
-
-def load_user_config(
-    user_id: str,
-    *,
-    config_dir: str | os.PathLike[str] = DEFAULT_CONFIG_DIR,
-    env_dir: str | os.PathLike[str] = DEFAULT_ENV_DIR,
-    default_config: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Load one isolated account config from JSON plus explicit env files.
-
-    The returned dictionary is always a deep copy.  In particular, callers
-    may safely pass it to multiple ephemeral sessions without sharing nested
-    provider dictionaries or IMA settings.
-    """
-
-    root = Path(config_dir)
-    user = str(user_id)
-    config = copy.deepcopy(dict(default_config or {}))
-    account_file = root / f"config_{_safe_user(user)}.json"
-    if account_file.exists():
-        config = _read_json(account_file)
-    env = _environment_for_user(user, env_dir=Path(env_dir))
-    _merge_llm_env(config, env)
-    # BotSession currently owns an AI client but does not accept an IMA client
-    # per account.  Keep these values attached to this account, and make the
-    # limitation observable, rather than mutating os.environ and leaking them.
-    ima_env = {key: value for key, value in env.items() if key.startswith("IMA_")}
-    if ima_env:
-        config["ima_env"] = copy.deepcopy(ima_env)
-    config["runtime_env"] = copy.deepcopy(env)
-    return copy.deepcopy(config)
-
-
 def load_default_config(*, config_dir: str | os.PathLike[str] = DEFAULT_CONFIG_DIR) -> dict[str, Any]:
     """Load the shared ``config.json`` used as the ephemeral default."""
 
@@ -196,41 +138,7 @@ def load_default_config(*, config_dir: str | os.PathLike[str] = DEFAULT_CONFIG_D
 
 # Descriptive aliases keep the loader easy to discover for embedders that use
 # the terminology from the deployment documentation.
-load_config_for_user = load_user_config
 load_env_file = parse_env_file
-
-
-def discover_named_users(
-    *,
-    config_dir: str | os.PathLike[str] = DEFAULT_CONFIG_DIR,
-    env_dir: str | os.PathLike[str] = DEFAULT_ENV_DIR,
-    users: Iterable[str] | None = None,
-) -> tuple[str, ...]:
-    """Resolve named accounts explicitly, or discover their config/env files."""
-
-    if users is not None:
-        values = [str(item).strip() for item in users if str(item).strip()]
-    else:
-        values = []
-        root = Path(config_dir)
-        try:
-            values.extend(path.stem[len("config_"):] for path in root.glob("config_*.json"))
-        except OSError:
-            pass
-        try:
-            values.extend(path.stem for path in Path(env_dir).glob("*.env")
-                          if path.stem not in {"ima", "llm"})
-        except OSError:
-            pass
-    # Preserve order and reject path traversal/empty names after sanitizing.
-    result: list[str] = []
-    seen: set[str] = set()
-    for item in values:
-        safe = _safe_user(item)
-        if safe not in seen:
-            seen.add(safe)
-            result.append(safe)
-    return tuple(result)
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
@@ -264,7 +172,6 @@ class SharedRuntimeConfig:
     config_dir: Path = field(default_factory=lambda: Path(DEFAULT_CONFIG_DIR))
     state_dir: Path = field(default_factory=lambda: Path(DEFAULT_STATE_DIR))
     env_dir: Path = field(default_factory=lambda: Path(DEFAULT_ENV_DIR))
-    named_users: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, *, environ: Mapping[str, str] | None = None) -> "SharedRuntimeConfig":
@@ -286,8 +193,6 @@ class SharedRuntimeConfig:
         port = integer("CLAWBOT_WEB_PORT", DEFAULT_PORT)
         ttl = decimal("CLAWBOT_SESSION_TTL", 8 * 3600, 0.01)
         rate_window = decimal("CLAWBOT_WEB_RATE_WINDOW", 60.0, 1.0)
-        users_raw = str(value("CLAWBOT_NAMED_USERS", value("CLAWBOT_USERS", "")))
-        users = tuple(item.strip() for item in users_raw.split(",") if item.strip())
         prefix = str(value("CLAWBOT_WEB_PREFIX", DEFAULT_PREFIX)).strip() or DEFAULT_PREFIX
         return cls(
             host=str(value("CLAWBOT_WEB_HOST", DEFAULT_HOST)), port=port, prefix=prefix,
@@ -306,7 +211,6 @@ class SharedRuntimeConfig:
             config_dir=Path(str(value("CLAWBOT_CONFIG_DIR", DEFAULT_CONFIG_DIR))),
             state_dir=Path(str(value("CLAWBOT_STATE_DIR", DEFAULT_STATE_DIR))),
             env_dir=Path(str(value("CLAWBOT_ENV_DIR", DEFAULT_ENV_DIR))),
-            named_users=users,
         )
 
 
@@ -317,25 +221,6 @@ RuntimeConfig = SharedRuntimeConfig
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
-
-
-async def _create_background(manager: Any, user_id: str, config: dict[str, Any],
-                             state_file: Path | None = None) -> Any:
-    """Call manager variants while keeping state path support backwards-safe."""
-
-    fn = getattr(manager, "create_background", None)
-    if not callable(fn):
-        fn = getattr(manager, "get_or_create")
-    kwargs: dict[str, Any] = {}
-    if state_file is not None:
-        try:
-            params = inspect.signature(fn).parameters.values()
-            if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params) or \
-                    "state_file" in inspect.signature(fn).parameters:
-                kwargs["state_file"] = str(state_file)
-        except (TypeError, ValueError):
-            pass
-    return await _maybe_await(fn(user_id, copy.deepcopy(config), **kwargs))
 
 
 async def run_shared(
@@ -385,12 +270,19 @@ async def run_shared(
     if manager is None:
         manager = BotManager(http)
     if app is None:
-        default_cfg = load_user_config(
-            "__ephemeral_default__",
-            config_dir=runtime.config_dir,
-            env_dir=runtime.env_dir,
-            default_config=load_default_config(config_dir=runtime.config_dir),
-        )
+        # Ephemeral-only bootstrap: deep-copy the shared ``config.json`` and
+        # merge the two shared env files (``llm.env`` + ``ima.env``) into a
+        # per-session dictionary.  Per-account env files do not exist in the
+        # ephemeral-only topology; see CLAUDE.md "Cleanup 2026-09-15".
+        default_cfg = copy.deepcopy(load_default_config(config_dir=runtime.config_dir))
+        env: dict[str, str] = {}
+        for path in (runtime.env_dir / "llm.env", runtime.env_dir / "ima.env"):
+            env.update(parse_env_file(path))
+        _merge_llm_env(default_cfg, env)
+        ima_env = {key: value for key, value in env.items() if key.startswith("IMA_")}
+        if ima_env:
+            default_cfg["ima_env"] = copy.deepcopy(ima_env)
+        default_cfg["runtime_env"] = copy.deepcopy(env)
         web_config = {
             "session_ttl": runtime.session_ttl,
             "ephemeral_limit": runtime.ephemeral_limit,
@@ -409,21 +301,6 @@ async def run_shared(
         await runner.setup()
         site = web.TCPSite(runner, runtime.host, runtime.port)
         await site.start()
-        users = discover_named_users(config_dir=runtime.config_dir,
-                                     env_dir=runtime.env_dir,
-                                     users=runtime.named_users or None)
-        default_cfg = load_default_config(config_dir=runtime.config_dir)
-        # Do not serialize QR startup: each account gets its own supervised
-        # background task and can independently wait for a scan.
-        await asyncio.gather(*(
-            _create_background(
-                manager, user,
-                load_user_config(user, config_dir=runtime.config_dir,
-                                 env_dir=runtime.env_dir,
-                                 default_config=default_cfg),
-                runtime.state_dir / f"weixin_state_{_safe_user(user)}.json",
-            ) for user in users
-        ))
         await (stop_event or asyncio.Event()).wait()
     finally:
         stop_all = getattr(manager, "stop_all", None)
@@ -451,7 +328,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--prefix", default=None)
-    parser.add_argument("--named-user", action="append", dest="users", default=None)
     args = parser.parse_args(argv)
     runtime = SharedRuntimeConfig.from_env()
     from bot import _redact_text, load_or_create_config
@@ -478,8 +354,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         runtime.port = args.port
     if args.prefix is not None:
         runtime.prefix = args.prefix
-    if args.users is not None:
-        runtime.named_users = tuple(args.users)
 
     async def runner() -> None:
         event = asyncio.Event()

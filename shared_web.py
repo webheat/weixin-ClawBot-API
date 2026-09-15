@@ -1,8 +1,9 @@
-"""Shared-process web routes for the multi-user ClawBot runtime.
+"""Shared-process web routes for the ephemeral-only ClawBot runtime.
 
-This module deliberately has no dependency on :mod:`utils.bot_launcher` and
-never starts a process.  ``manager`` is a small duck-typed boundary supplied by
-the shared bot process::
+This module never starts a process or subprocess; sessions are created on
+demand via ``POST /ephemeral/start`` and live as in-process tasks under
+``manager``.  ``manager`` is a small duck-typed boundary supplied by the
+shared bot process::
 
     await manager.get_or_create(user_id, config=None)
     manager.get(user_id) -> BotSession | None

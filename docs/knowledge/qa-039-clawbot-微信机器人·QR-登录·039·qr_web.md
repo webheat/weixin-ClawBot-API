@@ -11,7 +11,7 @@ keywords: [qr_web, 18300]
 clawbot 支持网页扫码登录吗？（第 2 个变体）
 
 ## 答
-支持。qr_web.py 起一个 127.0.0.1:18300 的 aiohttp，nginx ^~ /clawbot/ 反代出去；多用户由 qr_portal.py 在 :18300 单入口分发。 变体说明：当 KB 中存在多条相似 Q&A 时，
+支持。qr_web.py 起一个 127.0.0.1:18300 的 aiohttp，nginx ^~ /clawbot/ 反代出去；多用户由 shared_web.py 在 :18300 单入口分发。 变体说明：当 KB 中存在多条相似 Q&A 时，
 
 ## 关键词
 qr_web、18300

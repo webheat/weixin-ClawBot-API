@@ -19,11 +19,9 @@ sudo systemctl daemon-reload
 
 # 2. 停止并禁用旧 service（4 service → 0）
 sudo systemctl stop clawbot-portal.service
-sudo systemctl stop clawbot@alice.service        # 如果有命名用户
-sudo systemctl stop 'clawbot@eph_*.service'     # 如果有 ephemeral 子进程
+sudo systemctl stop 'clawbot@eph_*.service'    # 历史残留：旧 launcher 曾写 eph_<hex>.service
 sudo systemctl stop clawbot.service
 sudo systemctl disable clawbot-portal.service
-sudo systemctl disable clawbot@alice.service
 sudo systemctl disable clawbot.service
 
 # 3. 删除旧 unit 文件
@@ -57,13 +55,21 @@ WXOAPP_EPHEMERAL_ENABLED=1    # 1=无 cookie 访客自动分配临时 session
 WXOAPP_EPHEMERAL_TTL=28800    # 临时 session cookie 有效期（秒，默认 8h）
 ```
 
-## 命名用户持久化
+## ephemeral session 持久化
 
-命名用户（OAuth 绑定或手动指定的 user_id）通过 `/etc/clawbot/<name>.env` 配置；
-新 service 启动时由 `shared_runtime` 读取并自动恢复 `weixin_state_<name>.json`。
+共享 runtime **不**为 ephemeral session 写任何磁盘 env 文件；它们的元数据
+只活在内存里，由 `BotManager.sessions` 维护，TTL 到期由 `shared_web` 周期
+GC。
 
-ephemeral session **不**写 `/etc/clawbot/eph_*.env`（与旧架构的根本区别）；
-它们的元数据只活在内存里，TTL 到期 GC。
+旧 launcher 时代残留的 `/etc/clawbot/eph_*.env` 已成为孤儿，shared_web 不再写；
+清理脚本：
+
+```bash
+sudo rm -f /etc/clawbot/eph_*.env
+```
+
+共享 ima 凭据（`/etc/clawbot/ima.env`）按需保留——shared_runtime 仍会在启动时
+读取它作为兜底，所有 ephemeral session 共享同一份 IMA 配置。
 
 ## 验证 multi-task 并行
 
@@ -73,7 +79,7 @@ ephemeral session **不**写 `/etc/clawbot/eph_*.env`（与旧架构的根本区
 ```
 INFO  [clawbot.qr] [user=eph_abc123] qr fetched via POST ...
 INFO  [clawbot.qr] [user=eph_def456] qr fetched via POST ...
-INFO  [clawbot.qr] [user=alice] qr fetched via POST ...
+INFO  [clawbot.qr] [user=eph_789xyz] qr fetched via POST ...
 ```
 
 ## 端口 / 反代
@@ -91,7 +97,7 @@ nginx 配置**不需要改**：
 sudo rm /etc/clawbot/eph_*.env
 ```
 
-`alice.env` / `oauth.env` 等命名用户 env 保留（shared_runtime 仍会读）。
+`ima.env` 保留——shared_runtime 启动时会作为兜底读取，所有 ephemeral session 共享同一份 IMA 配置。
 
 ## 回滚
 

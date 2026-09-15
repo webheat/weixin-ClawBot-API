@@ -238,7 +238,7 @@ async def main():
 | `login_with_qrcode` / `wait_login_confirmation` / `fetch_login_qrcode` / `poll_login_status` | 同步 → 异步函数 | **不动函数体**，从 module-level 移到 `BotSession` 方法（self 取代闭包） |
 | AI 层（`dusapi.py` / `deepseek.py` / `ima.py` / `_AIWithIma`） | stateless 类 | **不动**。本来就每次调用 new instance |
 | `qr_web.py` | 单一 `QrFlowState` | `BotSession.qr_state` 替它；web app 接收 `user_id` 路由到对应 session |
-| `qr_portal.py` | 反代到 user 端口 | **大量简化**：反代改成进程内调用 `manager.get_or_create(user_id)` |
+| `qr_portal.py` | 反代到 user 端口 | **已删除（2026-09-15）**：portal + 命名用户已下线，单进程 ephemeral-only 不再需要跨进程反代 |
 
 ---
 
@@ -246,12 +246,12 @@ async def main():
 
 ### Phase 1：把闭包拆成类（不引入 Manager）
 
-**目标**：`bot.py --user alice` 行为完全不变，但内部状态从闭包迁到 `BotSession`。
+**目标**：ephemeral 用户（`eph_<hex>`）行为完全不变，但内部状态从闭包迁到 `BotSession`。
 
 1. 新建 `bot_session.py`，定义 `BotSession` 类，把 13 个闭包变量 + 7 个 `async def` 全部迁入（机械搬迁，self 取代所有闭包引用）。
 2. `bot.py` 的 `main()` 简化为：构造 `BotSession` → `await session.start()` → `await asyncio.Event().wait()`。
 3. `qr_web.py` 接收 `qr_state` 注入（已经是这样了，但要从单例改成 per-session 实例）。
-4. 跑通：alice 的 bot 用新代码启动，扫码登录、收发消息；连接由 `getupdates`
+4. 跑通：ephemeral session 用新代码启动，扫码登录、收发消息；连接由 `getupdates`
    长轮询持续保活，服务端返回 `-14` 时再验证受控重登。
 
 **风险**：搬迁漏一个变量就是 bug。**缓解**：diff 应该几乎全是"加 self."，没有逻辑改动；上 dev 用户灰度 24h。
@@ -261,26 +261,26 @@ async def main():
 **目标**：同一个 `bot.py` 进程跑 N 个 `BotSession`。
 
 1. 新建 `bot_manager.py`，定义 `BotManager` 类。
-2. `main()` 改成 `BotManager` + 启动命名用户。
+2. `main()` 改成 `BotManager` + 不在启动时拉命名用户（命名用户已下线；ephemeral 由 `shared_web` 按需创建）。
 3. `web_app.py`（新建）把 web 路由改成 `user_id → manager.get_or_create()`。
-4. `qr_portal.py` 反代逻辑改成进程内调用（保留 HTTP 反代作为兜底，给跨进程/跨机器场景用）。
-5. 跑通：起 `bot.py` 不带 `--user`，从 web 端创建 alice + bob + ephemeral 三个 session，全部能收发消息。
+4. `shared_web.py` 的 `POST /ephemeral/start` 改成进程内调用 `manager.get_or_create(eph_<hex>)`，单进程内完成 QR 渲染、扫码轮询、长轮询一站式服务；HTTP 反代跨进程场景不再需要。
+5. 跑通：起 `bot.py` 不带任何命名用户，从 web 端创建 N 个 ephemeral session，全部能收发消息。
 
 **风险**：iLink 服务端对多 token 并发有未文档化的限流（之前一个进程一个 token 时未触发）。**缓解**：先 5 个并发试一晚上；日志监控 `iLink getupdates ret` 看是否被限。
 
 ### Phase 3：ephemeral GC 改造
 
-**目标**：`bot_launcher.reap_ephemeral` 改为 GC `BotManager.sessions` 里的 `eph_*`。
+**目标**：`shared_web` 的 ephemeral sweeper 改为 GC `BotManager.sessions` 里的 `eph_*`。
 
-1. `bot_launcher.py` 简化为"配置 + 索引"层（端口分配逻辑消失——端口现在由 `BotSession` 内部 bind）。
-2. `utils/bot_launcher.reap_ephemeral(manager, ttl)` 改成 `manager.sessions` 内的清理。
+1. `utils/bot_launcher.py` 已删除；端口分配、systemd 拉起逻辑都不再需要——`BotSession` 共享单进程 HTTP 连接池，ephemeral 不绑端口。
+2. `BotManager` 内部按 `CLAWBOT_SESSION_TTL` 周期 GC `eph_*` session；浏览器 cookie 失效只触发未登录 session 停止，已登录 session 不受影响。
 3. 删 `_start_systemd` / `_start_subprocess`——`BotManager` 自己 start session。
 
 **风险**：低。Phase 2 已经把所有状态机搬进 `BotSession`，GC 只是遍历 + `session.stop()`。
 
-### Phase 4（可选）：systemd 单元清理
+### Phase 4（已完成 · 2026-09-15）：ephemeral-only 收尾
 
-`/etc/clawbot/eph_*.env` 全部消失，named user 仍然保留 systemd（ops 习惯 + 跨机器场景）。`clawbot@<name>.service` 改为可选（推荐继续用，systemd 管 portal 即可）。
+命名用户、portal 反代、per-user systemd unit 全部下线。单进程 ephemeral-only 不再有 named systemd unit 可保留；`clawbot-shared.service` 是唯一进程，无模板。
 
 ---
 
@@ -357,11 +357,11 @@ class UserContext:
 
 每完成一个 Phase：
 
-- Phase 1：alice bot 用新代码跑 24h，对照旧代码看 reconnect / 收发消息 / 状态持久化日志
-- Phase 2：5 个并发 session（3 named + 2 ephemeral）跑 8h，看 iLink 服务端是否有限流
+- Phase 1：ephemeral `eph_<hex>` 用新代码跑 24h，对照旧代码看 reconnect / 收发消息 / 状态持久化日志
+- Phase 2：5 个并发 ephemeral session 跑 8h，看 iLink 服务端是否有限流
 - Phase 3：未认证 ephemeral TTL 触发 → session.stop() 优雅停机；已认证 session
   不因浏览器闲置停止，新的访客仍能分配新 session
-- Phase 4（可选）：named user 保留 systemd，portal 用单进程，跨机器场景文档化
+- Phase 4：portal / 命名用户 / per-user systemd 已下线；单进程 ephemeral-only 是终态
 
 ---
 
