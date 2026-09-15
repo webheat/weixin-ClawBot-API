@@ -4,7 +4,7 @@
 
 ## TL;DR
 
-ephemeral bot **协议层**完全不需要 systemd —— iLink 2.4.6 只看 HTTP 请求里的 token，不管 bot 进程是 systemd 启的还是 portal subprocess 启的。当前用 systemd 主要是 **ops 一致性**（跟 named users / OAuth bot 同一套机制）+ **几个免费午餐**。结论：**现状 70 分，可以一直用**；真要改也是无痛的、可逆的。
+ephemeral bot **协议层**完全不需要 systemd —— iLink 2.4.6 只看 HTTP 请求里的 token，不管 bot 进程是 systemd 启的还是 portal subprocess 启的。当前用 systemd 主要是 **ops 一致性**（跟 named users / OAuth bot 同一套机制）+ **3 个真正的免费午餐**（崩溃自动重启 / cgroup 进程隔离 / ops 工具链）+ 几个成本项。结论：**现状 70 分，可以一直用**；真要改也是无痛的、可逆的。
 
 ## 当前架构
 
@@ -37,15 +37,30 @@ bot_launcher.reap_ephemeral(ttl=8h, grace=10min)
 
 ## systemd 给我们什么（去掉后要自己补）
 
-| 能力 | systemd 路径 | 去掉后用什么补 |
+**真正是"免费午餐"的**（不写代码就有）：
+
+| 能力 | systemd 路径 | 重要性 | 替代成本 |
+|---|---|---|---|
+| 崩溃自动重启 | `Restart=on-failure` 模板自带 | **高** | portal 要自己 `waitpid` + `Popen` 重启循环 + 写 PID 跟踪 |
+| 进程隔离 | cgroup 内存/CPU 限制（v2） | 中 | portal 自己 `prlimit` / 显式 cgroup 配置 |
+| ops 工具链 | `systemctl status` / `journalctl` / `list-units` | **高**（debug 时） | 只能 `ps aux` 过滤或维护 sessions.json 索引 |
+
+**表面对我们意义有限的**：
+
+| 能力 | systemd 路径 | 现实情况 |
 |---|---|---|
-| 崩溃自动重启 | `Restart=on-failure` 模板自带 | portal 写 PID + `waitpid` + `subprocess.Popen` 重启循环 |
-| 日志收集 | journald 自动收 | 现状：已经直接写 `logs/clawbot_eph_*.log`（无依赖） |
-| 进程隔离 | cgroup 内存/CPU 限制 | portal 自己 `prlimit` / cgroup v2（要 root，已 root） |
-| 端口分配 | 无依赖，bot 自己起 web 时从 env 读 | 一致（仍要在 env 传；subprocess 可走 argv） |
-| 冷启动开销 | `daemon-reload` ~100ms + `start` ~200ms | 直接 `Popen` ~50ms，**省 ~250ms** |
-| `/etc/clawbot/` 污染 | 每次留一个 `eph_*.env`，sweeper 回收时删 | 不用写 env 文件，**省 IO + 杜绝残留** |
-| ops 工具链 | `systemctl status/list-units` 一眼看清 | 自己 `ps aux | grep` 或维护 sessions 索引 |
+| 日志收集 | journald 自动收 | **没接上**：`bot_launcher.py` 起 systemd 没传 `StandardOutput=journal`，`bot.py` 直接写 `logs/clawbot_eph_*.log`。换 subprocess 完全等价（甚至更好：不用 systemd 转发） |
+
+**subprocess 模式反而赢的**（节省成本，不是免费午餐）：
+
+| 能力 | systemd 路径 | subprocess 路径 | 差距 |
+|---|---|---|---|
+| 冷启动 | `daemon-reload` ~100ms + `start` ~200ms | `Popen` ~50ms | -250ms（扫码场景下用户感知不到） |
+| `/etc/clawbot/` 污染 | 每次留一个 `eph_*.env`，sweeper 异步回收 | 不写 env 文件 | 杜绝孤儿残留 |
+| 回收路径 | `systemctl stop` + `rm env` + 改 JSON = 3 步 | `kill -TERM` + 改 JSON = 2 步 | 少 1 步，sweeper 出 bug 时影响小 |
+| 端口/env 传递 | 必须写 env 文件让模板 `%i` 看到 | 走 argv 即可 | 少一次磁盘 IO |
+
+> **TL;DR**：真正的免费午餐只有 **3 个**（崩溃重启 / cgroup / ops 工具链）。journald 那个其实没用上。日志写到文件、端口读 env、回收三步这些是"systemd 路径的固有成本"——subprocess 在这些维度反而更优。
 
 ## 协议层需求 vs ops 层需求
 
