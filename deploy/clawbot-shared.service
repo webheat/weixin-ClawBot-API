@@ -1,0 +1,41 @@
+[Unit]
+# 单进程多用户共享 runtime（BotManager + shared_web，绑 :18300）
+# 取代旧 clawbot.service（legacy 单租户）和 clawbot@.service 模板（per-user systemd unit）。
+# 启动顺序：必须先于 nginx reload；不需要先于 mysql/redis 之类（无依赖）。
+Description=WeChat ClawBot Shared Runtime (multi-user single process)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/weixin-ClawBot-API
+
+# .env 包含 CLAWBOT_WEB_* / WXOAPP_* / IMA_* / LLM_* 全套配置；
+# 共享 runtime 启动时由 shared_runtime.load_config() 读取并按用户维度隔离。
+EnvironmentFile=/opt/weixin-ClawBot-API/.env
+
+# 入口：python -u bot.py（无 --user）→ bot.py:2611 路由到 shared_runtime.main()
+# shared_runtime 内部:
+#   1. 构造 aiohttp.ClientSession（共享 HTTP 连接池，所有 BotSession 复用）
+#   2. 构造 BotManager 并启动命名用户（/etc/clawbot/<name>.env 中配置）
+#   3. 启动 shared_web (aiohttp) 绑 :18300
+#   4. 拉起 ephemeral GC sweeper（每 5 分钟清超期 eph_* session）
+ExecStart=/opt/weixin-ClawBot-API/venv/bin/python -u bot.py
+Restart=on-failure
+RestartSec=10
+
+# 状态 / 日志
+# journalctl -u clawbot-shared -f 实时跟踪
+# 日志文件：logs/clawbot.log（setup_logging() 写文件；7 天滚动）
+
+# 安全：只允许访问项目目录 + /etc/clawbot（防 token/QR 误写到别处）
+# /var/log/nginx 不需要写（nginx 自己写 access log）
+ReadWritePaths=/opt/weixin-ClawBot-API /etc/clawbot
+
+# 优雅停机：收到 SIGTERM 后等 30s 让 BotSession 跑完 notifystop
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
