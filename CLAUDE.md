@@ -8,6 +8,7 @@ Python 3.12+ client that speaks Tencent's [OpenClaw Weixin](https://github.com/T
 
 ## Current state (read first)
 
+- **Recent big change (2026-09-15) — privacy-safe portal + ephemeral bot GC**. 三阶段改动：(1) 删 `qr_portal.py` 旧 picker（`_PICKER_HTML` / `_render_picker` / `handle_select`），无 cookie 访客只看 OAuth / ephemeral 单按钮登录页，不再列用户列表；(2) 新增 ephemeral 模式（`WXOAPP_EPHEMERAL_ENABLED=1`），OAuth 关时每个访客点按钮自动分配 `eph_<hex>` 临时 bot（`start_or_get(openid="")`），新 systemd unit + 新端口；(3) portal sweeper 每 5 分钟 GC 过期临时 bot（`bot_launcher.reap_ephemeral`，OAuth 绑定的 bot 永不被回收）。`/switch` 换语义：触发 `/relink` 让当前 bot 出新 iLink QR，**保留 cookie**（不再清 cookie 踢回登录页）。详见下方 "Multi-user layout" 表。
 - **Active P0 — per-user conversation history** (in progress). Bot currently sees only the last message; "我刚才说了什么" / "继续上次" both fail. Plan: persist `runtime_state["contexts"][from_id]["history"]` (list of `{"role","content","ts"}`) into `weixin_state.json` so it survives restart; sliding-window cap N=20 (or token-budget trim); rename `ai.chat(text)` → `ai.chat_with_history(messages, system_prompt)` and update `_AIWithIma` to merge history with `ima` snippets. Exclude `/help` / `/time` / `/重新连接` and the `COMMANDS_MSG` welcome from history; private chat only (no group messages). Risk: context bloat → token cost; need a cap and a monitor. Full TODO in `TODO.md`.
 - **Recent big change (2026-09-07)** — full IMA pipeline rewrite + 150 Q&A ingested into a fresh KB. Full timeline, decisions, and sharp edges are in `docs/SESSION_2026-09-07_ima_pipeline.md`. The four new IMA knobs (`IMA_ILINK_KEYWORD_EXTRACT` / `IMA_ILINK_FETCH_BODY` / local fallback / `llm_caveat`) all live in `ima.py` and are routed via `_AIWithIma.chat`'s 3-state machine — read that section before changing AI routing.
 - **Fast Q&A lookup** — `docs/knowledge/` holds ~30 short notes indexed `qa-NNN-<topic>` (ima search keywords, context_token, X-WECHAT-UIN, ret=-14, etc.). Grep by topic when you hit an unfamiliar failure mode before reading the full 51 KB protocol reference.
@@ -147,15 +148,26 @@ Single-tenant is the default (no `--user` → `weixin_state.json`, `config.json`
 
 `/etc/clawbot/ima.env` is the shared ima fallback (currently the production ima key). A user gets their own ima by adding `IMA_ILINK_CLIENT_ID` / `IMA_ILINK_API_KEY` / `IMA_ILINK_DEFAULT_KB` to their `<user>.env`; `load_dotenv(override=False)` puts user values first.
 
-`qr_portal.py` runs on `:18300` as the single entry point: `https://bx.mengxa.com/clawbot/`. Picker reads `/etc/clawbot/*.env`, dispatch uses 30-day cookie `clawbot_user`, HTML gets a "切换用户" injection bar, upstream auth is `Authorization: Bearer <user.CLAWBOT_WEB_TOKEN>` injected per-request. Backends (per-user `qr_web.py`) keep their existing routes — `qr_web.py`'s `?token=` query path still works.
+`qr_portal.py` runs on `:18300` as the single entry point: `https://bx.mengxa.com/clawbot/`. **访客无 cookie 时，门户页面绝不展示任何用户列表**（隐私约束；早期版本 picker 会列出所有用户 + 端口 + 实时状态，已删除）。登录方式双轨：
 
-Operations (nginx stays simple):
+| 模式 | 触发条件 | 行为 |
+|---|---|---|
+| OAuth | `WXOAPP_ENABLED=1` + `WXOAPP_APP_ID/SECRET` 齐 | 单按钮"微信扫码登录" → 开放平台授权 → openid 绑 bot |
+| ephemeral | OAuth 关 + `WXOAPP_EPHEMERAL_ENABLED=1`（默认开） | 单按钮"扫码登录" → 自动分配临时 bot（`eph_<hex>`，新 systemd unit） |
+| 未配置 | 两者都关 | 503 错误页，提示管理员配置 |
+
+cookie `clawbot_user` 持久化绑定（OAuth 模式 8h，ephemeral 模式 8h），bot 进程内 `proxy_to` 反代到对应 `:port`，HTML 注入右上角"切换账号"按钮（→ `/switch`）。
+
+**`/switch` 语义（2026-09-15 改）：** 触发当前 bot 的 `/relink` → 清 `bot_token` → 走 `do_reconnect` 出新 iLink QR → **保留 cookie**（用户原地看到新 QR，不再被踢回登录页）。同 bot 进程同端口，仅 iLink token 换新；访客用同一个微信扫码 = 同 iLink 账号续期，换另一个微信扫码 = iLink 账号切换（`apply_new_login` 自动清 contexts）。
+
+**ephemeral bot GC（防端口耗尽）：** portal sweeper 每 5 分钟扫 `var/bot_sessions.json`，回收 `last_used_at` 超过 `cookie_max_age + 600s` 的 `eph_*` 临时 bot（`systemctl stop` → 删 env 文件 → 从 sessions 移除）。OAuth 绑定的 bot（short_id 非 `eph_` 前缀）永不被回收。`bot_launcher.touch(short_id)` 在每次成功反代时刷新 `last_used_at`。
+
+操作（nginx 不变）：
 ```bash
 sudo systemctl stop clawbot.service           # disable legacy single-tenant
 sudo systemctl enable --now clawbot-portal.service
-sudo cp /etc/clawbot/user.env.example /etc/clawbot/alice.env
-sudo $EDITOR /etc/clawbot/alice.env          # CLAWBOT_WEB_PORT, CLAWBOT_WEB_TOKEN
-sudo systemctl enable --now clawbot@alice
+# 启用 OAuth：在 .env 设 WXOAPP_ENABLED=1
+# 启用 ephemeral：默认开（OAuth 关时自动启用）；显式关：WXOAPP_EPHEMERAL_ENABLED=0
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
@@ -167,6 +179,7 @@ sudo nginx -t && sudo systemctl reload nginx
 - **`get_updates_buf` is opaque**: store verbatim, forward verbatim. Only the iLink server can advance it.
 - **`context_token` must come from the inbound message** and is required by `sendmessage`. Token rotation across reconnect/reinstall is expected.
 - **Account switch (`ilink_bot_id` change) clears `get_updates_buf`, `contexts`, `last_contact`, and `welcomed_users`**. Same-account relogin preserves them.
+- **Portal never leaks user list (privacy)**: 无 cookie 访客的页面**必须**是单一登录按钮（OAuth / ephemeral / 错误页），**不得**渲染任何用户、端口、env 文件路径、bot 状态。`/healthz` 只返 `{ok: True, login_mode: ...}` 不带 `users` 字段。proxy 502 fallback 不暴露 name/port/exception。`/select` 已删除（OAuth 模式下任何人 GET `/select?name=` 已知用户即拿到 cookie = 账号劫持；现在 cookie 只能由 `/oauth/cb` 或 `/ephemeral/start` 设置）。
 - **First QR is fixed endpoint `BASE_URL = https://ilinkai.weixin.qq.com`**. After `scaned_but_redirect`, switch to the server-returned `baseurl`. This switch is one-way per session.
 - **Headers**: never set `Content-Length` manually (aiohttp computes it). The `X-WECHAT-UIN` is a fresh random uint32 → base64 per request. Each POST body includes `base_info: {channel_version: "2.4.6", bot_agent: "weixin-ClawBot-API/1.2.0 (python)"}` (sanitized via `sanitize_bot_agent`).
 - **Media messages are out of scope** for now: image / file / untranscribed voice return a capability hint and are not passed to AI. AES-128-ECB + CDN upload/download not implemented.

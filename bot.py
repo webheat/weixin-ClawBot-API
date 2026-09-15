@@ -435,12 +435,45 @@ def load_or_create_config() -> dict:
 
 BASE_URL = "https://ilinkai.weixin.qq.com"
 COMMANDS_MSG = (
-    "连接成功！\n"
-    "可用指令：\n"
-    "/help  /指令   - 查看全部指令列表\n"
-    "/time          - 查询当前连接剩余时间\n"
-    "/重新连接       - 立即触发重新连接（需确认）\n"
-    "\n非指令输入即为 AI 对话"
+    "你好，我是 🪶 翼claw，您的个人微信专属智能助理。\n"
+    "📚 接入 ima 知识库，支持文字 / 语音 / 公众号卡片。\n"
+    "\n"
+    "直接发消息即可对话，常用指令：\n"
+    "/help    查看全部指令\n"
+    "/time    查看当前连接剩余时间\n"
+    "/重新连接 立即刷新连接"
+)
+
+INTRO_DETAIL_MSG = (
+    "🪶 翼claw · 您的个人微信专属智能助理\n"
+    "\n"
+    "我是一个由大语言模型驱动的微信机器人（DeepSeek / Claude / GPT 可选），\n"
+    "跑在您自己的服务器上。发消息给我，我会用 AI 帮您解答问题、\n"
+    "整理资料、撰写内容。\n"
+    "\n"
+    "📚 我能做什么\n"
+    "\n"
+    "• AI 自由对话：闲聊、写作、翻译、分析、头脑风暴——直接发消息就行。\n"
+    "• 知识库问答：接入了腾讯 ima，预装 150 条您专属 Q&A。\n"
+    "  \"xxx 怎么用 / xxx 是什么\" 这类问题优先从知识库找答案。\n"
+    "• 三层兜底检索：云端 KB 没命中时，自动回退本地 KB 或语义检索。\n"
+    "  断网也能用本地知识库回答。\n"
+    "• 多模态理解：文字、语音（自动转文字）、公众号 / 小程序卡片\n"
+    "  （自动读标题和摘要）都能识别处理。\n"
+    "• 持续在线：单次连接约 24 小时，掉线自动重连，不需要您手动干预。\n"
+    "\n"
+    "⚙️ 常用指令\n"
+    "\n"
+    "• /help    · 查看全部指令\n"
+    "• /time    · 查看当前连接剩余时间\n"
+    "• /重新连接 · 立即刷新连接\n"
+    "\n"
+    "💡 小提示\n"
+    "问具体问题比\"你好\"更能发挥我的能力；\n"
+    "知识库内容会随您上传的资料持续更新。\n"
+    "\n"
+    "━━━━━━━━━━━\n"
+    "直接发消息即可开始对话 👋"
 )
 
 
@@ -1058,6 +1091,15 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                 bot_base_url_ref,
             )
         login_time_ref[0] = time.time()
+        # 关键：前端 render() 只有看到 status==="logged_in" 才会显示"登录成功 ✓"。
+        # do_reconnect 成功后必须同步刷这个状态，否则页面一直停留在 qr_pending
+        # 显示 QR，哪怕 iLink 实际已登录成功（用户看到老 QR 继续扫 → 实际是 dead QR
+        # 因为 do_reconnect 已在等 scan 结果并会进入新的 QR 周期）。
+        # 旧路径（message_loop 的 -14 handler）单独写过一行，这里补齐 do_reconnect 主路径。
+        if web_state is not None:
+            web_state.status = "logged_in"
+            web_state.logged_in_at = time.time()
+            log_reconnect.info("reconnect web state set logged_in (frontend should show ✓)")
     finally:
         reconnect_in_progress[0] = False
 
@@ -1117,10 +1159,14 @@ async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_co
                 print("[自动] 尚无最近联系人，跳过本轮自动重连（仅 web/terminal 出 QR）")
                 login_time_ref[0] = time.time()
                 continue
-            await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                               typing_ticket_cache, reconnect_asked, warning_active,
-                               reconnect_in_progress, login_time_ref, cfg, runtime_state,
-                               web_on_qrcode, web_state)
+            # 走单一入口：若 listener 已在跑（被 /relink 抢先或 -14 触发），
+            # 这里会 await 同一 Future，不会再开第二个 login_with_qrcode。
+            try:
+                await request_relogin("force-before")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_reconnect.warning("force reconnect failed err=%s", _redact_text(exc))
         except asyncio.CancelledError:
             raise
         except ILinkAPIError as exc:
@@ -1321,7 +1367,8 @@ async def poll_login_status(session, qrcode, base_url=BASE_URL, verify_code=None
 
 
 async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_seconds=None,
-                                  allow_already_connected=False, web_state=None):
+                                  allow_already_connected=False, web_state=None,
+                                  cancel_event=None):
     timeout_seconds = timeout_seconds or RECONNECT_CONFIG["qrcode_scan_timeout"]
     deadline = time.time() + timeout_seconds
     current_base_url = base_url or BASE_URL
@@ -1332,6 +1379,11 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
         if time.time() >= deadline:
             log_qr.warning("login timed out after %.1fs", timeout_seconds)
             return {"timeout": True}
+        # 协作式取消：portal /relink 在初始登录等待扫码阶段触发的 cancel_event
+        # 必须在 1s 内命中，否则 listener 一直等不到 reconnect_in_progress 变 False
+        if cancel_event is not None and cancel_event.is_set():
+            log_qr.info("wait_login_confirmation cancelled by external event")
+            return {"cancelled": True}
 
         try:
             result = await poll_login_status(session, qrcode, current_base_url, pending_verify_code)
@@ -1394,8 +1446,15 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
         await asyncio.sleep(1)
 
 
-async def login_with_qrcode(session, local_token_list=None, existing_state=None, on_qrcode=None, web_state=None):
-    """执行官方二维码登录，最多展示 MAX_QR_REFRESH_COUNT 个二维码。"""
+async def login_with_qrcode(session, local_token_list=None, existing_state=None,
+                            on_qrcode=None, web_state=None, cancel_event=None):
+    """执行官方二维码登录，最多展示 MAX_QR_REFRESH_COUNT 个二维码。
+
+    Args:
+        cancel_event: 可选的 ``asyncio.Event``——若在循环中被 set，函数立刻
+            抛 ``asyncio.CancelledError``。用于让 portal ``/switch`` 在初始
+            登录等待扫码阶段也能触发接管（避免 listener 还没起来就被忽略）。
+    """
     # 与官方实现一致：初始二维码计为第 1 次，最多共展示 3 个二维码。
     refresh_count = 1
     deadline = time.time() + RECONNECT_CONFIG["qrcode_scan_timeout"]
@@ -1404,6 +1463,9 @@ async def login_with_qrcode(session, local_token_list=None, existing_state=None,
                 refresh_count, MAX_QR_REFRESH_COUNT,
                 max(0.0, deadline - time.time()))
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            log_qr.info("login cancelled by external event (cancel_event set)")
+            raise asyncio.CancelledError("login_with_qrcode cancelled by event")
         remaining = deadline - time.time()
         if remaining <= 0:
             log_qr.error("login aborted refresh_count=%d reason=deadline_exceeded",
@@ -1443,9 +1505,13 @@ async def login_with_qrcode(session, local_token_list=None, existing_state=None,
             timeout_seconds=remaining,
             allow_already_connected=True,
             web_state=web_state,
+            cancel_event=cancel_event,
         )
         if login_result.get("bot_token"):
             return login_result
+        if login_result.get("cancelled"):
+            # cancel_event 命中：把 cancelled 信号透传上去，让 main() 抛 CancelledError
+            raise asyncio.CancelledError("login_with_qrcode cancelled by event")
         if login_result.get("already_connected"):
             old_token = str(existing_state.get("bot_token") or "").strip()
             if old_token:
@@ -1515,31 +1581,219 @@ async def main():
     async with aiohttp.ClientSession() as session:
         # ---- 启动 web 登录页面（CLAWBOT_WEB_ENABLED=1 默认）----
         qr_state = QrFlowState()
+        relogin_event = asyncio.Event()
         web_task: asyncio.Task | None = None
         web_on_qrcode = None
         if web_enabled():
-            web_task = asyncio.create_task(qr_web_start(qr_state))
+            web_task = asyncio.create_task(qr_web_start(qr_state, relogin_event=relogin_event))
             web_on_qrcode = make_web_on_qrcode(qr_state, session)
 
-        if saved_token:
-            # 官方客户端会按账号复用本地凭据；若服务端随后返回 -14，
-            # 消息循环会停止紧密轮询并进入受控二维码重登录。
-            print("[登录] 复用本地保存的微信连接；token 失效时会自动要求重新扫码。")
-            log_qr.info("login reuse saved_token len=%d", len(saved_token))
+        # ---- 初始化可变状态容器 + relogin_listener（必须在初始登录之前）----
+        #
+        # 历史 bug：relogin_listener 之前在 main() 末尾才创建，初始登录等待扫码期间
+        # /relink 设的 event 没人消费，新 QR 永远不出。现把容器 / listener 都前置，
+        # 初始登录期间用 reconnect_in_progress[0]=True 排斥 listener，
+        # 登录完成后再让 listener 接棒（处理登录期间累积的 /relink 事件）。
+        bot_token_ref = [saved_token]
+        bot_base_url_ref = [runtime_state.get("baseurl", BASE_URL)]
+        saved_contact = runtime_state.get("last_contact") or {}
+        last_contact = {
+            "from_id": saved_contact.get("from_id") or None,
+            "context_token": saved_contact.get("context_token") or None,
+        }
+        typing_ticket_cache = {}
+        welcomed_users = set(runtime_state.get("contexts", {}).keys())
+        reconnect_asked = asyncio.Event()
+        warning_active = [False]
+        reconnect_in_progress = [False]
+        login_time_ref = [time.time()]
+        manual_reconnect_pending = {}
+        # ---- 重新登录：单一 owner 模式 ----
+        #
+        # 历史 bug：relogin_listener（来自 /relink）、message_loop 的 -14 handler、
+        # reconnect_timer_task 的 force_before、handle_message 的 "Y" 手动重连
+        # 各自独立调 login_with_qrcode / do_reconnect。在 /relink 场景下 listener
+        # 刚清空 token 触发自己的 do_reconnect 时，message_loop 的下一轮 getupdates
+        # 用空 token 拿到 -14，又调一次 login_with_qrcode，两条链路并发抢
+        # web_on_qrcode，前端看到的 QR 被两条链路互踩（"正在生成新二维码..." 卡很久
+        # 然后突然换一张码 = 用户扫的码已失效）。修法：所有 4 条路径都通过
+        # request_relogin() 入口；唯一真正干活的是 relogin_listener，并发调用者
+        # 共享同一个 Future，避免双发登录。
+        _relogin_lock = asyncio.Lock()
+        _pending_relogin: list[Optional[asyncio.Future]] = [None]
+
+        async def request_relogin(reason: str) -> dict:
+            """所有重新登录路径的唯一入口。
+
+            - 若已有 listener 在跑：直接 await 它的 Future，调用方零额外登录。
+            - 若空闲：登记新 Future、set relogin_event 唤醒 listener，await 它的结果。
+
+            Returns: do_reconnect 产出的 login_result dict（与 listen 自身用同一个）。
+            Raises: do_reconnect 抛出的任何异常。
+            """
+            async with _relogin_lock:
+                if _pending_relogin[0] is not None and not _pending_relogin[0].done():
+                    log_reconnect.info("relogin dedup: joining in-flight reason=%s", reason)
+                    existing = _pending_relogin[0]
+                else:
+                    existing = None
+                    future: asyncio.Future = asyncio.get_event_loop().create_future()
+                    _pending_relogin[0] = future
+                    relogin_event.set()
+                    log_reconnect.warning("relogin requested reason=%s", reason)
+            if existing is not None:
+                return await existing
+            return await future
+
+        async def relogin_listener():
+            """重新登录的真正执行者（唯一 owner）。被 request_relogin 或 /relink 唤醒。
+
+            触发条件 1：portal 用户在右上角点"切换账号" → /relink → qr_web 把
+            relogin_event.set()。
+            触发条件 2：request_relogin 被 message_loop / timer / handle_message
+            "Y" 调用，登记 Future + set event。
+
+            行为：清空 token 引用 → 调 do_reconnect → 把结果 set 给 _pending_relogin
+            （如果有等待方）。Future 异常路径同样 set_exception，让 await 抛出来。
+            """
+            log_reconnect.warning("relogin_listener task started")
+            while True:
+                await relogin_event.wait()
+                # reconnect_in_progress=True 时**不**清 event，让初始 login 的
+                # cancel_event 检查能在 ~1s 内命中；但必须 sleep 避免 busy-loop
+                # （不清 event + 不 sleep 会让 wait() 立刻返回陷入死循环）。
+                if reconnect_in_progress[0]:
+                    log_reconnect.info("relogin_listener skipped: reconnect in progress; event kept")
+                    await asyncio.sleep(0.5)
+                    continue
+                relogin_event.clear()
+                # 拿当前等待方（若有）。即使没有人 await 也要跑（/relink 是
+                # fire-and-forget；没有等待方就直接 set 不上 future，do_reconnect
+                # 仍然把新 QR 推到 qr_state）。
+                async with _relogin_lock:
+                    current_future = _pending_relogin[0]
+                log_reconnect.warning("relogin_listener running; has_awaiter=%s",
+                                     current_future is not None)
+                try:
+                    runtime_state["bot_token"] = ""
+                    save_runtime_state(runtime_state)
+                    bot_token_ref[0] = ""
+                    qr_state.status = "qr_pending"  # 双保险（qr_web 已经设过）
+                    login_result = await do_reconnect(
+                        session, bot_token_ref, bot_base_url_ref, last_contact,
+                        typing_ticket_cache, reconnect_asked, warning_active,
+                        reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
+                        runtime_state,
+                        web_on_qrcode=web_on_qrcode,
+                        web_state=qr_state,
+                    )
+                    if current_future is not None and not current_future.done():
+                        current_future.set_result(login_result)
+                except asyncio.CancelledError:
+                    # main() 在被取消时也会取消本 task；如果有等待方，要把异常传出去
+                    # 否则 caller 永久挂起。
+                    if current_future is not None and not current_future.done():
+                        current_future.set_exception(asyncio.CancelledError())
+                    raise
+                except Exception as exc:
+                    log_reconnect.error("relogin_listener crashed err=%s",
+                                        _redact_text(exc), exc_info=True)
+                    if current_future is not None and not current_future.done():
+                        current_future.set_exception(exc)
+                finally:
+                    # 兜底：do_reconnect 任何退出路径（成功 / 异常 / max_refresh_exceeded）
+                    # 都确保 is_regenerating=False。如果 set_qr_png 没机会跑（fetch 失败
+                    # / qrcode 缺失），前端就不会永远卡在"正在生成..."。
+                    if qr_state.is_regenerating:
+                        log_reconnect.warning("relogin_listener: clearing stale is_regenerating "
+                                              "(do_reconnect exited without set_qr_png)")
+                        qr_state.is_regenerating = False
+                    # 释放 _pending_relogin 槽位，让下一轮 request_relogin 能起新流程。
+                    async with _relogin_lock:
+                        if _pending_relogin[0] is current_future:
+                            _pending_relogin[0] = None
+
+        relogin_task = asyncio.create_task(relogin_listener())
+
+        # 初始登录期间占住 reconnect_in_progress，避免 relogin_listener 抢跑
+        # 触发第二个 login_with_qrcode（两个并行会竞争 QR、互相覆盖 state）。
+        # 包成 task 是为了让 cancel_event 命中时能强制 cancel_task.cancel() 中断
+        # iLink 的 35s 长轮询 poll_login_status（不用 task 的话只能在 1-35s 后
+        # 排队等 poll 返回再检测 cancel，listener 一直等不到 reconnect_in_progress
+        # 变 False）。
+        reconnect_in_progress[0] = True
+        login_result: Optional[dict] = None
+        login_task: Optional[asyncio.Task] = None
+        try:
+            if saved_token:
+                # 官方客户端会按账号复用本地凭据；若服务端随后返回 -14，
+                # 消息循环会停止紧密轮询并进入受控二维码重登录。
+                print("[登录] 复用本地保存的微信连接；token 失效时会自动要求重新扫码。")
+                log_qr.info("login reuse saved_token len=%d", len(saved_token))
+                login_result = {
+                    "bot_token": saved_token,
+                    "baseurl": runtime_state.get("baseurl") or BASE_URL,
+                    "ilink_bot_id": runtime_state.get("ilink_bot_id", ""),
+                    "ilink_user_id": runtime_state.get("ilink_user_id", ""),
+                }
+            else:
+                # 同时启动 cancel-watcher：relogin_event 一被 set，立刻取消 login_task
+                # （task 模式：cancel_event 协作式检测在 iLink 35s 长轮询里走不到，
+                # 必须强制 cancel task 才能让 login_with_qrcode 立刻抛 CancelledError）
+                async def _cancel_initial_login():
+                    await relogin_event.wait()
+                    if login_task is not None and not login_task.done():
+                        log_qr.info("cancel-watcher: cancelling initial login task")
+                        login_task.cancel()
+                cancel_watcher = asyncio.create_task(_cancel_initial_login())
+                login_task = asyncio.create_task(login_with_qrcode(
+                    session,
+                    [],
+                    existing_state=runtime_state,
+                    on_qrcode=web_on_qrcode,
+                    web_state=qr_state,
+                ))
+                try:
+                    login_result = await login_task
+                finally:
+                    cancel_watcher.cancel()
+                    try:
+                        await cancel_watcher
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        except asyncio.CancelledError:
+            # relogin_event 触发 cancel_task → login_with_qrcode 抛 CancelledError；
+            # 此时不要退出 main()，让 relogin_listener 接手：它会清 token、跑 do_reconnect
+            # 重新出 QR、扫到后再把 token 写回 bot_token_ref[0]。这里等 do_reconnect
+            # 完成（bot_token_ref 被 listener 重新填好）后继续走 message_loop。
+            log_qr.warning("initial login cancelled by /relink; "
+                           "awaiting relogin_listener to produce new token")
+            # **立刻**释放 reconnect_in_progress，让 listener 的下一轮 wait() 命中
+            # 并启动 do_reconnect（不再 sleep + skip）。如果等 60s listener 还没填回
+            # token（一般不会发生），则下面抛 RuntimeError 终止进程。
+            reconnect_in_progress[0] = False
+            for _ in range(600):  # 60s 上限
+                await asyncio.sleep(0.1)
+                if bot_token_ref[0]:
+                    break
+            else:
+                raise RuntimeError("relogin_listener did not produce token within 60s")
+            # 把 listener 刚拿到的凭据同步到 runtime_state 和 login_result，
+            # 让下面的"登录成功"代码块正常 apply / 发 notifystart / 起 message_loop。
             login_result = {
-                "bot_token": saved_token,
-                "baseurl": runtime_state.get("baseurl") or BASE_URL,
+                "bot_token": bot_token_ref[0],
+                "baseurl": bot_base_url_ref[0] or runtime_state.get("baseurl") or BASE_URL,
                 "ilink_bot_id": runtime_state.get("ilink_bot_id", ""),
                 "ilink_user_id": runtime_state.get("ilink_user_id", ""),
             }
+            log_qr.info("resuming main() after listener produced token "
+                        "bot_id=%s", str(login_result["ilink_bot_id"])[:8] or "-")
         else:
-            login_result = await login_with_qrcode(
-                session,
-                [],
-                existing_state=runtime_state,
-                on_qrcode=web_on_qrcode,
-                web_state=qr_state,
-            )
+            reconnect_in_progress[0] = False
+        if login_result is None:
+            # 理论不会到这里；defensive：未拿到 token 直接退出
+            log_qr.error("login failed reason=no_login_result")
+            return
         bot_token = str(login_result.get("bot_token") or "").strip()
         if not bot_token:
             log_qr.error("login failed reason=missing_bot_token_in_response")
@@ -1549,6 +1803,8 @@ async def main():
         qr_state.logged_in_at = time.time()
 
         bot_base_url = login_result.get("baseurl") or runtime_state.get("baseurl") or BASE_URL
+        bot_base_url_ref[0] = bot_base_url
+        bot_token_ref[0] = bot_token
         old_account_id = str(runtime_state.get("ilink_bot_id") or "")
         new_account_id = str(login_result.get("ilink_bot_id") or old_account_id)
         if new_account_id and old_account_id != new_account_id:
@@ -1567,21 +1823,6 @@ async def main():
 
         print(f"登录成功！baseurl={bot_base_url}")
         print(f"{'=' * 40}\n{COMMANDS_MSG}\n{'=' * 40}")
-
-        bot_token_ref = [bot_token]
-        bot_base_url_ref = [bot_base_url]
-        saved_contact = runtime_state.get("last_contact") or {}
-        last_contact = {
-            "from_id": saved_contact.get("from_id") or None,
-            "context_token": saved_contact.get("context_token") or None,
-        }
-        typing_ticket_cache = {}
-        welcomed_users = set(runtime_state.get("contexts", {}).keys())
-        reconnect_asked = asyncio.Event()
-        warning_active = [False]
-        reconnect_in_progress = [False]
-        login_time_ref = [time.time()]
-        manual_reconnect_pending = {}
 
         await notify_lifecycle(session, "ilink/bot/msg/notifystart", bot_token, bot_base_url)
 
@@ -1659,14 +1900,15 @@ async def main():
                 if normalized == "Y":
                     await send_msg_safe(session, from_id, context_token, "好的，正在重新连接...",
                                         bot_token_ref, bot_base_url_ref)
-                    await do_reconnect(
-                        session, bot_token_ref, bot_base_url_ref, last_contact,
-                        typing_ticket_cache, reconnect_asked, warning_active,
-                        reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
-                        runtime_state,
-                        web_on_qrcode=web_on_qrcode,
-                        web_state=qr_state,
-                    )
+                    try:
+                        await request_relogin("manual-reconnect")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log_msg.error("manual reconnect failed err=%s", _redact_text(exc), exc_info=True)
+                        await send_msg_safe(session, from_id, context_token,
+                                            f"[失败] 重连未完成: {_redact_text(exc)}",
+                                            bot_token_ref, bot_base_url_ref)
                 else:
                     await send_msg_safe(session, from_id, context_token, "已取消重新连接",
                                         bot_token_ref, bot_base_url_ref)
@@ -1690,7 +1932,7 @@ async def main():
             if from_id not in welcomed_users:
                 log_msg.debug("handle welcome from=%s", from_id[-8:])
                 welcomed_users.add(from_id)
-                await send_msg_safe(session, from_id, context_token, COMMANDS_MSG,
+                await send_msg_safe(session, from_id, context_token, INTRO_DETAIL_MSG,
                                     bot_token_ref, bot_base_url_ref)
                 return
 
@@ -1866,22 +2108,16 @@ async def main():
                     raise
                 except ILinkAPIError as exc:
                     if exc.is_stale_token:
-                        log_msg.warning("iLink -14 stale_token, entering controlled relogin")
+                        log_msg.warning("iLink -14 stale_token; requesting relogin")
                         print("[iLink] ret/errcode=-14，当前 token 已失效，进入受控重新登录。")
-                        runtime_state["bot_token"] = ""
-                        save_runtime_state(runtime_state)
+                        # 走单一入口：若 listener 已被 /relink 唤醒（典型场景：
+                        # 用户点"切换账号"时 listener 刚清 token、开始 do_reconnect），
+                        # 这里直接 await 同一 Future，绝不会并发调第二个
+                        # login_with_qrcode 导致 web_on_qrcode 被两条链路互踩。
                         try:
-                            await asyncio.sleep(RETRY_DELAY)
-                            fresh_login = await login_with_qrcode(
-                                session, [], existing_state={},
-                                on_qrcode=web_on_qrcode,
-                                web_state=qr_state,
-                            )
-                            await apply_new_login(fresh_login)
-                            qr_state.status = "logged_in"
-                            qr_state.logged_in_at = time.time()
-                            # 同账号重新登录沿用该账号游标；切换账号时
-                            # apply_new_login 会清空持久化状态，这里同步本地变量。
+                            await request_relogin("iLink -14")
+                            # 重新读持久化游标：同账号 re-login 保留游标；换账号时
+                            # listener 内部已清空 runtime_state。reset long-poll 节奏。
                             get_updates_buf = str(runtime_state.get("get_updates_buf") or "")
                             long_poll_timeout = LONG_POLL_TIMEOUT
                             consecutive_failures = 0
@@ -1925,11 +2161,12 @@ async def main():
             web_on_qrcode=web_on_qrcode,
             web_state=qr_state,
         ))
+
         message_task = asyncio.create_task(message_loop())
         try:
             await message_task
         finally:
-            all_tasks = [message_task, timer_task]
+            all_tasks = [message_task, timer_task, relogin_task]
             if web_task is not None:
                 all_tasks.append(web_task)
             for task in all_tasks:
