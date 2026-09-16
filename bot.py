@@ -1410,19 +1410,26 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
             continue
 
         if result.get("bot_token"):
+            log_qr.info("qr_confirmed bot_id=%s",
+                        str(result.get("ilink_bot_id") or "-")[:12])
             return result
         if result.get("login_error"):
+            log_qr.info("qr_status=login_error")
             return result
         if result.get("already_connected"):
+            log_qr.info("qr_status=already_connected")
             return result if allow_already_connected else {"already_connected": True}
         if result.get("expired") or result.get("verify_code_blocked"):
+            log_qr.info("qr_status=expired_or_verify_code_blocked")
             return result
         if result.get("redirect_base"):
             current_base_url = result["redirect_base"]
             log_qr.info("poll node switched to=%s", current_base_url)
             print(f"扫码轮询切换到新节点: {current_base_url}")
+            log_qr.info("qr_status=redirect_base")
             continue
         if result.get("scanned"):
+            log_qr.info("qr_status=scanned")
             if pending_verify_code and result.get("verify_code_accepted"):
                 pending_verify_code = None
             if web_state is not None:
