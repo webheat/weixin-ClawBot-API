@@ -1,4 +1,4 @@
-"""Focused lifecycle tests for the ephemeral-only shared runtime."""
+"""Focused lifecycle tests for the session-token shared runtime."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ from shared_runtime import (
 class FakeManager:
     """Stand-in for ``BotManager`` that records session-creation calls.
 
-    The ephemeral-only runtime creates sessions on demand via the web layer
-    (``POST /ephemeral/start``); ``run_shared`` itself does not eagerly start
-    any user.  This fake records every ``create_background`` call so tests
+    The session-token runtime creates sessions on demand via the web layer
+    (``POST /start``); ``run_shared`` itself does not eagerly start any
+    session.  This fake records every ``create_background`` call so tests
     can assert the runtime does not auto-spawn anything.
     """
 
@@ -31,10 +31,10 @@ class FakeManager:
         self.started: list[str] = []
         self.stopped = False
 
-    async def create_background(self, user_id, config, **kwargs):
-        self.started.append(user_id)
+    async def create_background(self, session_id, config, **kwargs):
+        self.started.append(session_id)
 
-    def get(self, user_id):
+    def get(self, session_id):
         return None
 
     async def stop_all(self):
@@ -46,8 +46,8 @@ def _write_config(path: Path, payload: dict) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_shared_does_not_eagerly_start_users(tmp_path: Path):
-    """Ephemeral sessions start on demand via ``POST /ephemeral/start``; the
+async def test_run_shared_does_not_eagerly_start_sessions(tmp_path: Path):
+    """Session-token sessions start on demand via ``POST /start``; the
     shared listener itself must never auto-spawn a session."""
     _write_config(tmp_path, {
         "provider": "dusapi",
@@ -87,7 +87,7 @@ def test_parse_env_file_is_pure(tmp_path: Path, monkeypatch):
     assert parsed["CLAWBOT_LLM_MODEL"] == "small"
     assert parsed["IMA_ILINK_API_KEY"] == "ima-key"
     # ``parse_env_file`` must never mutate the process environment — that
-    # would leak one ephemeral session's IMA/LLM credentials to every other.
+    # would leak one session's IMA/LLM credentials to every other.
     assert "CLAWBOT_LLM_API_KEY" not in os.environ
     assert "CLAWBOT_LLM_MODEL" not in os.environ
     assert "IMA_ILINK_API_KEY" not in os.environ

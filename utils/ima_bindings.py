@@ -1,7 +1,7 @@
 """ima KB ↔ iLink-user 绑定的进程内单例持久化。
 
-ephemeral-only 部署里浏览器 cookie 是唯一句柄；cookie 过期 / 重启后
-``eph_<hex>`` 就丢。如果绑定只存在 ``shared_web.py`` 内存里，下次扫码
+session-token-only 部署里浏览器 cookie 是唯一句柄；cookie 过期 / 重启后
+``session_id`` 就丢。如果绑定只存在 ``shared_web.py`` 内存里，下次扫码
 还得重选 KB —— 所以落到跨 cookie / 跨重启 / 多 ``BotSession`` 并发安全
 的 JSON 文件 + ``asyncio.Lock``。
 
@@ -220,8 +220,8 @@ def _print_table(rows: list[tuple[str, dict]]) -> None:
     if not rows:
         print("(空)")
         return
-    for user_id, binding in rows:
-        print(f"  ilink_user_id={user_id}")
+    for ilink_user_id, binding in rows:
+        print(f"  ilink_user_id={ilink_user_id}")
         for key in _FIELDS:
             print(f"    {key:14s} = {binding.get(key, '')!r}")
 

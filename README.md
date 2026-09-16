@@ -66,7 +66,7 @@ python bot.py
 共享运行常用环境变量：`CLAWBOT_WEB_HOST`、`CLAWBOT_WEB_PORT`、
 `CLAWBOT_WEB_PREFIX`、`CLAWBOT_CONFIG_DIR`、`CLAWBOT_STATE_DIR`、
 `CLAWBOT_ENV_DIR`、`CLAWBOT_SESSION_TTL` 和
-`CLAWBOT_EPHEMERAL_LIMIT`。Cookie 默认按请求是否为 HTTPS 自动决定 Secure；
+`CLAWBOT_MAX_SESSIONS`（最大并发 session 数 / max concurrent sessions）。Cookie 默认按请求是否为 HTTPS 自动决定 Secure；
 在可信 nginx 后部署时设置 `CLAWBOT_TRUST_PROXY=1`，也可用
 `CLAWBOT_COOKIE_SECURE=1` 强制开启。
 

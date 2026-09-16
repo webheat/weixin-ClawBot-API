@@ -131,7 +131,7 @@ def _merge_llm_env(config: dict[str, Any], env: Mapping[str, str]) -> None:
 
 
 def load_default_config(*, config_dir: str | os.PathLike[str] = DEFAULT_CONFIG_DIR) -> dict[str, Any]:
-    """Load the shared ``config.json`` used as the ephemeral default."""
+    """Load the shared ``config.json`` used as the session default."""
 
     return _read_json(Path(config_dir) / "config.json")
 
@@ -163,7 +163,7 @@ class SharedRuntimeConfig:
     port: int = DEFAULT_PORT
     prefix: str = DEFAULT_PREFIX
     session_ttl: float = 8 * 3600
-    ephemeral_limit: int = 100
+    session_limit: int = 100
     rate_limit: int = 5
     rate_window: float = 60.0
     cookie_secure: bool | None = None
@@ -197,7 +197,7 @@ class SharedRuntimeConfig:
         return cls(
             host=str(value("CLAWBOT_WEB_HOST", DEFAULT_HOST)), port=port, prefix=prefix,
             session_ttl=ttl,
-            ephemeral_limit=integer("CLAWBOT_EPHEMERAL_LIMIT", 100, 1),
+            session_limit=integer("CLAWBOT_MAX_SESSIONS", 100, 1),
             rate_limit=integer("CLAWBOT_WEB_RATE_LIMIT", 5, 1),
             rate_window=rate_window,
             cookie_secure=(
@@ -270,10 +270,10 @@ async def run_shared(
     if manager is None:
         manager = BotManager(http)
     if app is None:
-        # Ephemeral-only bootstrap: deep-copy the shared ``config.json`` and
+        # Default bootstrap: deep-copy the shared ``config.json`` and
         # merge the two shared env files (``llm.env`` + ``ima.env``) into a
-        # per-session dictionary.  Per-account env files do not exist in the
-        # ephemeral-only topology; see CLAUDE.md "Cleanup 2026-09-15".
+        # per-session dictionary.  Per-account env files do not exist in
+        # the session-token-only topology; see CLAUDE.md "Cleanup 2026-09-15".
         default_cfg = copy.deepcopy(load_default_config(config_dir=runtime.config_dir))
         env: dict[str, str] = {}
         for path in (runtime.env_dir / "llm.env", runtime.env_dir / "ima.env"):
@@ -285,7 +285,7 @@ async def run_shared(
         default_cfg["runtime_env"] = copy.deepcopy(env)
         web_config = {
             "session_ttl": runtime.session_ttl,
-            "ephemeral_limit": runtime.ephemeral_limit,
+            "session_limit": runtime.session_limit,
             "rate_limit": runtime.rate_limit,
             "rate_window": runtime.rate_window,
             "cookie_secure": runtime.cookie_secure,

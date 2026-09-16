@@ -76,7 +76,7 @@ class BotSession:
 
     def __init__(
         self,
-        user_id: str,
+        session_id: str,
         http: aiohttp.ClientSession,
         config: dict[str, Any] | None = None,
         *,
@@ -85,12 +85,18 @@ class BotSession:
         on_event: Optional[Callable[[str, "BotSession", dict[str, Any]], Awaitable[None] | None]] = None,
         on_qrcode: Optional[Callable[[str], Awaitable[None] | None]] = None,
     ) -> None:
-        self.user_id = str(user_id)
+        self.session_id = str(session_id)
         self.http = http
         self.config = copy.deepcopy(config or {})
         state_root = Path(str(self.config.get("state_dir") or "."))
+        # State files pre-2026-09-16 used the ``weixin_state_eph_<hex>`` pattern
+        # with the opaque session id minted by shared_web.  After the rename
+        # the new code path uses ``weixin_state_<token_urlsafe>`` without the
+        # ``eph_`` prefix.  Existing on-disk files are intentionally left
+        # untouched — they belong to sessions that no longer run and the
+        # next GC sweep (or ``weixin_state_*.json`` TTL) reaps them.
         self.state_file = Path(state_file) if state_file is not None else (
-            state_root / f"weixin_state_{_safe_name(self.user_id)}.json"
+            state_root / f"weixin_state_{_safe_name(self.session_id)}.json"
         )
         self._state_lock = threading.Lock()
         self._on_event = on_event
@@ -375,6 +381,20 @@ class BotSession:
                 self.qr_state.is_regenerating = False
 
     async def request_relogin(self, reason: str = "manual") -> dict[str, Any]:
+        # Always trace *who* asked for a relogin and *which* iLink owner it
+        # targets.  The opaque session token (``session_id``) is logged as-is;
+        # ``ilink_user_id`` is the WeChat-account-stable owner identity and is
+        # truncated to its last 12 chars to keep logs short without leaking
+        # the full sensitive value.  ``bot_id`` rotates per QR so it is safe.
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        owner = (self.ilink_user_id or "")[-12:]
+        log_reconnect.info(
+            "relogin_requested session=%s reason=%s bot_id=%s owner=%s "
+            "stopped=%s authenticating=%s",
+            self.session_id, reason, self.ilink_bot_id or "-",
+            owner or "-", self._stopped, self._reauthenticating,
+        )
         if self._stopped:
             raise RuntimeError("session stopped")
         async with self._relogin_lock:
@@ -421,7 +441,7 @@ class BotSession:
             raise RuntimeError("session stopped")
         # Listener is intentionally created before QR login so /relink can
         # cancel and take over an initial QR flow.
-        self._relogin_task = asyncio.create_task(self._relogin_listener(), name=f"relogin-{self.user_id}")
+        self._relogin_task = asyncio.create_task(self._relogin_listener(), name=f"relogin-{self.session_id}")
         self._initializing = True
         already_applied = False
         try:
@@ -432,9 +452,9 @@ class BotSession:
                 try:
                     # Cancel the in-flight 35s QR status request immediately
                     # when /relink asks the listener to take over.
-                    login_task = asyncio.create_task(self._login(), name=f"initial-login-{self.user_id}")
+                    login_task = asyncio.create_task(self._login(), name=f"initial-login-{self.session_id}")
                     cancel_task = asyncio.create_task(self._initial_cancel.wait(),
-                                                      name=f"cancel-login-{self.user_id}")
+                                                      name=f"cancel-login-{self.session_id}")
                     done, _ = await asyncio.wait((login_task, cancel_task),
                                                  return_when=asyncio.FIRST_COMPLETED)
                     if cancel_task in done and not login_task.done():
@@ -485,7 +505,7 @@ class BotSession:
                 self._fatal.set()
                 await self._emit("task_failed", task=name, error=str(exc))
                 raise
-        task = asyncio.create_task(runner(), name=f"{name}-{self.user_id}")
+        task = asyncio.create_task(runner(), name=f"{name}-{self.session_id}")
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
         return task
 
@@ -494,7 +514,7 @@ class BotSession:
         """Send a transactional reply with a replay-stable client id."""
         from bot import API_TIMEOUT, api_post, base_info, ensure_business_success
 
-        identity = self.ilink_bot_id or self.user_id
+        identity = self.ilink_bot_id or self.session_id
         client_id = "openclaw-weixin:" + hashlib.sha256(
             f"{identity}:{self._message_id(msg)}:{kind}".encode("utf-8")
         ).hexdigest()[:32]
@@ -783,6 +803,23 @@ class BotSession:
                 if task is not current and not task.done():
                     task.cancel()
             await asyncio.gather(*(t for t in tasks if t is not current), return_exceptions=True)
+            # Trace every shutdown so the [user=-] notifystop line is no
+            # longer orphaned.  ``caller`` is the asyncio task that asked for
+            # shutdown — useful when multiple paths (manager.stop, sweeper,
+            # _evict_failed, signal handler) converge here.
+            from utils.logging_setup import get_logger
+            log_reconnect = get_logger("reconnect")
+            owner = (self.ilink_user_id or "")[-12:]
+            caller_task = asyncio.current_task()
+            caller_name = caller_task.get_name() if caller_task is not None else "-"
+            log_reconnect.info(
+                "session.stop session=%s owner=%s bot_id=%s "
+                "had_token=%s authenticating=%s reauth_required=%s "
+                "caller=%s",
+                self.session_id, owner or "-", self.ilink_bot_id or "-",
+                bool(self.bot_token), self._reauthenticating,
+                self._reauthentication_required, caller_name,
+            )
             if self.bot_token:
                 try:
                     from bot import notify_lifecycle

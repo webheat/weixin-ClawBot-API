@@ -1,18 +1,19 @@
-"""Shared-process web routes for the ephemeral-only ClawBot runtime.
+"""Shared-process web routes for the ClawBot runtime.
 
 This module never starts a process or subprocess; sessions are created on
-demand via ``POST /ephemeral/start`` and live as in-process tasks under
-``manager``.  ``manager`` is a small duck-typed boundary supplied by the
-shared bot process::
+demand via ``POST /start`` and live as in-process tasks under ``manager``.
+``manager`` is a small duck-typed boundary supplied by the shared bot
+process::
 
-    await manager.get_or_create(user_id, config=None)
-    manager.get(user_id) -> BotSession | None
-    await manager.stop(user_id)
-    await manager.touch(user_id)       # a sync implementation is also OK
+    await manager.get_or_create(session_id, config=None)
+    manager.get(session_id) -> BotSession | None
+    await manager.stop(session_id)
+    await manager.touch(session_id)       # a sync implementation is also OK
 
 Each ``BotSession`` must expose ``qr_state`` and either ``request_relogin`` or
 ``relogin_event``.  The browser only receives an opaque, random cookie; the
-cookie is mapped to a user id on the server and is never treated as a user id.
+cookie is mapped to a session id on the server and is never treated as a
+session id.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ log = logging.getLogger("clawbot.shared_web")
 DEFAULT_PREFIX = "/clawbot"
 DEFAULT_COOKIE = "clawbot_session"
 DEFAULT_SESSION_TTL = 8 * 3600
-DEFAULT_EPHEMERAL_LIMIT = 100
+DEFAULT_SESSION_LIMIT = 100
 DEFAULT_RATE_LIMIT = 5
 DEFAULT_RATE_WINDOW = 60.0
 DEFAULT_RESUME_TTL = 30 * 24 * 3600
@@ -43,10 +44,10 @@ DEFAULT_RESUME_TTL = 30 * 24 * 3600
 
 @dataclass
 class BrowserBinding:
-    user_id: str
+    session_id: str
     created_at: float
     last_used_at: float
-    ephemeral: bool = True
+    transient: bool = True
     csrf_token: str = ""
     last_switch_at: float = 0.0
 
@@ -71,12 +72,12 @@ class BrowserSessions:
         self._resume_tokens: dict[str, tuple[str, float]] = {}
         self._lock = asyncio.Lock()
 
-    async def bind(self, user_id: str, *, ephemeral: bool = True) -> str:
+    async def bind(self, session_id: str, *, transient: bool = True) -> str:
         now = time.time()
         sid = secrets.token_urlsafe(32)
         async with self._lock:
             self._bindings[sid] = BrowserBinding(
-                user_id, now, now, ephemeral, csrf_token=secrets.token_urlsafe(32)
+                session_id, now, now, transient, csrf_token=secrets.token_urlsafe(32)
             )
         return sid
 
@@ -100,10 +101,10 @@ class BrowserSessions:
         async with self._lock:
             return self._bindings.pop(sid, None)
 
-    async def issue_resume(self, user_id: str) -> str:
+    async def issue_resume(self, session_id: str) -> str:
         token = secrets.token_urlsafe(32)
         async with self._lock:
-            self._resume_tokens[token] = (str(user_id), time.time() + self.resume_ttl)
+            self._resume_tokens[token] = (str(session_id), time.time() + self.resume_ttl)
         return token
 
     async def resolve_resume(self, token: Optional[str]) -> Optional[str]:
@@ -113,14 +114,14 @@ class BrowserSessions:
             record = self._resume_tokens.get(token)
             if record is None:
                 return None
-            user_id, expires_at = record
+            session_id, expires_at = record
             if time.time() >= expires_at:
                 self._resume_tokens.pop(token, None)
                 return None
-            return user_id
+            return session_id
 
-    async def revoke_resume(self, user_id: str) -> None:
-        key = str(user_id)
+    async def revoke_resume(self, session_id: str) -> None:
+        key = str(session_id)
         async with self._lock:
             for token, record in list(self._resume_tokens.items()):
                 if record[0] == key:
@@ -238,6 +239,77 @@ def _state_dict(state: Any) -> dict:
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
+
+
+# Paths the browser polls continuously — keep these at DEBUG so we don't drown
+# the shared log when many visitors are active at once.
+_WEB_POLL_PATHS = frozenset({"/state", "/healthz", "/qrcode.png"})
+
+
+def _web_user_label(request: web.Request) -> str:
+    """Return the last 12 chars of the opaque session cookie, or ``"-"``.
+
+    The opaque token is logged as a routing hint, not as authentication.
+    Truncating to 12 chars matches the ``ilink_user_id[-12:]`` style used
+    throughout the project and keeps the log line readable.
+    """
+
+    sid = request.cookies.get(DEFAULT_COOKIE) or ""
+    return sid[-12:] if sid else "-"
+
+
+@web.middleware
+async def _web_request_log_middleware(
+    request: web.Request, handler: Any
+) -> web.StreamResponse:
+    """Log every aiohttp request through ``clawbot.web`` so that previously
+    silent triggers (POST /switch, POST /start, etc.) leave a trail.
+
+    ``GET /state`` / ``/healthz`` / ``/qrcode.png`` are browser polls — emit
+    them at DEBUG.  Everything else is INFO.  4xx/5xx escalate to
+    WARNING/ERROR.  Exceptions raised by the handler are caught so the log
+    line still records the status code the framework would have produced.
+    """
+
+    start = time.perf_counter()
+    method = request.method
+    path = request.rel_url.path
+    user_label = _web_user_label(request)
+    is_poll = path in _WEB_POLL_PATHS and method == "GET"
+    log_level = logging.DEBUG if is_poll else logging.INFO
+    response: Optional[web.StreamResponse] = None
+    try:
+        response = await handler(request)
+        return response
+    except web.HTTPException as exc:
+        log_level = max(log_level, logging.WARNING if exc.status < 500 else logging.ERROR)
+        dur_ms = (time.perf_counter() - start) * 1000
+        log.log(
+            log_level,
+            "web req method=%s path=%s user=%s status=%d dur_ms=%.1f err=%s",
+            method, path, user_label, exc.status, dur_ms, exc.reason,
+        )
+        raise
+    except Exception:
+        dur_ms = (time.perf_counter() - start) * 1000
+        log.exception(
+            "web req crashed method=%s path=%s user=%s dur_ms=%.1f",
+            method, path, user_label, dur_ms,
+        )
+        raise
+    finally:
+        if response is not None:
+            status = response.status
+            if status >= 500:
+                log_level = logging.ERROR
+            elif status >= 400 and log_level < logging.WARNING:
+                log_level = logging.WARNING
+            dur_ms = (time.perf_counter() - start) * 1000
+            log.log(
+                log_level,
+                "web req method=%s path=%s user=%s status=%d dur_ms=%.1f",
+                method, path, user_label, status, dur_ms,
+            )
 
 
 def _build_ima_client(ima_env: Mapping[str, str] | None) -> Optional[Any]:
@@ -424,7 +496,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                   sessions: Optional[BrowserSessions] = None) -> web.Application:
     """Build the shared-process aiohttp application.
 
-    Config keys: ``session_ttl``, ``ephemeral_limit``, ``rate_limit``,
+    Config keys: ``session_ttl``, ``session_limit``, ``rate_limit``,
     ``rate_window``, ``cookie_name``, ``resume_ttl``, and optional
     ``session_config`` passed to ``manager.get_or_create``.
     """
@@ -441,11 +513,11 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
     limiter = SlidingRateLimiter(cfg.get("rate_limit", DEFAULT_RATE_LIMIT),
                                  cfg.get("rate_window", DEFAULT_RATE_WINDOW),
                                  cfg.get("rate_limit_max_keys", 10000))
-    max_ephemeral = max(1, int(cfg.get("ephemeral_limit", DEFAULT_EPHEMERAL_LIMIT)))
+    max_sessions = max(1, int(cfg.get("session_limit", DEFAULT_SESSION_LIMIT)))
     create_lock = asyncio.Lock()
     pending_creates = 0
     pending_sessions: dict[str, asyncio.Task] = {}
-    app = web.Application()
+    app = web.Application(middlewares=[_web_request_log_middleware])
     app["manager"] = manager
     app["browser_sessions"] = store
 
@@ -477,11 +549,11 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         b = await store.resolve(request.cookies.get(cookie_name))
         if b is None:
             return None, web.json_response({"error": "unauthorized"}, status=401)
-        session = manager.get(b.user_id)
-        if session is None and b.user_id not in pending_sessions:
+        session = manager.get(b.session_id)
+        if session is None and b.session_id not in pending_sessions:
             await store.remove(request.cookies.get(cookie_name))
             return None, web.json_response({"error": "session_not_found"}, status=401)
-        await _maybe_await(getattr(manager, "touch", lambda _: None)(b.user_id))
+        await _maybe_await(getattr(manager, "touch", lambda _: None)(b.session_id))
         return b, None
 
     async def resume_existing(request: web.Request) -> Optional[str]:
@@ -489,16 +561,16 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         token = request.cookies.get(resume_cookie_name)
         if not callable(resolver) or not token:
             return None
-        user_id = await _maybe_await(resolver(token))
-        if not user_id:
+        session_id = await _maybe_await(resolver(token))
+        if not session_id:
             return None
-        if manager.get(user_id) is None and user_id not in pending_sessions:
+        if manager.get(session_id) is None and session_id not in pending_sessions:
             revoke = getattr(store, "revoke_resume", None)
             if callable(revoke):
-                await _maybe_await(revoke(user_id))
+                await _maybe_await(revoke(session_id))
             return None
-        sid = await store.bind(user_id)
-        await _maybe_await(getattr(manager, "touch", lambda _: None)(user_id))
+        sid = await store.bind(session_id)
+        await _maybe_await(getattr(manager, "touch", lambda _: None)(session_id))
         return sid
 
     async def index(request: web.Request) -> web.Response:
@@ -511,7 +583,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                 set_session_cookie(response, request, recovered_sid)
                 return response
             # unauthenticated browser sees the login page, never a user list
-            start = root_for(request) + "/ephemeral/start"
+            start = root_for(request) + "/start"
             response = web.Response(text=LOGIN_HTML.replace("__START__", escape(start)),
                                     content_type="text/html")
             if request.cookies.get(cookie_name):
@@ -522,7 +594,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                 .replace("__CSRF__", json.dumps(b.csrf_token)))
         return web.Response(text=page, content_type="text/html")
 
-    async def ephemeral_start(request: web.Request) -> web.StreamResponse:
+    async def session_start(request: web.Request) -> web.StreamResponse:
         nonlocal pending_creates
         allowed, retry = await limiter.allow(
             _client_key(request, trust_proxy=_as_bool(cfg.get("trust_proxy"))))
@@ -536,19 +608,19 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             set_session_cookie(response, request, recovered_sid)
             return response
         async with create_lock:
-            existing = {b.user_id for _, b in await store.snapshot()}
+            existing = {b.session_id for _, b in await store.snapshot()}
             active = len(existing) + pending_creates
-            if active >= max_ephemeral:
+            if active >= max_sessions:
                 return web.json_response({"error": "session_limit"}, status=429,
                                          headers={"Retry-After": "60"})
             pending_creates += 1
-        user_id = "eph_" + secrets.token_hex(16)
+        session_id = secrets.token_urlsafe(32)
         # Bind before starting: BotSession.start() may block while waiting for
         # QR confirmation.  The browser must receive its cookie immediately.
-        sid = await store.bind(user_id)
+        sid = await store.bind(session_id)
         issue_resume = getattr(store, "issue_resume", None)
         resume_token = (
-            await _maybe_await(issue_resume(user_id))
+            await _maybe_await(issue_resume(session_id))
             if callable(issue_resume) else ""
         )
 
@@ -557,7 +629,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             try:
                 create_background = getattr(manager, "create_background", None)
                 if callable(create_background):
-                    result = create_background(user_id, session_config)
+                    result = create_background(session_id, session_config)
                     await _maybe_await(result)
                     return
                 get_or_create = manager.get_or_create
@@ -569,25 +641,25 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                 if supports_wait:
                     # Explicit manager capability: returns before QR polling.
                     await _maybe_await(get_or_create(
-                        user_id, session_config, wait_ready=False))
+                        session_id, session_config, wait_ready=False))
                 else:
                     # Legacy implementation can wait for a 480s QR flow;
                     # running it on this background task avoids request deadlock.
-                    await _maybe_await(get_or_create(user_id, session_config))
+                    await _maybe_await(get_or_create(session_id, session_config))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("shared session create failed user=%s err=%s", user_id, exc)
+                log.warning("shared session create failed session=%s err=%s", session_id, exc)
                 try:
-                    await _maybe_await(manager.stop(user_id))
+                    await _maybe_await(manager.stop(session_id))
                 except Exception:
                     pass
                 revoke = getattr(store, "revoke_resume", None)
                 if callable(revoke):
-                    await _maybe_await(revoke(user_id))
+                    await _maybe_await(revoke(session_id))
                 raise
             finally:
-                pending_sessions.pop(user_id, None)
+                pending_sessions.pop(session_id, None)
 
         try:
             # Explicit non-blocking manager capabilities can be awaited in the
@@ -605,8 +677,8 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             if callable(create_background) or supports_wait:
                 await create_when_ready()
             else:
-                task = asyncio.create_task(create_when_ready(), name=f"web-create-{user_id}")
-                pending_sessions[user_id] = task
+                task = asyncio.create_task(create_when_ready(), name=f"web-create-{session_id}")
+                pending_sessions[session_id] = task
                 task.add_done_callback(
                     lambda done: done.exception() if not done.cancelled() else None
                 )
@@ -614,7 +686,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             await store.remove(sid)
             revoke = getattr(store, "revoke_resume", None)
             if callable(revoke):
-                await _maybe_await(revoke(user_id))
+                await _maybe_await(revoke(session_id))
             log.warning("shared session create failed err=%s", exc)
             return web.json_response({"error": "session_create_failed"}, status=503)
         finally:
@@ -631,7 +703,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         b, error = await binding(request)
         if error:
             return error
-        session = manager.get(b.user_id)  # type: ignore[union-attr]
+        session = manager.get(b.session_id)  # type: ignore[union-attr]
         if session is None:
             return web.json_response({"status": "starting", "has_qr_png": False}, status=202)
         body = _state_dict(getattr(session, "qr_state", None))
@@ -657,7 +729,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         b, error = await binding(request)
         if error:
             return error
-        session = manager.get(b.user_id)  # type: ignore[union-attr]
+        session = manager.get(b.session_id)  # type: ignore[union-attr]
         if session is None:
             return web.Response(status=204)
         png = getattr(getattr(session, "qr_state", None), "current_qr_png", None)
@@ -680,7 +752,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         code = str((payload or {}).get("code") or "").strip()
         if not code.isdigit() or not 4 <= len(code) <= 8:
             return web.json_response({"error": "code must be 4-8 digits"}, status=400)
-        session = manager.get(b.user_id)  # type: ignore[union-attr]
+        session = manager.get(b.session_id)  # type: ignore[union-attr]
         if session is None:
             return web.json_response({"error": "session_starting"}, status=409)
         state_obj = getattr(session, "qr_state", None)
@@ -701,7 +773,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         if not allowed:
             return web.json_response({"ok": True, "rate_limited": True,
                                       "retry_after": retry})
-        session = manager.get(b.user_id)  # type: ignore[union-attr]
+        session = manager.get(b.session_id)  # type: ignore[union-attr]
         if session is None:
             return web.json_response({"error": "session_starting"}, status=409)
         request_relogin = getattr(session, "request_relogin", None)
@@ -712,12 +784,12 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                 except TypeError:
                     await _maybe_await(request_relogin(reason="web switch"))
                 except Exception as exc:
-                    log.warning("web relogin failed user=%s err=%s", b.user_id, exc)
+                    log.warning("web relogin failed session=%s err=%s", b.session_id, exc)
 
-            task = asyncio.create_task(trigger_relogin(), name=f"web-switch-{b.user_id}")
-            pending_sessions[f"switch:{b.user_id}"] = task
+            task = asyncio.create_task(trigger_relogin(), name=f"web-switch-{b.session_id}")
+            pending_sessions[f"switch:{b.session_id}"] = task
             task.add_done_callback(
-                lambda done, key=f"switch:{b.user_id}": pending_sessions.pop(key, None)
+                lambda done, key=f"switch:{b.session_id}": pending_sessions.pop(key, None)
             )
         else:
             event = getattr(session, "relogin_event", None)
@@ -734,7 +806,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
 
     async def _get_owner_ilink_id(b: BrowserBinding) -> str:
         """查 BotSession 的 ilink_user_id；不依赖 BotSession.ilink_user_id 存在性。"""
-        session = manager.get(b.user_id)
+        session = manager.get(b.session_id)
         return str(getattr(session, "ilink_user_id", "") or "")
 
     async def ima_bind_get(request: web.Request) -> web.Response:
@@ -844,7 +916,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             from utils.ima_bindings import get_default_bindings as _get_bindings
             bindings = await _get_bindings()
             bot_id_at_bind = ""
-            session = manager.get(b.user_id)
+            session = manager.get(b.session_id)
             if session is not None:
                 bot_id_at_bind = str(getattr(session, "ilink_bot_id", "") or "")
             await bindings.bind(
@@ -887,12 +959,12 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
         while True:
             await asyncio.sleep(max(0.05, min(60.0, store.ttl / 4)))
             for _, expired_binding in await store.expire():
-                if expired_binding.ephemeral:
-                    starter = pending_sessions.pop(expired_binding.user_id, None)
+                if expired_binding.transient:
+                    starter = pending_sessions.pop(expired_binding.session_id, None)
                     if starter is not None and not starter.done():
                         starter.cancel()
                         await asyncio.gather(starter, return_exceptions=True)
-                    session = manager.get(expired_binding.user_id)
+                    session = manager.get(expired_binding.session_id)
                     authenticated = getattr(session, "has_authenticated_connection", None)
                     if authenticated is None and session is not None:
                         token = getattr(session, "bot_token", "")
@@ -902,14 +974,14 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
                         # Browser control-plane expiry must not stop a live
                         # WeChat data-plane connection.  getupdates remains
                         # active and -14 still drives controlled QR recovery.
-                        log.info("expired browser binding retained authenticated session user=%s",
-                                 expired_binding.user_id)
+                        log.info("expired browser binding retained authenticated session=%s",
+                                 expired_binding.session_id)
                         continue
                     try:
-                        await _maybe_await(manager.stop(expired_binding.user_id))
+                        await _maybe_await(manager.stop(expired_binding.session_id))
                     except Exception as exc:
-                        log.warning("expired session stop failed user=%s err=%s",
-                                    expired_binding.user_id, exc)
+                        log.warning("expired session stop failed session=%s err=%s",
+                                    expired_binding.session_id, exc)
 
     async def lifecycle_cleanup(app_: web.Application):
         sweeper = asyncio.create_task(sweep_expired(), name="shared-web-sweeper")
@@ -935,7 +1007,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             ("/switch", "POST", switch),
             ("/ima/bind", "GET", ima_bind_get), ("/ima/bind", "POST", ima_bind_post),
             ("/ima/unbind", "POST", ima_unbind_post),
-            ("/ephemeral/start", "POST", ephemeral_start), ("/healthz", "GET", healthz)):
+            ("/start", "POST", session_start), ("/healthz", "GET", healthz)):
             path = (base.rstrip("/") + suffix) or "/"
             app.router.add_route(method, path, handler)
     if pfx:
@@ -945,7 +1017,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             ("/switch", "POST", switch),
             ("/ima/bind", "GET", ima_bind_get), ("/ima/bind", "POST", ima_bind_post),
             ("/ima/unbind", "POST", ima_unbind_post),
-            ("/ephemeral/start", "POST", ephemeral_start), ("/healthz", "GET", healthz)):
+            ("/start", "POST", session_start), ("/healthz", "GET", healthz)):
             app.router.add_route(method, suffix, handler)
     return app
 

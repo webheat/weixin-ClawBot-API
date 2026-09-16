@@ -49,7 +49,7 @@
 | **多进程并行** | 在**一个进程内**通过 asyncio 并行处理 N 个用户的长轮询 / 收发消息 / 定时重连（协程级并行） |
 | **数据隔离** | 每个用户的 `bot_token` / `contexts` / 持久化文件按 user 维度独立，互不可见 |
 | **iLink_bot 协议** | Tencent OpenClaw iLink 2.4.6 HTTP（`get_bot_qrcode` / `getupdates` / `sendmessage` 等） |
-| **新用户接入** | 访客进入 `/clawbot/` 后由 shared_web 分配一个不透明 cookie 映射的 `eph_<hex>` session_id，进程内为该 session 启动一个长轮询协程，**不**新开 systemd unit、不占独立端口、不创建子进程 |
+| **新用户接入** | 访客进入 `/clawbot/` 后由 shared_web 分配一个不透明 cookie 映射的 session token（URL-safe 随机串），进程内为该 session 启动一个长轮询协程，**不**新开 systemd unit、不占独立端口、不创建子进程 |
 
 ---
 
@@ -63,16 +63,16 @@
 | 2 · 切换用户 + 防抖 | ✅ **已实现** | `POST /switch` 使用 CSRF 校验和服务端 1.5 秒原子防抖，后台触发该 session 的新 QR，不阻塞 HTTP 请求。 |
 | 3 · 登录后文字对话 | ✅ **已实现** | 每个 session 独立长轮询；普通文字进入各自 AI/IMA 栈，再用该账号 token/context 回写。 |
 | 3 · 文本指令 | ✅ **保持兼容** | `/help`、`/time`、`/重新连接` 保留；首条普通问题在发送欢迎语后仍继续交给 AI。 |
-| 架构 · 新用户无 systemd unit | ✅ **已实现** | `/ephemeral/start` 只在当前进程注册 `eph_<hex>` session，不调用 launcher、systemctl 或 subprocess；网页 TTL 到期只停止未完成扫码的 session，已登录连接继续由后台维护。 |
+| 架构 · 新用户无 systemd unit | ✅ **已实现** | `/clawbot/start` 只在当前进程注册新的 session token，不调用 launcher、systemctl 或 subprocess；网页 TTL 到期只停止未完成扫码的 session，已登录连接继续由后台维护。 |
 | 架构 · 单进程多任务并行 | ✅ **已实现** | 同用户并发创建去重，不同用户启动互不持锁；每个用户各自运行消息、定时和重连任务。 |
 
 ### 已落实的关键安全与可靠性约束
 
-1. 浏览器只持有随机 opaque session id；不能把 cookie 伪造成 user id 越权访问别人的 QR。
+1. 浏览器只持有随机 opaque session token；不能把 cookie 伪造成 user id 越权访问别人的 QR。
 2. `/switch` 与配对码提交必须携带绑定级 CSRF token；创建接口同时有 IP 限流和全局容量限制。
 3. 消息批次先持久化，回复确认成功后才记录 message id 并推进 `get_updates_buf`；重放使用稳定 client id。
 4. 启动任务和常驻任务受监督；失败 session 会从 Manager 摘除并优雅停止，避免僵尸会话。
-5. 未完成扫码的 ephemeral 会话随浏览器 TTL 回收；已登录连接不受浏览器闲置影响；不写 env、不占独立端口、不创建 systemd unit。
+5. 未完成扫码的 session 随浏览器 TTL 回收；已登录连接不受浏览器闲置影响；不写 env、不占独立端口、不创建 systemd unit。
 
 ### 哪些不需要改
 
@@ -88,14 +88,14 @@
 > 2026-09-15 已落地。下面只是历史回顾，方便阅读代码时知道"为什么是这样"。
 
 ```
-现状（共享进程 / ephemeral-only）：
+现状（共享进程 / session-based 单进程模型）：
   shared_web (:18300) ── opaque cookie 映射 ── BotManager (单进程)
-                                              ├─ eph_<hex> 长轮询协程 (anonymous web visitor)
-                                              └─ eph_<hex> 长轮询协程 (另一个 web visitor)
+                                              ├─ session token 长轮询协程 (anonymous web visitor)
+                                              └─ session token 长轮询协程 (另一个 web visitor)
   无 named user、无 systemd 模板、无子进程、无 per-user 端口。
 ```
 
-代码改造：`bot.py` 的单租户闭包状态机已重写为 `BotSession + BotManager`；`qr_portal.py` / `utils/bot_launcher.py` / OAuth 路径已全部删除，只保留 `shared_web.py` + `qr_web.py` 的共享入口 + ephemeral 会话生命周期。**iLink 协议层 / AI 层 / 持久化格式 / 日志结构均未改**。
+代码改造：`bot.py` 的单租户闭包状态机已重写为 `BotSession + BotManager`；`qr_portal.py` / `utils/bot_launcher.py` / OAuth 路径已全部删除，只保留 `shared_web.py` + `qr_web.py` 的共享入口 + session 生命周期。**iLink 协议层 / AI 层 / 持久化格式 / 日志结构均未改**。
 
 ---
 

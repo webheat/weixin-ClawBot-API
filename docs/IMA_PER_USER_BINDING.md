@@ -20,8 +20,8 @@ CLAUDE.md "Product context: IMA vs Obsidian" 决策表里第一行就指出：
 
 但 "Shared creds via `/etc/clawbot/ima.env`" 是 **凭据** 共享，不是 **KB** 共享。`/etc/clawbot/ima.env` 里的 `IMA_ILINK_DEFAULT_KB` 是一段**全局字符串**（`ima.py:116` 读一次、`ima.py:508` 当 fallback），整个 process 共一份。当前共享运行时下：
 
-- 匿名访客 `eph_656ef35f...` 扫一次码 → 分配一个 BotSession → 用 `IMA_ILINK_DEFAULT_KB` 这个 KB 检索
-- 换一个浏览器、换个 `eph_*` cookie、再扫码 → 拿到**另一个** BotSession，**仍然查同一个 KB**
+- 匿名访客拿到一个 session token，扫一次码 → 分配一个 BotSession → 用 `IMA_ILINK_DEFAULT_KB` 这个 KB 检索
+- 换一个浏览器、换个 session token、再扫码 → 拿到**另一个** BotSession，**仍然查同一个 KB**
 
 这意味着：「翼claw 助手」运维方预装了 150 条 Q&A 灌进某个 KB（见 `docs/SESSION_2026-09-07_ima_pipeline.md`），但任何扫了同一个 QR 的人看到的是同一份资料。**对单一部署 owner 的「个人助理」场景不致命；对「我自己的微信、想接我自己的 KB」的诉求不成立。**
 
@@ -30,7 +30,7 @@ CLAUDE.md "Product context: IMA vs Obsidian" 决策表里第一行就指出：
 ## 2. 设计目标
 
 - 每个 bot 主人（手机扫码登录的那个微信号，`ilink_user_id`）能绑定一个 IMA KB。
-- 绑定关系跨浏览器、跨设备、跨服务重启都有效。**不**依赖 `eph_<hex>` cookie，不依赖 `eph_*` state 文件。
+- 绑定关系跨浏览器、跨设备、跨服务重启都有效。**不**依赖浏览器 cookie / opaque session token，**不**依赖 session 状态文件。
 - 第一次扫码登录后自动套用绑定；之后该用户的所有消息都查该 KB。
 - `KBT_MINE_KB` 不能 `search_knowledge`（`docs/IMA_KB.md:126-139`：实测 `code=220004 invalid knowledge_base_id`），所以绑定页只能选 `KBT_SHARED_KB` / `KBT_SUBSCRIBED_CREATE_KB`。
 - 单一配置回退：未绑定时继续用旧的 `IMA_ILINK_DEFAULT_KB`，不破坏现有部署。
@@ -51,7 +51,7 @@ CLAUDE.md "Product context: IMA vs Obsidian" 决策表里第一行就指出：
 | `ilink_bot_id` | `077b77e37683@im.bot` | ❌ | **每个 QR 生命周期独立生成**；同微信号连续两次扫码 iLink 分配两个不同 bot 实体（`docs/2026-09-15_IN_FLIGHT_RELOGIN_RACE.md:392-410` + commit `f298d82`） |
 | `from_user_id` (msg 里) | `o9XXXX@im.wechat` | ❌ | 是聊天对方（user → bot 的另一侧），不是 bot 主人 |
 | `bot_token` | 64 hex chars | ❌ | 轮转更快，且会污染日志 |
-| `eph_<hex>` | `eph_656ef35f563969087b7c6459f48b8b68` | ❌ | 浏览器 cookie 死了就丢，与「跨设备/重启有效」目标直接冲突 |
+| opaque browser session token | URL-safe hex string | ❌ | 浏览器 cookie 死了就丢，与「跨设备/重启有效」目标直接冲突 |
 
 **结论：用 `ilink_user_id` 作键。**
 
@@ -62,10 +62,10 @@ CLAUDE.md "Product context: IMA vs Obsidian" 决策表里第一行就指出：
 ```
 首次扫码
 ─────────────────────────────────────────────────────
-浏览器访问 /ephemeral/start
-  └─ shared_web.py:398   mint user_id = "eph_" + secrets.token_hex(16)
-  └─ shared_web.py:401   store.bind(user_id) → opaque cookie
-  └─ shared_web.py:416   BotManager.get_or_create(eph_<hex>)
+浏览器访问 /clawbot/start
+  └─ shared_web.py:397   mint opaque URL-safe session token (secrets.token_hex-like)
+  └─ shared_web.py:401   store.bind(session_token) → opaque cookie
+  └─ shared_web.py:416   BotManager.get_or_create(session_token)
 
 BotSession.start()
   └─ _login → login_with_qrcode → poll_login_status
@@ -74,7 +74,7 @@ BotSession.start()
   └─ _apply_login  (bot_session.py:265-299)
        └─ self.ilink_user_id = result["ilink_user_id"]   ← bot_session.py:288
        └─ await self._emit("logged_in", account_changed=...)   ← bot_session.py:299
-  └─ (manager 侧 handler)  ima_bindings.lookup(eph_<hex>)     ← OPTIONAL pre-warm
+  └─ (manager 侧 handler)  ima_bindings.lookup(ilink_user_id)     ← OPTIONAL pre-warm
        └─ 命中 → 缓存到 self._kb_id 以备 handle_message 直查
        └─ 未命中 → self._kb_id = None → 后续走 IMA_ILINK_DEFAULT_KB
 
@@ -98,7 +98,7 @@ handle_message(msg)  (bot_session.py:503)
 
 ## 5. 持久化设计
 
-`weixin_state_eph_<hex>.json` 跟浏览器 cookie 同生共死（`bot_session.py:91-94` 用 `_safe_name(user_id)` 拼文件名，cookie 一过期 `BrowserSessions.expire()` 会 `manager.stop()`；`shared_web.py:133-141`），**不能**用来存绑定。绑定必须独立成一个文件：
+`weixin_state_<session_token>.json` 跟浏览器 cookie 同生共死（`bot_session.py:91-94` 用 `_safe_name(user_id)` 拼文件名，cookie 一过期 `BrowserSessions.expire()` 会 `manager.stop()`；`shared_web.py:133-141`），**不能**用来存绑定。绑定必须独立成一个文件：
 
 ```
 CLAWBOT_STATE_DIR/ima_bindings.json
@@ -204,7 +204,7 @@ sudo systemctl restart clawbot.service
 ## 9. 未做 / 后续
 
 - 群聊 per-user KB 区分 —— 当前群消息也用 bot 主人 KB（`from_user_id` 是群，owner 是主人，绑哪个取决于"谁付钱"；保持单 KB 是更合理的默认）。
-- 多 bot 主人共享一个进程下的 multi-account switch UI —— `BotManager` 现在支持，但 web 只暴露 `eph_*` 入口；named user 路径已在 2026-09-15 cleanup 删除（commit `d54398c`）。恢复"同一浏览器管理多个 KB"属于独立特性。
+- 多 bot 主人共享一个进程下的 multi-account switch UI —— `BotManager` 现在支持，但 web 只暴露 `/clawbot/start` 入口；named user 路径已在 2026-09-15 cleanup 删除（commit `d54398c`）。恢复"同一浏览器管理多个 KB"属于独立特性。
 - KB 内容同步 / 双向同步 —— "IMA 当检索源、Obsidian 当编辑源"方案 A（`docs/SESSION_2026-09-07_ima_pipeline.md:236`）属于更大的内容工作流，超出本特性范围。
 - `utils/list_ima_bindings.py` 诊断 CLI —— 不在 v1，但 `IMABindings.list()` API 已留好；后续加 CLI 时直接调用即可。
 - 跨 `BotSession` 的 `kb_id` 缓存一致性 —— `BotSession._kb_id`（manager 侧在 `_emit("logged_in")` 里写入）只在 session 生命周期内有效；用户在另一浏览器解绑后，**当前 session** 的 `_kb_id` 不会失效（直到下次重连）。**可接受**：5–15 s 的人工解绑操作不要求立刻影响在飞消息；重启 / 重连后必然最新。生产补强：每隔 60 s 重新 `lookup` 一次（简单加 `BotSession._kb_id_refresh_at`）。
@@ -216,7 +216,7 @@ sudo systemctl restart clawbot.service
 - `ima.py:ImaClient.search_knowledge` `ima.py:489-545` —— `knowledge_base_id` kwarg 已存在
 - `ima.py:ImaConfig` `ima.py:50-123` —— `default_knowledge_base_id` 是 fallback 字段
 - `bot_session.py:_apply_login` `bot_session.py:265-299` —— `ilink_user_id` 写入点（line 288）
-- `shared_web.py:ephemeral_start` `shared_web.py:378-481` —— `eph_<hex>` 铸造（line 398）
+- `shared_web.py:session_start` `shared_web.py:378-481` —— session token 铸造（line 397）
 - `shared_web.py:INDEX_HTML` `shared_web.py:243-267` —— 当前 web UI（需扩 KB 绑定按钮）
 - `shared_web.py:verify_code` CSRF 校验 `shared_web.py:506-528` —— 绑定写操作可直接复用 `secrets.compare_digest(request.headers.get("X-CSRF-Token", ""), b.csrf_token)`（line 510-512）
 - `shared_runtime.py:282-284` —— `ima_env` 注入模式参考，新模块按同样方式接入 `IMABindings`
@@ -224,4 +224,4 @@ sudo systemctl restart clawbot.service
 - `docs/2026-09-15_IN_FLIGHT_RELOGIN_RACE.md:392-410` —— `ilink_user_id` 稳定性的实测证据
 - `weixin-openclaw-api-py-docs.md:1051` —— iLink `ilink_bot_id` 轮转语义
 - `CLAUDE.md` "Product context: IMA vs Obsidian" —— 选 ima 的决策依据
-- `CLAUDE.md` "Multi-user layout (ephemeral-only)" —— `eph_*` 状态文件生命周期
+- `CLAUDE.md` "Multi-user layout (session-based single-process model)" —— session 状态文件生命周期

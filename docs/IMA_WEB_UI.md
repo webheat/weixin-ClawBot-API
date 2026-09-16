@@ -40,12 +40,12 @@
 └──────────────────────────────┘
 ```
 
-点 "扫码登录" → `POST /clawbot/ephemeral/start` → 服务端铸 `eph_<hex(16)>` + 写两个 cookie：
+点 "扫码登录" → `POST /clawbot/start` → 服务端铸一个 URL-safe session token + 写两个 cookie：
 
 | Cookie | TTL | 用途 |
 |---|---|---|
-| `clawbot_session`（默认名） | 8 小时 | 浏览器 ↔ `eph_*` 绑定 |
-| `clawbot_session_resume` | 30 天 | 浏览器清掉主 cookie 后用它恢复 `eph_*` |
+| `clawbot_session`（默认名） | 8 小时 | 浏览器 ↔ session token 绑定 |
+| `clawbot_session_resume` | 30 天 | 浏览器清掉主 cookie 后用它恢复 session |
 
 详细见 `shared_web.py:36-41`（`DEFAULT_SESSION_TTL` / `DEFAULT_RESUME_TTL`）。
 
@@ -103,7 +103,7 @@
 
 - 必须持有 `clawbot_session` cookie（已被现有 `binding()` 助手校验，`shared_web.py:329-338`）
 - 必须带 `X-CSRF-Token`（已有机制，`shared_web.py:79` 铸 + `INDEX_HTML` 模板里的 `__CSRF__`）
-- **绑定写入时用的是 `BotSession.ilink_user_id`**，不是 cookie 里的 `eph_<hex>`。这意味着：
+- **绑定写入时用的是 `BotSession.ilink_user_id`**，不是 cookie 里的 session token。这意味着：
   - 即使 cookie 是新发的（30 天 resume 后浏览器自动恢复），绑定仍然生效
   - 跨浏览器/跨设备/跨重启都有效（绑定文件独立于 state 文件）
 
@@ -129,21 +129,21 @@
 
 ## 5. 跨设备恢复的关键流程
 
-**核心约束**：`eph_<hex>` cookie 会丢、`ilink_user_id` 不会丢。
+**核心约束**：浏览器 cookie 会丢、`ilink_user_id` 不会丢。
 
 ```
 设备 A（已绑定）：
-  ┌─ 浏览器 cookie (eph_a1b2) → BotSession(ilink_user_id=o9...@im.wechat)
+  ┌─ 浏览器 cookie → BotSession(ilink_user_id=o9...@im.wechat)
   ├─ ima_bindings.json: { o9...@im.wechat: {kb_id: "X", ...} }
   └─ bot 收到任何消息 → lookup(o9...) → kb_id=X → search_knowledge(knowledge_base_id=X)
 
 设备 B（同一微信号，新浏览器）：
-  ┌─ 浏览器没有 cookie → 扫码 → mint eph_c3d4 → BotSession(ilink_user_id=o9...@im.wechat)
+  ┌─ 浏览器没有 cookie → 扫码 → 铸新 session token → BotSession(ilink_user_id=o9...@im.wechat)
   ├─ ima_bindings.json: { o9...@im.wechat: {kb_id: "X", ...} } ← 同一个文件
   └─ bot 收到任何消息 → lookup(o9...) → kb_id=X ✅ 自动恢复
 ```
 
-这就是为什么绑定文件**必须**独立于 `weixin_state_eph_*.json`（后者随 cookie 死）。
+这就是为什么绑定文件**必须**独立于 `weixin_state_<session_token>.json`（后者随 cookie 死）。
 
 ---
 
@@ -152,7 +152,7 @@
 ```
 第 1 步：访问 Web UI
    浏览器 → http://host:18300/clawbot/ → 看到 "扫码登录" 按钮
-   点 → POST /ephemeral/start → mint eph_<hex> → set cookie → 302 回 /
+   点 → POST /clawbot/start → 铸 session token → set cookie → 302 回 /
 
 第 2 步：扫码登录
    主页显示 QR → 手机微信扫 → 配对码 → 提交 verify_code → status='logged_in'
@@ -185,9 +185,9 @@
 
 | 场景 | 表现 | 原因 / 处理 |
 |---|---|---|
-| 刚 mint `eph_*`，还没扫码 | `self.ilink_user_id == ""` | 主页卡片显示 "请先完成扫码登录后再绑定知识库"；`/ima/bind` 返 412 Precondition Failed |
+| 刚 mint session token，还没扫码 | `self.ilink_user_id == ""` | 主页卡片显示 "请先完成扫码登录后再绑定知识库"；`/ima/bind` 返 412 Precondition Failed |
 | KB 在 IMA 端被删除 | 下次 search 返 `code=???` | `_AIWithIma` 走 `mode=llm-only`（已有兜底），并 `ima_bindings.unbind(...)` 自动清掉死绑定 + log warn |
-| 用户多个 bot 主人账号切换 | 同 `eph_*` 重新扫码 → `ilink_user_id` 变 | 主页卡片自动刷新（按新 `ilink_user_id` lookup ），新主人可重新绑 |
+| 用户多个 bot 主人账号切换 | 同一 session 重新扫码 → `ilink_user_id` 变 | 主页卡片自动刷新（按新 `ilink_user_id` lookup ），新主人可重新绑 |
 | 跨设备冲突（同一 ilink_user_id 同时在 A、B 设备登录） | 后绑定的覆盖先绑定的 | `bind()` 是 upsert；记 `bound_at` / `bot_id_at_bind` 供审计 |
 | 多人共享一个浏览器 cookie（极端） | 不允许 | cookie `httponly + samesite=Lax`，普通 XSS 偷不到 |
 

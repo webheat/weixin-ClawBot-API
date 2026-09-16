@@ -25,7 +25,7 @@ if BotSession is None:  # pragma: no cover - useful migration diagnostic
 
 def _make_session(
     monkeypatch: pytest.MonkeyPatch,
-    user_id: str,
+    session_id: str,
     config: dict[str, Any] | None = None,
     state_file: Any = None,
 ):
@@ -39,17 +39,17 @@ def _make_session(
         "get_updates_buf": "old-cursor",
     }
     cfg = config or {
-        "llm": {"provider": "deepseek", "api_key": f"key-{user_id}"},
+        "llm": {"provider": "deepseek", "api_key": f"key-{session_id}"},
         "state_dir": "test-state",
     }
     try:
         kwargs = {"state_file": state_file} if state_file is not None else {}
-        sess = BotSession(user_id, FakeHTTP(), cfg, **kwargs)
+        sess = BotSession(session_id, FakeHTTP(), cfg, **kwargs)
     except TypeError:
         # A few implementations make the shared HTTP client keyword-only.
         try:
             kwargs = {"state_file": state_file} if state_file is not None else {}
-            sess = BotSession(user_id=user_id, session=FakeHTTP(), config=cfg, **kwargs)
+            sess = BotSession(session_id=session_id, session=FakeHTTP(), config=cfg, **kwargs)
         except TypeError as exc:  # make an incomplete migration explicit
             pytest.fail(f"BotSession constructor does not implement the documented API: {exc}")
     sess._contract_ai = FakeAI()

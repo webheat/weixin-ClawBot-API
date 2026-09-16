@@ -2839,8 +2839,8 @@ def create_ai_client(raw_cfg: dict):
 
 if __name__ == "__main__":
     # Default entry: dispatch to shared_runtime. The shared process serves
-    # only ephemeral users (`eph_<hex>` minted in shared_web.py) — no named
-    # users, no per-port subprocess, no OAuth.
+    # only session-token sessions (``secrets.token_urlsafe(32)`` minted in
+    # ``shared_web.py``) — no named users, no per-port subprocess, no OAuth.
     import sys
     from shared_runtime import main as shared_main
     shared_main(sys.argv[1:])

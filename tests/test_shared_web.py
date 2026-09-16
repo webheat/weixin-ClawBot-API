@@ -43,16 +43,16 @@ class FakeManager:
     def __init__(self):
         self.sessions = {}
 
-    async def get_or_create(self, user_id, config=None):
-        return self.sessions.setdefault(user_id, FakeSession())
+    async def get_or_create(self, session_id, config=None):
+        return self.sessions.setdefault(session_id, FakeSession())
 
-    def get(self, user_id):
-        return self.sessions.get(user_id)
+    def get(self, session_id):
+        return self.sessions.get(session_id)
 
-    async def stop(self, user_id):
-        self.sessions.pop(user_id, None)
+    async def stop(self, session_id):
+        self.sessions.pop(session_id, None)
 
-    async def touch(self, user_id):
+    async def touch(self, session_id):
         return None
 
 
@@ -62,10 +62,10 @@ class BlockingManager(FakeManager):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def get_or_create(self, user_id, config=None):
+    async def get_or_create(self, session_id, config=None):
         self.started.set()
         await self.release.wait()
-        return self.sessions.setdefault(user_id, FakeSession())
+        return self.sessions.setdefault(session_id, FakeSession())
 
 
 class SharedWebTests(AioHTTPTestCase):
@@ -73,7 +73,7 @@ class SharedWebTests(AioHTTPTestCase):
         self.manager = FakeManager()
         return build_web_app(self.manager, prefix="/clawbot",
                              config={"rate_limit": 1, "rate_window": 60,
-                                     "ephemeral_limit": 2})
+                                     "session_limit": 2})
 
     def _cookie(self, response):
         value = response.headers["Set-Cookie"]
@@ -84,12 +84,12 @@ class SharedWebTests(AioHTTPTestCase):
         joined = "\n".join(value)
         return re.search(r"clawbot_session_resume=([^;]+)", joined).group(1)
 
-    async def test_raw_user_id_cookie_cannot_cross_tenant(self):
+    async def test_raw_session_cookie_cannot_cross_tenant(self):
         response = await self.client.get("/clawbot/state",
                                          headers={"Cookie": "clawbot_session=alice"})
         self.assertEqual(response.status, 401)
 
-        response = await self.client.post("/clawbot/ephemeral/start",
+        response = await self.client.post("/clawbot/start",
                                           allow_redirects=False)
         self.assertEqual(response.status, 302)
         sid = self._cookie(response)
@@ -103,14 +103,14 @@ class SharedWebTests(AioHTTPTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual((await response.json())["status"], "qr_pending")
 
-    async def test_ephemeral_rate_limit_and_prefix(self):
+    async def test_session_rate_limit_and_prefix(self):
         response = await self.client.get("/clawbot/")
         self.assertEqual(response.status, 200)
-        self.assertIn("/clawbot/ephemeral/start", await response.text())
-        response = await self.client.post("/clawbot/ephemeral/start",
+        self.assertIn("/clawbot/start", await response.text())
+        response = await self.client.post("/clawbot/start",
                                           allow_redirects=False)
         self.assertEqual(response.status, 302)
-        response = await self.client.post("/clawbot/ephemeral/start",
+        response = await self.client.post("/clawbot/start",
                                           allow_redirects=False)
         self.assertEqual(response.status, 429)
 
@@ -125,21 +125,21 @@ class SharedWebTests(AioHTTPTestCase):
         await client.start_server()
         try:
             response = await client.post(
-                "/clawbot/ephemeral/start",
+                "/clawbot/start",
                 headers={"X-Forwarded-Proto": "https"},
                 allow_redirects=False,
             )
             self.assertIn("Secure", response.headers["Set-Cookie"])
             response = await client.get(
                 "/clawbot/",
-                headers={"X-Forwarded-Prefix": "/x</script><script>alert(1)</script>"},
+                headers={"X-Forwarded-Proto": "/x</script><script>alert(1)</script>"},
             )
             self.assertNotIn("alert(1)", await response.text())
         finally:
             await client.close()
 
     async def test_switch_and_verify_require_csrf(self):
-        response = await self.client.post("/clawbot/ephemeral/start",
+        response = await self.client.post("/clawbot/start",
                                           allow_redirects=False)
         sid = self._cookie(response)
         cookie = {"Cookie": f"clawbot_session={sid}"}
@@ -157,7 +157,7 @@ class SharedWebTests(AioHTTPTestCase):
         client = TestClient(server)
         await client.start_server()
         try:
-            response = await client.post("/clawbot/ephemeral/start", allow_redirects=False)
+            response = await client.post("/clawbot/start", allow_redirects=False)
             self.assertEqual(response.status, 302)
             await asyncio.wait_for(manager.started.wait(), timeout=0.5)
             sid = re.search(r"clawbot_session=([^;]+)", response.headers["Set-Cookie"]).group(1)
@@ -168,7 +168,7 @@ class SharedWebTests(AioHTTPTestCase):
             manager.release.set()
             await client.close()
 
-    async def test_expired_ephemeral_binding_stops_manager_session(self):
+    async def test_expired_session_binding_stops_manager_session(self):
         manager = FakeManager()
         app = build_web_app(manager, prefix="/clawbot",
                             config={"session_ttl": 0.1, "rate_limit": 5})
@@ -177,7 +177,7 @@ class SharedWebTests(AioHTTPTestCase):
         client = TestClient(server)
         await client.start_server()
         try:
-            response = await client.post("/clawbot/ephemeral/start", allow_redirects=False)
+            response = await client.post("/clawbot/start", allow_redirects=False)
             self.assertEqual(response.status, 302)
             await asyncio.sleep(0.35)
             self.assertEqual(manager.sessions, {})
@@ -193,12 +193,12 @@ class SharedWebTests(AioHTTPTestCase):
         client = TestClient(server)
         await client.start_server()
         try:
-            response = await client.post("/clawbot/ephemeral/start", allow_redirects=False)
+            response = await client.post("/clawbot/start", allow_redirects=False)
             self.assertEqual(response.status, 302)
-            user_id = next(iter(manager.sessions))
-            manager.sessions[user_id].bot_token = "authenticated-token"
+            session_id = next(iter(manager.sessions))
+            manager.sessions[session_id].bot_token = "authenticated-token"
             await asyncio.sleep(0.35)
-            self.assertIn(user_id, manager.sessions)
+            self.assertIn(session_id, manager.sessions)
             self.assertEqual(await app["browser_sessions"].snapshot(), [])
         finally:
             await client.close()
@@ -212,9 +212,9 @@ class SharedWebTests(AioHTTPTestCase):
         client = TestClient(server)
         await client.start_server()
         try:
-            response = await client.post("/clawbot/ephemeral/start", allow_redirects=False)
+            response = await client.post("/clawbot/start", allow_redirects=False)
             self.assertEqual(response.status, 302)
-            user_id = next(iter(manager.sessions))
+            session_id = next(iter(manager.sessions))
             sid = self._cookie(response)
             resume = self._resume_cookie(response)
             await app["browser_sessions"].remove(sid)
@@ -223,8 +223,8 @@ class SharedWebTests(AioHTTPTestCase):
                 allow_redirects=False,
             )
             self.assertEqual(response.status, 302)
-            self.assertIn(user_id, manager.sessions)
-            self.assertNotIn(user_id, response.headers.get("Set-Cookie", ""))
+            self.assertIn(session_id, manager.sessions)
+            self.assertNotIn(session_id, response.headers.get("Set-Cookie", ""))
             self.assertRegex("\n".join(response.headers.getall("Set-Cookie")),
                              r"clawbot_session=[^;]+")
         finally:

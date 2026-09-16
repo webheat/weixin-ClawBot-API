@@ -46,7 +46,7 @@
 ## 已完成
 
 - [x] **多用户支持（场景 B）—— portal 单入口** — 所有用户共用 `https://bx.mengxa.com/clawbot/`，portal 根据 cookie 派发
-  - `bot.py` 加 `--user <name>` 参数（向后兼容：不传 = 单租户旧行为）— **已于 2026-09-15 ephemeral-only 清理时移除**
+  - `bot.py` 加 `--user <name>` 参数（向后兼容：不传 = 单租户旧行为）— **已于 2026-09-15 session-based cleanup 时移除**
   - `_resolve_user_paths()` 推导 `config_<user>.json` / `weixin_state_<user>.json` / `logs/clawbot_<user>.log`；非法字符（除 `_.-` 外）自动替换为 `_`
   - `ImaConfig.from_env(env_files=list)` 支持按顺序 `override=False` 加载；默认 `None` 跳过文件加载，env 由 `bot.py` 提前装好
   - `setup_logging(log_file=...)` 接受完整日志路径，覆盖默认 `logs/clawbot.log`

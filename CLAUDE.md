@@ -8,7 +8,7 @@ Python 3.12+ client that speaks Tencent's [OpenClaw Weixin](https://github.com/T
 
 ## Current state (read first)
 
-- **Recent cleanup (2026-09-15) — ephemeral-only**. `python bot.py` 默认进入 `shared_runtime.py`：一个 `BotManager` 管理 N 个隔离的 `BotSession`，共享一个 `aiohttp` 连接池和一个 `shared_web` 登录入口。**只有 ephemeral 用户**（`eph_<hex>` 在 `shared_web.py:397` 铸造）—— 没有命名用户、没有 OAuth、没有 `--user` / `--legacy-single` / `--named-user` CLI。opaque cookie + CSRF + 限流 + TTL GC 是唯一入口。已删除：`qr_portal.py`、`utils/bot_launcher.py`、`utils/oauth_bindings.py`、`wechat_oauth.py`、`docs/WECHAT_OAUTH.md`、`docs/multi-user.md`、`docs/EPHEMERAL_BOT_LIFECYCLE.md`。
+- **Recent cleanup (2026-09-15) — session-based single-process model**. `python bot.py` 默认进入 `shared_runtime.py`：一个 `BotManager` 管理 N 个隔离的 `BotSession`，共享一个 `aiohttp` 连接池和一个 `shared_web` 登录入口。访客进入 `/clawbot/` 拿到一个不透明的 URL-safe session token（铸造点 `shared_web.py:397`）—— 没有命名用户、没有 OAuth、没有 `--user` / `--legacy-single` / `--named-user` CLI。opaque cookie + CSRF + 限流 + TTL GC 是唯一入口。已删除：`qr_portal.py`、`utils/bot_launcher.py`、`utils/oauth_bindings.py`、`wechat_oauth.py`、`docs/WECHAT_OAUTH.md`、`docs/multi-user.md`、`docs/SESSION_BOT_LIFECYCLE.md`（旧 session-lifecycle 文档，2026-09-15 一并清理）。The user identifier that matters is `ilink_user_id` (WeChat-account-stable, only available after QR confirmation); the opaque token is just a session handle.
 - **Recent feature (2026-09-16) — per-user IMA KB binding**. Each bot owner (`ilink_user_id`, NOT `ilink_bot_id` which rotates per QR) can bind their own IMA knowledge base; the binding survives browser cookie death, device switch, and server restart because it lives in a separate file `CLAWBOT_STATE_DIR/ima_bindings.json`. Read [`docs/IMA_PER_USER_BINDING.md`](docs/IMA_PER_USER_BINDING.md) before touching `_AIWithIma.chat` for per-user routing. Three binding entry points: web UI `/clawbot/ima/bind`, WeChat `/bindkb <kb_id>` (owner-gated), `utils/ima_bindings.py` CLI for ops.
 - **Active P0 — per-user conversation history** (in progress). Bot currently sees only the last message; "我刚才说了什么" / "继续上次" both fail. Plan: persist `runtime_state["contexts"][from_id]["history"]` (list of `{"role","content","ts"}`) into `weixin_state.json` so it survives restart; sliding-window cap N=20 (or token-budget trim); rename `ai.chat(text)` → `ai.chat_with_history(messages, system_prompt)` and update `_AIWithIma` to merge history with `ima` snippets. Exclude `/help` / `/time` / `/重新连接` and the `COMMANDS_MSG` welcome from history; private chat only (no group messages). Risk: context bloat → token cost; need a cap and a monitor. Full TODO in `TODO.md`.
 - **Recent big change (2026-09-07)** — full IMA pipeline rewrite + 150 Q&A ingested into a fresh KB. Full timeline, decisions, and sharp edges are in `docs/SESSION_2026-09-07_ima_pipeline.md`. The four new IMA knobs (`IMA_ILINK_KEYWORD_EXTRACT` / `IMA_ILINK_FETCH_BODY` / local fallback / `llm_caveat`) all live in `ima.py` and are routed via `_AIWithIma.chat`'s 3-state machine — read that section before changing AI routing.
@@ -28,7 +28,7 @@ One unified decision table covers both the product choice and the runtime code p
 | If you need… | Use | Why |
 |---|---|---|
 | Multi-user editing, cross-device access, official AI answering | **ima** (production) | Service-side KB; supports `KEYWORD_EXTRACT` + `FETCH_BODY` + `RERANK`. Shared creds via `/etc/clawbot/llm.env` + `/etc/clawbot/ima.env` (no per-user env files) |
-| **One KB per bot owner (each WeChat user has their own)** | **ima + `utils/ima_bindings.py`** | Bindings keyed by `ilink_user_id` (WeChat-account-stable), persisted to `CLAWBOT_STATE_DIR/ima_bindings.json`. Survives `eph_*` cookie death, device switch, server restart. See [`docs/IMA_PER_USER_BINDING.md`](docs/IMA_PER_USER_BINDING.md). UI: `/clawbot/ima/bind` or WeChat `/bindkb <kb_id>`. |
+| **One KB per bot owner (each WeChat user has their own)** | **ima + `utils/ima_bindings.py`** | Bindings keyed by `ilink_user_id` (WeChat-account-stable), persisted to `CLAWBOT_STATE_DIR/ima_bindings.json`. Survives browser-cookie death, device switch, server restart. See [`docs/IMA_PER_USER_BINDING.md`](docs/IMA_PER_USER_BINDING.md). UI: `/clawbot/ima/bind` or WeChat `/bindkb <kb_id>`. |
 | Publishing content externally ("知识号") | **ima** | `KBT_SUBSCRIBED_CREATE_KB` is the native publish channel |
 | New content not yet indexed by IMA (5–15 min lag) | **ima + local fallback + semantic** (推荐) | 三层 fallback：IMA 命中走 `llm+ima`；0 命中走 `llm+local`（CLAWBOT_LOCAL_FALLBACK=1）；仍 0 命中走 `llm+semantic`（SEMANTIC_KB_ENABLED=1）。路由转换在 `logs/clawbot.log` 看 `mode=... reason=...` |
 | Offline / no `ima.qq.com` egress / privacy-sensitive | **LocalKBIndex** only | `CLAWBOT_LOCAL_FALLBACK=1`; clear all `IMA_ILINK_*` to force `mode=llm+local` |
@@ -50,7 +50,8 @@ All commands assume the project root; the venv is `venv/`. First-run setup (prov
 ```bash
 # Run the default one-process service (:18300/clawbot/) — only entry point.
 # Sessions are created on demand by anonymous web visitors hitting
-# POST /ephemeral/start; user_id is `eph_<hex(16)>` minted at shared_web.py:397.
+# POST /clawbot/start; the server mints an opaque URL-safe session token
+# at shared_web.py:397 and uses it to map browser ↔ BotSession in memory.
 python bot.py
 ./venv/bin/python bot.py
 
@@ -120,7 +121,7 @@ Sync `requests` wrapper, mirrors `dusapi.py`/`deepseek.py`. **First `.env` consu
 **Hard limit:** neither IMA nor `LocalKBIndex` does embedding/semantic search (substring keyword match only). If you need true semantic retrieval, that's a new dependency, not a config knob. See the decision table under "Product context: IMA vs Obsidian" for which code path to use.
 
 ### 5. `shared_web.py` and `qr_web.py`
-`shared_web.py` is the default single listener. It maps opaque browser cookies to Manager sessions and exposes QR state, verification, account switching and ephemeral creation under `/clawbot`. `qr_web.py` still provides the per-session `QrFlowState` and QR conversion helpers; its old standalone per-user server is legacy only.
+`shared_web.py` is the default single listener. It maps opaque browser cookies to Manager sessions and exposes QR state, verification, account switching and session creation under `/clawbot`. `qr_web.py` still provides the per-session `QrFlowState` and QR conversion helpers; its old standalone per-session server is legacy only.
 
 ### 6. `utils/` — diagnostics, KB tools, logging
 
@@ -128,7 +129,7 @@ All five utilities are runnable as `python utils/<name>.py` from the project roo
 
 - **`logging_setup.py`** — `setup_logging()` is called once at `__main__` entry. Idempotent. Console respects `CLAWBOT_LOG_LEVEL`, file always DEBUG, rotates at midnight local time, keeps 7 backups. Sub-loggers use `get_logger("qr")` → `clawbot.qr`. `RedactFilter` takes the `_redact_text` callback and is wired onto both handlers.
 - **`list_ima_kb.py`** — diagnostic CLI. Lists ima knowledge bases for the configured account; `--pick <substr>` fuzzy-matches and prints the env line; `--update` rewrites `.env` in place. Useful when `IMA_ILINK_DEFAULT_KB` needs to change.
-- **`ima_bindings.py`** — per-user IMA KB binding store. Keyed by `ilink_user_id` (WeChat-account-stable, NOT `eph_<hex>` cookie id). Persists `ilink_user_id → {kb_id, kb_name, kb_type, bound_at, bot_id_at_bind}` to `CLAWBOT_STATE_DIR/ima_bindings.json` with `asyncio.Lock` + atomic write + `chmod 0o600`. CLI: `list` / `lookup <user>` / `unbind <user>` — `bind` is intentionally NOT exposed (must go through `/clawbot/ima/bind` for CSRF + cookie auth). Rejects `kb_type=1001` (`KBT_MINE_KB`) because search returns `code=220004` (`docs/IMA_KB.md:126-139`).
+- **`ima_bindings.py`** — per-user IMA KB binding store. Keyed by `ilink_user_id` (WeChat-account-stable, NOT the opaque browser session token). Persists `ilink_user_id → {kb_id, kb_name, kb_type, bound_at, bot_id_at_bind}` to `CLAWBOT_STATE_DIR/ima_bindings.json` with `asyncio.Lock` + atomic write + `chmod 0o600`. CLI: `list` / `lookup <user>` / `unbind <user>` — `bind` is intentionally NOT exposed (must go through `/clawbot/ima/bind` for CSRF + cookie auth). Rejects `kb_type=1001` (`KBT_MINE_KB`) because search returns `code=220004` (`docs/IMA_KB.md:126-139`).
 - **`local_kb.py`** — offline fallback KB (JSON-serialised Q&A pairs) consulted when IMA returns 0 hits and `IMA_ILINK_LOCAL_FALLBACK` is on. Format is the same one `import_business_lang.py` writes — keep them in sync.
 - **`seed_ima_kb.py`** — bulk-ingest a directory of markdown / text into a target ima KB using `ImaClient.import_doc`. Used for the 150 Q&A bootstrap on 2026-09-07.
 - **`import_business_lang.py`** — convenience importer that normalises a 客服话术 corpus into the local KB + ima KB shape (covers chunking, dedupe, keyword tagging). Run before `seed_ima_kb.py` if the corpus is in the raw 话术 / transcript form.
@@ -138,27 +139,27 @@ All five utilities are runnable as `python utils/<name>.py` from the project roo
 | Path | Lifecycle | Sensitive? |
 |---|---|---|
 | `config.json` | first run, rewritten on every config edit | yes (API keys) |
-| `weixin_state_eph_<hex>.json` | atomically rewritten per session after messages, cursor commits and reconnects | yes (`bot_token`, `context_token`) |
-| `CLAWBOT_STATE_DIR/ima_bindings.json` | rewritten per `IMABindings.bind` / `unbind` (web UI or `/bindkb`); survives `eph_*` cookie death | yes (`ilink_user_id` is sensitive; `kb_id` is not) |
+| `weixin_state_<session_token>.json` | atomically rewritten per session after messages, cursor commits and reconnects | yes (`bot_token`, `context_token`) |
+| `CLAWBOT_STATE_DIR/ima_bindings.json` | rewritten per `IMABindings.bind` / `unbind` (web UI or `/bindkb`); survives session-token death | yes (`ilink_user_id` is sensitive; `kb_id` is not) |
 | `logs/clawbot_shared.log` | daily rolling shared log with a per-record user dimension | partial (filter redacts) |
 | `/etc/clawbot/{llm,ima}.env` | explicitly parsed into per-session dictionaries without mutating `os.environ` | yes (`IMA_ILINK_API_KEY`) |
 
 State keys: `bot_token`, `baseurl`, `ilink_bot_id`, `ilink_user_id`, `get_updates_buf`, `pending_messages`, `processed_message_ids`, `contexts` and `last_contact`.
 
-## Multi-user layout (ephemeral-only)
+## Multi-user layout (session-based single-process model)
 
-`python bot.py` is the only entry point. Anonymous web visitors receive a random `eph_<hex(16)>` id minted at `shared_web.py:397` and known only to the server-side cookie store. No named users, no OAuth, no per-user subprocess / port / systemd unit — sessions live as in-process `BotSession` tasks under one shared `BotManager` and one shared `aiohttp` connection pool.
+`python bot.py` is the only entry point. Anonymous web visitors receive an opaque URL-safe session token minted at `shared_web.py:397` and known only to the server-side cookie store. There are no named users, no OAuth, no per-user subprocess / port / systemd unit — sessions live as in-process `BotSession` tasks under one shared `BotManager` and one shared `aiohttp` connection pool. Note: the **stable user identifier** (used for IMA KB bindings, KB lookups, etc.) is `ilink_user_id`, which is only assigned after QR confirmation; the opaque session token is just a browser-handle.
 
 | Path | Form |
 |---|---|
-| state file | `CLAWBOT_STATE_DIR/weixin_state_eph_<hex>.json` |
-| config file | ephemeral deep-copies `CLAWBOT_CONFIG_DIR/config.json` at session create time |
+| state file | `CLAWBOT_STATE_DIR/weixin_state_<session_token>.json` |
+| config file | each session deep-copies `CLAWBOT_CONFIG_DIR/config.json` at session create time |
 | log file | `logs/clawbot_shared.log`, every protocol task carries `[user=<id>]` |
 | env files | `/etc/clawbot/llm.env` → `ima.env`, parsed into per-session dictionaries without mutating `os.environ` |
 | web port | one process-level `CLAWBOT_WEB_PORT` (default 18300) |
 | systemd unit | one shared service only; none per user |
 
-The shared page never lists users. `POST /ephemeral/start` allocates one random in-process session and sets an opaque server-mapped cookie; `/switch` retains that binding while requesting a new iLink QR. Browser TTL cleanup removes the web binding, but keeps a session that already owns an iLink token running so WeChat/OpenClaw interaction is independent of browser activity; only an unauthenticated QR session is stopped. Cookie Secure is auto-selected from the request scheme; set `CLAWBOT_TRUST_PROXY=1` only when a trusted edge overwrites forwarding headers, or force it with `CLAWBOT_COOKIE_SECURE=1`.
+The shared page never lists users. `POST /clawbot/start` allocates one random in-process session and sets an opaque server-mapped cookie; `/switch` retains that binding while requesting a new iLink QR. Browser TTL cleanup removes the web binding, but keeps a session that already owns an iLink token running so WeChat/OpenClaw interaction is independent of browser activity; only an unauthenticated QR session is stopped. Cookie Secure is auto-selected from the request scheme; set `CLAWBOT_TRUST_PROXY=1` only when a trusted edge overwrites forwarding headers, or force it with `CLAWBOT_COOKIE_SECURE=1`.
 
 Typical service operation:
 ```bash
@@ -175,8 +176,8 @@ sudo nginx -t && sudo systemctl reload nginx
 - **`get_updates_buf` is opaque**: store verbatim, forward verbatim. Only the iLink server can advance it.
 - **`context_token` must come from the inbound message** and is required by `sendmessage`. Token rotation across reconnect/reinstall is expected.
 - **Account switch (`ilink_bot_id` change) clears `get_updates_buf`, `contexts`, `last_contact`, and `welcomed_users`**. Same-account relogin preserves them.
-- **`ilink_user_id` is the stable identity for per-user IMA KB binding** — NOT `ilink_bot_id` (rotates per QR; see `docs/2026-09-15_IN_FLIGHT_RELOGIN_RACE.md:392-410` + commit `f298d82`) and NOT `from_user_id` (chat peer, not bot owner). Bindings live in `ima_bindings.json`, **not** inside `weixin_state_eph_*.json` (the latter dies with the browser cookie and would break cross-device survival). Web UI `/ima/bind` always re-validates submitted `kb_id` against live `ImaClient.list_searchable_kbs()` to defeat client spoofing of `kb_name` / `kb_type`.
-- **Portal never leaks user list (privacy)**: 无 cookie 访客的页面**必须**是单一登录按钮（OAuth / ephemeral / 错误页），**不得**渲染任何用户、端口、env 文件路径、bot 状态。`/healthz` 只返 `{ok: True, login_mode: ...}` 不带 `users` 字段。proxy 502 fallback 不暴露 name/port/exception。`/select` 已删除（OAuth 模式下任何人 GET `/select?name=` 已知用户即拿到 cookie = 账号劫持；现在 cookie 只能由 `/oauth/cb` 或 `/ephemeral/start` 设置）。
+- **`ilink_user_id` is the stable identity for per-user IMA KB binding** — NOT `ilink_bot_id` (rotates per QR; see `docs/2026-09-15_IN_FLIGHT_RELOGIN_RACE.md:392-410` + commit `f298d82`) and NOT `from_user_id` (chat peer, not bot owner). Bindings live in `ima_bindings.json`, **not** inside `weixin_state_<session_token>.json` (the latter dies with the browser cookie and would break cross-device survival). Web UI `/ima/bind` always re-validates submitted `kb_id` against live `ImaClient.list_searchable_kbs()` to defeat client spoofing of `kb_name` / `kb_type`.
+- **Portal never leaks user list (privacy)**: 无 cookie 访客的页面**必须**是单一登录按钮（OAuth / start-session / 错误页），**不得**渲染任何用户、端口、env 文件路径、bot 状态。`/healthz` 只返 `{ok: True, login_mode: ...}` 不带 `users` 字段。proxy 502 fallback 不暴露 name/port/exception。`/select` 已删除（OAuth 模式下任何人 GET `/select?name=` 已知用户即拿到 cookie = 账号劫持；现在 cookie 只能由 `/oauth/cb` 或 `/clawbot/start` 设置）。
 - **First QR is fixed endpoint `BASE_URL = https://ilinkai.weixin.qq.com`**. After `scaned_but_redirect`, switch to the server-returned `baseurl`. This switch is one-way per session.
 - **Headers**: never set `Content-Length` manually (aiohttp computes it). The `X-WECHAT-UIN` is a fresh random uint32 → base64 per request. Each POST body includes `base_info: {channel_version: "2.4.6", bot_agent: "weixin-ClawBot-API/1.2.0 (python)"}` (sanitized via `sanitize_bot_agent`).
 - **Media messages are out of scope** for now: image / file are not passed to AI; an untranscribed voice gets an actionable retry/“转文字” prompt and is not passed to AI. AES-128-ECB + CDN upload/download not implemented.

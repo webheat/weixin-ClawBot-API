@@ -27,15 +27,15 @@ class BotManager:
         # embedders that provide a specialized session implementation.
         self._factory = session_factory or BotSession
 
-    async def get_or_create(self, user_id: str, config: dict[str, Any] | None = None,
+    async def get_or_create(self, session_id: str, config: dict[str, Any] | None = None,
                             *, wait_ready: bool = True, **kwargs: Any) -> BotSession:
         """Return a running session; concurrent callers share one start task.
 
         The lock protects only dictionary operations.  QR polling, AI setup and
-        lifecycle HTTP requests all happen outside it, so one user cannot
-        block another user's login for several minutes.
+        lifecycle HTTP requests all happen outside it, so one session cannot
+        block another session's login for several minutes.
         """
-        key = str(user_id)
+        key = str(session_id)
         async with self._lock:
             if self._stopping:
                 raise RuntimeError("manager stopping")
@@ -123,16 +123,16 @@ class BotManager:
         finally:
             USER_LOG_CONTEXT.reset(context_token)
 
-    async def create_background(self, user_id: str, config: dict[str, Any] | None = None,
+    async def create_background(self, session_id: str, config: dict[str, Any] | None = None,
                                 **kwargs: Any) -> BotSession:
         """Create/register immediately; QR login proceeds in a supervised task."""
-        return await self.get_or_create(user_id, config, wait_ready=False, **kwargs)
+        return await self.get_or_create(session_id, config, wait_ready=False, **kwargs)
 
-    def get(self, user_id: str) -> Optional[BotSession]:
-        return self.sessions.get(str(user_id))
+    def get(self, session_id: str) -> Optional[BotSession]:
+        return self.sessions.get(str(session_id))
 
-    async def stop(self, user_id: str) -> None:
-        key = str(user_id)
+    async def stop(self, session_id: str) -> None:
+        key = str(session_id)
         context_token = USER_LOG_CONTEXT.set(key)
         try:
             async with self._lock:
@@ -165,7 +165,7 @@ class BotManager:
         if maintenance:
             await asyncio.gather(*maintenance, return_exceptions=True)
 
-    async def touch(self, user_id: str) -> None:
-        session = self.get(user_id)
+    async def touch(self, session_id: str) -> None:
+        session = self.get(session_id)
         if session is not None:
             session.last_used_at = time.time()

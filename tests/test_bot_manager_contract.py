@@ -26,8 +26,8 @@ class ControlledSession:
     start_gate: dict[str, asyncio.Event] = {}
     fail_first: set[str] = set()
 
-    def __init__(self, user_id: str, session: Any, config: dict[str, Any], **kwargs: Any) -> None:
-        self.user_id = user_id
+    def __init__(self, session_id: str, session: Any, config: dict[str, Any], **kwargs: Any) -> None:
+        self.session_id = session_id
         self.session = session
         self.config = config
         self.on_event = kwargs.get("on_event")
@@ -42,16 +42,16 @@ class ControlledSession:
         cls.fail_first.clear()
 
     async def start(self) -> None:
-        type(self).starts[self.user_id] += 1
-        type(self).start_started.setdefault(self.user_id, asyncio.Event()).set()
-        if self.user_id in type(self).fail_first and type(self).starts[self.user_id] == 1:
+        type(self).starts[self.session_id] += 1
+        type(self).start_started.setdefault(self.session_id, asyncio.Event()).set()
+        if self.session_id in type(self).fail_first and type(self).starts[self.session_id] == 1:
             raise RuntimeError("simulated startup failure")
-        gate = type(self).start_gate.get(self.user_id)
+        gate = type(self).start_gate.get(self.session_id)
         if gate is not None:
             await gate.wait()
 
     async def stop(self) -> None:
-        type(self).stops[self.user_id] += 1
+        type(self).stops[self.session_id] += 1
 
 
 @pytest.fixture
@@ -142,7 +142,7 @@ async def test_failed_permanent_worker_is_evicted(manager: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_different_users_do_not_block_on_a_slow_start(manager: Any) -> None:
+async def test_different_sessions_do_not_block_on_a_slow_start(manager: Any) -> None:
     """One QR scan/login cannot hold a global manager lock for every tenant."""
 
     ControlledSession.start_gate["alice"] = asyncio.Event()
@@ -153,7 +153,7 @@ async def test_different_users_do_not_block_on_a_slow_start(manager: Any) -> Non
     try:
         bob = asyncio.create_task(manager.get_or_create("bob", {"owner": "b"}))
         bob_session = await asyncio.wait_for(bob, timeout=0.5)
-        assert bob_session.user_id == "bob"
+        assert bob_session.session_id == "bob"
         assert ControlledSession.starts["bob"] == 1
     finally:
         ControlledSession.start_gate["alice"].set()
@@ -170,7 +170,7 @@ async def test_failed_start_is_removed_and_can_be_retried(manager: Any) -> None:
     assert "alice" not in sessions, "failed startup must not leave a zombie session"
 
     second = await manager.get_or_create("alice", {"owner": "a"})
-    assert second.user_id == "alice"
+    assert second.session_id == "alice"
     assert ControlledSession.starts["alice"] == 2
     await _cleanup(manager)
 

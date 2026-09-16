@@ -128,7 +128,7 @@ if owner_id:
   - 要么强制要求 `CLAWBOT_STATE_DIR` 必须设（启动时 assert）
   - 至少要在 `__init__` 里 log warning 当默认路径生效时
 - [ ] **`_WRITE_LOCK` 是否跨实例共享**：子代理 B 说"class-level asyncio.Lock shared by all instances" —— 在单进程里 OK，**但 `_DEFAULT` 是 process-local**。多进程部署时每个进程一份锁，并发写可能 race。CLAUDE.md 明确说 BrowserSessions 是 process-local，多 worker 部署**本来就不支持** —— 但 ima_bindings.json 是文件层共享的，理论上 race。要么加 `fcntl.flock`，要么明确文档说"多 worker 不支持"
-- [ ] **bind 的 upsert 语义**：先 unbind 再 bind，还是合并更新？两个 `eph_*` 同 `ilink_user_id` 同时绑不同 KB 时谁赢？
+- [ ] **bind 的 upsert 语义**：先 unbind 再 bind，还是合并更新？同一个 `ilink_user_id` 在两个 session 里同时绑不同 KB 时谁赢？
 - [ ] **`chmod 0o600`** 是否在容器/某些 fs 上失败？要 try/except 兜底
 - [ ] **JSON 文件损坏回退**：子代理测试过写 `this is not json {{{`，确认 warn + 返回空。但**这会静悄悄清掉所有绑定** —— 接手 LLM 应该确认日志是否 audit-grade（带时间戳 + 文件路径）
 - [ ] **`kb_type` 校验在 `IMABindings.bind` 内部做了**，但 `kb_type=1002` 字符串别名（`KB_TYPE_SHARED = "KBT_SHARED_KB"`）也接受吗？看代码只接 int，不接字符串别名 —— 接受也好拒绝也好，**必须有明确语义**而不是"看情况"
@@ -247,12 +247,12 @@ CLAUDE.md 强调"`shared_runtime.parse_env_file` 不调 `os.environ.update`"。`
 
 ## 6. Git 操作注意
 
-- 当前分支：`cleanup/ephemeral-only-20260915`
+- 当前分支：`cleanup/session-based-20260915`
 - 当前 remote：`git@github.com:webheat/weixin-ClawBot-API.git`
 - 修改：`bot.py` `bot_session.py` `ima.py` `shared_web.py`
 - 新增：`docs/IMA_PER_USER_BINDING.md` `docs/IMA_WEB_UI.md` `utils/ima_bindings.py`
 - **污染文件**：`ima_bindings.json`（空文件，**必须删掉** + 加 .gitignore）
-- commit 风格：项目近期是 `cleanup(ephemeral): ...` / `docs: ...` / `fix(voice): ...` / `fix(session): ...` —— 建议 commit 信息：`feat(ima): per-user KB binding via ilink_user_id`
+- commit 风格：项目近期是 `cleanup(session): ...` / `docs: ...` / `fix(voice): ...` / `fix(session): ...` —— 建议 commit 信息：`feat(ima): per-user KB binding via ilink_user_id`
 - push 前先 `git fetch` + 看有没有 remote-side 改动
 
 ---

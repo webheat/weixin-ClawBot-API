@@ -1,7 +1,7 @@
 # 2026-09-15 复盘：in-flight AI reply 与 request_relogin 竞态
 
 > 严重等级：P0（用户体验直接断流）
-> 影响面：共享运行时下所有 `eph_*` / `o*` / named 用户的「处理中消息」都会被无差别打断
+> 影响面：共享运行时下所有活跃 session（任何 session token）的「处理中消息」都会被无差别打断 —— 包括已登录的 anonymous web visitor 和 named user。**唯一的稳定 user id 是 `ilink_user_id`（WeChat-account-stable，扫码后才有）**；浏览器持有的只是一个不透明的 session token，不是 user 标识。
 > 触发面：`request_relogin()` 的全部 4 个调用点（manual / stale-token / session-expiry / web switch）
 > 修复状态：本文档只含分析与方案；代码补丁待 review 后单独立 commit
 
@@ -15,7 +15,7 @@
 
 用户感知：「我刚才那句话你回了吗？」→ 没有 → 重连后机器人只回新消息，旧问题被吞。
 
-## 2. 事故时间线（本次 `eph_656ef35f...` 实例）
+## 2. 事故时间线（本次 session 实例）
 
 | 时间 (CST) | 事件 | 来源 |
 |---|---|---|
@@ -39,7 +39,7 @@
 | 18:43:21.252 | `sendtyping 2` → **errcode=-14** | clawbot.api |
 | 18:43:47 → 18:49:19 | 客户端轮询新 QR；3 次过期后 `max_refresh_exceeded` | clawbot.qr |
 | 18:49:19 | `login aborted refresh_count=3 reason=max_refresh_exceeded` | clawbot.qr |
-| 18:49:19 | `web relogin failed user=eph_656ef35f...` | clawbot.shared_web |
+| 18:49:19 | `web relogin failed user=<session_token>` | clawbot.shared_web |
 
 > 关键证据：18:43:15.343 `sendtyping` 仍返回 `ret:0`，**说明旧 token 在 18:43:15 还是好的**。18:43:16.887 的 `login start` 与 18:43:15.343 之间**只有 1.5 s 间隔**，LLM 调用不可能在那 1.5 s 内完成（第一次正常 AI 回复用了 3.4 s）。因此 `login start` 不是 `_drain_batch` 自己发起的。
 
@@ -310,7 +310,7 @@ async def test_relogin_waits_for_drain():
 ### 6.2 手动复现
 
 ```bash
-# 1) 起一个 ephemeral 会话，扫一次码让它进 logged_in
+# 1) 起一个 session，扫一次码让它进 logged_in
 # 2) 微信侧连发两条消息（中间间隔 < LLM 响应时间）
 # 3) 在第二条的 LLM 计算期间，浏览器点 #switch
 # 4) 观察 logs/clawbot_shared.log
@@ -327,16 +327,16 @@ grep -c "request_relogin reason=" logs/clawbot_shared.log
 # 必须 >= BotManager 中实际发生过 request_relogin 的次数
 ```
 
-## 7. 立即恢复：当前 `eph_656ef35f...` 会话
+## 7. 立即恢复：当前 session 实例
 
 **当前状态**（18:50 CST）：
 - QR 已耗尽（refresh_count=3 都 expired）
-- `weixin_state_eph_656ef35f563969087b7c6459f48b8b68.json` 里仍有 stale 的 `pending_messages[0]`（seq=2 语音「那你具体能查阅什么资料呢」）
+- `weixin_state_<session_token>.json` 里仍有 stale 的 `pending_messages[0]`（seq=2 语音「那你具体能查阅什么资料呢」）
 - 浏览器侧显示「二维码多次失效或登录失败，请稍后重试」
 
 **用户侧步骤**（必须由用户在浏览器里完成）：
 
-1. 在浏览器 `http://<host>:18300/clawbot/` 找到这个 `eph_656ef35f...` 标签
+1. 在浏览器 `http://<host>:18300/clawbot/` 找到这个 session 标签
 2. 点页面上的 **「切换用户」** 按钮（id=`#switch`）
    → 触发 `request_relogin("web switch")` → `_relogin_listener` 重新进入 QR 轮询（refresh_count 归零）
 3. 用绑定的微信扫描新 QR
@@ -351,18 +351,18 @@ grep -c "request_relogin reason=" logs/clawbot_shared.log
 # 等到 log 里看到：
 #   poll status=confirmed bot_id=...
 # 之后**先判断 ilink_bot_id 是否变了**：
-grep "eph_656ef35f563969087b7c6459f48b8b68.*poll status=confirmed" /opt/weixin-ClawBot-API/logs/clawbot_shared.log | tail -1
+grep "<session_token>.*poll status=confirmed" /opt/weixin-ClawBot-API/logs/clawbot_shared.log | tail -1
 # 拿最新一次 confirmed 响应里的 ilink_bot_id，和 state 文件里的对比：
 python3 -c "
 import json, re, subprocess
-p = '/opt/weixin-ClawBot-API/weixin_state_eph_656ef35f563969087b7c6459f48b8b68.json'
+p = '/opt/weixin-ClawBot-API/weixin_state_<session_token>.json'
 print('state ilink_bot_id =', json.load(open(p)).get('ilink_bot_id'))
 # 也可手工看 log 末尾 ilink_bot_id 字段
 "
 # 如果一致（同 bot 复用），才跑下面这段（idempotent，重复跑也安全）：
 python - <<'PY'
 import json, os
-p = "/opt/weixin-ClawBot-API/weixin_state_eph_656ef35f563969087b7c6459f48b8b68.json"
+p = "/opt/weixin-ClawBot-API/weixin_state_<session_token>.json"
 s = json.load(open(p))
 s["pending_messages"] = []
 s["pending_cursor"] = ""
@@ -409,10 +409,10 @@ PY
 **对周边设计的影响**：
 - **CLAUDE.md「Active P0 — per-user conversation history」**的实现假设需要重新审视。原本规划用 `from_id`（即 `ilink_user_id`）做 key 持久化历史 —— 这个 key 选得**对**，因为 `ilink_user_id` 是微信号级稳定标识；`ilink_bot_id` 不能用，会随 QR 循环变。
 - **CLAUDE.md「Critical invariants — Account switch clears ...」** 的措辞需要补充：「包括同微信号连续扫码触发的隐式 account switch」。这条 invariant 实际上比文档描述的更激进。
-- **`docs/2026-09-15_SESSION_CONNECTION_KEEPALIVE.md`** 隐含假设「受控重连后能恢复 session 上下文（`welcomed_users` / `contexts`）」。结合本发现，**这个假设只在同 bot 复用时成立**；对绝大多数用户（`eph_*` / 每次扫码都换 bot）重连后是「**全新用户**」体验。这与该 doc §3 「wechat 数据面...独立于浏览器页面继续运行」的设计意图**部分冲突** —— 浏览器 / QR 控制面和微信数据面解耦了，但 QR 循环本身仍然在切断数据面上下文。
+- **`docs/2026-09-15_SESSION_CONNECTION_KEEPALIVE.md`** 隐含假设「受控重连后能恢复 session 上下文（`welcomed_users` / `contexts`）」。结合本发现，**这个假设只在同 bot 复用时成立**；对绝大多数用户（anonymous visitor 每次扫码都换 session / new ilink_bot_id）重连后是「**全新用户**」体验。这与该 doc §3 「wechat 数据面...独立于浏览器页面继续运行」的设计意图**部分冲突** —— 浏览器 / QR 控制面和微信数据面解耦了，但 QR 循环本身仍然在切断数据面上下文。
 
 **待核实 / 后续实验**：
-1. iLink 给同微信号分配新 `ilink_bot_id` 是**协议层通用行为**还是**仅对 anonymous ephemeral** 如此？named 用户（`/etc/clawbot/alice.env`）扫码后 `ilink_bot_id` 是否会保持不变？需要拉一次 named 用户的重连日志（`logs/clawbot_alice.log`）做对照。
+1. iLink 给同微信号分配新 `ilink_bot_id` 是**协议层通用行为**还是**仅对 anonymous session** 如此？named 用户（`/etc/clawbot/alice.env`）扫码后 `ilink_bot_id` 是否会保持不变？需要拉一次 named 用户的重连日志（`logs/clawbot_alice.log`）做对照。
 2. 如果 named 用户能保持 `ilink_bot_id` 不变，那么 §7 的手动清理脚本**对 named 用户仍然必要**（5.2 互斥也仍然必要），应该作为「named 用户专用风险」单独标注。
 3. `account_changed=True` 分支目前**无条件**清 `contexts` / `welcomed_users`，对 named 用户是「丢失了与该 named user 已经建立的关系」—— 这与「重连保活」的设计意图**正面冲突**。需要和上一轮 `_reconnect` 的受控重连设计一起 review，看是否应该加一个 `keep_contexts=True` 的开关供 named 用户使用。
 
