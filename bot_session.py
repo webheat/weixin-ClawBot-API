@@ -435,7 +435,29 @@ class BotSession:
             self._initial_cancel.set()
             self._relogin_event.set()
         await self._emit("relogin_requested", reason=reason)
-        return await future
+        try:
+            return await future
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Server-driven relogin failures (stale-token, session-expiry) get
+            # best-effort background retries with conservative backoff (1m / 5m
+            # / 15m). User-driven relogins (web-switch, manual /重新连接) are NOT
+            # retried — we must respect explicit user cancellation. Protocol
+            # §2.7.3 says Tencent bans accounts that retry too fast; the 60s
+            # floor keeps us well clear of that penalty window while still
+            # giving the user one natural "phone at side" cycle to scan QR.
+            if reason in {"stale-token", "session-expiry"} and not self._stopped:
+                from utils.logging_setup import get_logger
+                get_logger("reconnect").info(
+                    "scheduling background relogin retries reason=%s err=%s",
+                    reason, exc,
+                )
+                asyncio.create_task(
+                    self._scheduled_retry_relogin(reason),
+                    name=f"relogin-retry-{self.session_id}",
+                )
+            raise
 
     async def _relogin_listener(self) -> None:
         while True:
@@ -463,6 +485,58 @@ class BotSession:
                     if self._pending_relogin is future:
                         self._pending_relogin = None
                 self._initial_cancel.clear()
+
+    async def _scheduled_retry_relogin(self, reason: str) -> None:
+        """Best-effort background retry after a failed request_relogin.
+
+        Server-driven reasons (``stale-token`` / ``session-expiry``) are
+        retried with conservative backoff (60s / 300s / 900s, total ~21 min).
+        User-driven reasons (``web-switch`` / ``manual``) must NOT reach this
+        method — the caller in :py:meth:`request_relogin` only schedules the
+        retry for the safe reason set. The schedule respects protocol
+        §2.7.3 (Tencent bans accounts that retry too fast).
+
+        The retry calls :py:meth:`_reconnect` directly, NOT through
+        :py:meth:`request_relogin`, so it does not touch
+        ``self._pending_relogin`` and cannot race with a new
+        listener-driven relogin. ``_reconnect_lock`` serializes concurrent
+        retries with normal relogin traffic, so multiple retry tasks
+        piling up after repeated -14 events simply queue.
+        """
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        delays = (60, 300, 900)
+        for delay in delays:
+            if self._stopped:
+                return
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            if self._stopped:
+                return
+            log_reconnect.info(
+                "scheduled_retry_relogin attempt reason=%s delay_s=%d",
+                reason, delay,
+            )
+            try:
+                result = await self._reconnect()
+                log_reconnect.info(
+                    "scheduled_retry_relogin succeeded reason=%s bot_id=%s",
+                    reason, (result.get("ilink_bot_id") or "-"),
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_reconnect.warning(
+                    "scheduled_retry_relogin failed reason=%s delay_s=%d err=%s",
+                    reason, delay, exc,
+                )
+        log_reconnect.error(
+            "scheduled_retry_relogin exhausted reason=%s total_attempts=%d",
+            reason, len(delays),
+        )
 
     async def start(self) -> "BotSession":
         if self._started:

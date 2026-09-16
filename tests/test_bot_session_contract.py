@@ -409,6 +409,170 @@ async def test_reconnect_binded_redirect_does_not_rollback_token(
     assert sess._reauthentication_required is True
 
 
+@pytest.mark.asyncio
+async def test_scheduled_retry_relogin_calls_reconnect_on_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """After request_relogin('stale-token') fails, background retries call
+    _reconnect on the 60s/300s/900s schedule until it succeeds.
+
+    See docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5 (option C).
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "stale-token"
+
+    sleep_delays: list[float] = []
+    call_count = 0
+    done_event = asyncio.Event()
+
+    async def fake_sleep(delay: float) -> None:
+        # Skip event-loop yields (delay=0) used to give background tasks
+        # a chance to run; only record real backoff sleeps.
+        if delay < 1:
+            return
+        sleep_delays.append(delay)
+
+    async def fake_reconnect() -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 3:
+            done_event.set()
+            return {"bot_token": "fresh-token", "ilink_bot_id": "new-bot"}
+        raise RuntimeError(f"transient QR failure #{call_count}")
+
+    monkeypatch.setattr(sess, "_reconnect", fake_reconnect)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    listener = asyncio.create_task(sess._relogin_listener())
+    try:
+        with pytest.raises(Exception, match="transient QR failure #1"):
+            await sess.request_relogin("stale-token")
+        await asyncio.wait_for(done_event.wait(), timeout=2)
+        await asyncio.sleep(0)
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
+
+    assert call_count == 3, f"_reconnect called {call_count} times, expected 3"
+    assert sleep_delays == [60, 300], (
+        f"expected backoff [60, 300] (before 2nd & 3rd attempt), got {sleep_delays}"
+    )
+    assert sess._pending_relogin is None
+
+
+@pytest.mark.asyncio
+async def test_scheduled_retry_relogin_skipped_for_user_driven_reasons(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """User-driven reasons ('web switch', 'manual') MUST NOT trigger background
+    retries — we must respect explicit user cancellation."""
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "stale-token"
+
+    sleep_calls: list[float] = []
+    call_count = 0
+
+    async def fake_sleep(delay: float) -> None:
+        if delay < 1:
+            return
+        sleep_calls.append(delay)
+
+    async def fake_reconnect() -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("user cancelled via web")
+
+    monkeypatch.setattr(sess, "_reconnect", fake_reconnect)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    listener = asyncio.create_task(sess._relogin_listener())
+    try:
+        with pytest.raises(Exception, match="user cancelled via web"):
+            await sess.request_relogin("web switch")
+        await asyncio.sleep(0.05)
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
+
+    assert call_count == 1, f"_reconnect called {call_count} times, expected 1"
+    assert sleep_calls == [], f"expected no sleep calls, got {sleep_calls}"
+
+
+@pytest.mark.asyncio
+async def test_manual_relogin_does_not_schedule_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """'/重新连接' command → request_relogin('manual') → no retry on failure."""
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "stale-token"
+
+    call_count = 0
+
+    async def fake_reconnect() -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("manual relogin failed")
+
+    monkeypatch.setattr(sess, "_reconnect", fake_reconnect)
+
+    listener = asyncio.create_task(sess._relogin_listener())
+    try:
+        with pytest.raises(Exception, match="manual relogin failed"):
+            await sess.request_relogin("manual")
+        await asyncio.sleep(0.05)
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
+
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduled_retry_relogin_exhausts_after_three_attempts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """All three retry attempts fail → no further _reconnect calls; backoff
+    schedule is exactly (60, 300, 900)."""
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "stale-token"
+
+    sleep_delays: list[float] = []
+    call_count = 0
+
+    async def fake_sleep(delay: float) -> None:
+        # Skip event-loop yields (delay=0); only record real backoff sleeps.
+        if delay < 1:
+            return
+        sleep_delays.append(delay)
+
+    async def fake_reconnect() -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError(f"persistent failure #{call_count}")
+
+    monkeypatch.setattr(sess, "_reconnect", fake_reconnect)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    listener = asyncio.create_task(sess._relogin_listener())
+    try:
+        with pytest.raises(Exception, match="persistent failure #1"):
+            await sess.request_relogin("session-expiry")
+        for _ in range(30):
+            await asyncio.sleep(0)
+            if call_count >= 4:
+                break
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
+
+    assert call_count == 4, (
+        f"expected 4 _reconnect calls (1 initial + 3 retries), got {call_count}"
+    )
+    assert sleep_delays == [60, 300, 900], (
+        f"expected backoff [60, 300, 900], got {sleep_delays}"
+    )
+
+
 def test_only_explicit_minus_14_is_classified_as_stale_token() -> None:
     from bot import ILinkAPIError
 
