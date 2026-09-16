@@ -421,3 +421,48 @@ PY
 **结论**：本事故是受控重连路径与消息处理路径的**第一类竞态**。Phase 1（加日志）即可在下次复发时把定位时间从「排除 3 个不可能」缩短到「1 行 grep」；Phase 2（互斥）才是根治，且实现量不大（~30 行 + 一个 lock）。建议两个 commit 分开发，Phase 1 立刻合，Phase 2 等 review。
 
 **§10 复盘修正**：「iLink 给同微信号也分配新 `ilink_bot_id`」这一发现让本事故的影响面**收窄**（stale state 风险被 iLink 自动消化），但同时**暴露出**「受控重连保活」与「per-account state 隔离」两条设计原则的潜在冲突，需要单独 review 解决。
+
+---
+
+## 11. Resolution (2026-09-16)
+
+> **本文档 §5.1 / §5.2 / §5.3 提议的三层修复全部已合并。**
+
+| 提议 | Commit | 日期 |
+|---|---|---|
+| §5.1 P0 立刻打：`request_relogin` 加 reason 日志 | `78e1dfd` 后续(已含)+ `3ec232b` 加 debug awaiting 日志 | 2026-09-15 |
+| §5.2 P1 主修复：`_drain_batch` 与 `_reconnect` 互斥 | `4f563a5` `fix(session): in-flight mutex + preserve pending on stale token` | 2026-09-16 |
+| §5.3 P2 防御：`_send_reliable` 失败保留 `pending` | `4f563a5` 同 commit | 2026-09-16 |
+| §8 后续：`request_relogin` 4 个调用点加 reason 日志 | `78e1dfd` 后续 + `3ec232b` 顶部 reason 日志 | 2026-09-15 → 2026-09-16 |
+| §8 后续：`send_typing_safe` 失败加 WARN | ⏸️ 未修 —— `_AIWithIma` 4-mode routing 中 `send_typing_safe` 仅在 AI 处理期间调,失败时上层已有 fallback,不阻塞 | — |
+| §10 后续：`account_changed=True` 保留上下文(`keep_contexts=True`) | ⏸️ 未修 —— 见下文 | — |
+
+**额外落地(超出本文档原始 §5 提议)**:
+
+| 提议来源 | Commit | 简述 |
+|---|---|---|
+| 用户后续提的"半死状态消除" | `708ec8c` `fix(session): restore bot_token on transient reconnect failure` | `_reconnect` 失败时回滚旧 token,substring guard 保留 78e1dfd 不变量 |
+| 用户后续提的"用户不在手机旁自动恢复" | `f2eeb12` `fix(session): background retry for server-driven relogin failures` | `_scheduled_retry_relogin` backoff (60s/300s/900s) 仅对 `stale-token` / `session-expiry` |
+| 用户后续提的"开放平台风格 QR 切换" | `3ec232b` `fix(session): observability + decoupled QR switch (open-platform style)` | `request_relogin("web switch" \| "manual")` 走 `_request_qr_switch` 解耦路径,不碰 token;详见 [`docs/2026-09-16_DECOUPLED_QR_SWITCH.md`](2026-09-16_DECOUPLED_QR_SWITCH.md) |
+
+**验证**: 37 pytest + 8 unittest 全过(包含 §6.1 提议的 `test_relogin_waits_for_drain` 形式的 `test_drain_lock_serializes_drain_and_reconnect` + `test_stale_token_during_drain_preserves_pending_messages`)。下次复发时按本文档 §6.1 步骤复现,应观察到:
+- `_send_reliable` 抛出 -14 时 `_drain_batch` **不会**继续推进 cursor,`pending_messages` 保留 → 重连成功后自动 replay
+- 修复前看到 -14 + `login start` 几乎同时 → 修复后 `login start` 在 `_send_reliable` raise 之后(因为 `_reconnect` 等 `_drain_batch` 跑完才清 token)
+
+**§10 待核实事项状态**:
+
+1. ❓ "iLink 给同微信号分配新 `ilink_bot_id` 是否协议层通用":未核实。代码层面已通过 §10 后续(隐式 account switch 触发 `_apply_login` 清 pending)避免 stale messages。
+2. ❓ "named 用户能否保持 `ilink_bot_id`":未核实。`account_changed=True` 分支无条件清 `contexts` / `welcomed_users`,对 named 用户确为"丢失关系"。`keep_contexts=True` 开关 ⏸️ 未实现,作为后续 P2。
+3. ⏸️ §10 待办("受控重连保活" vs "per-account state 隔离" 冲突):见 [`docs/2026-09-16_DECOUPLED_QR_SWITCH.md`](2026-09-16_DECOUPLED_QR_SWITCH.md) §2 —— 解耦方案已让 QR 循环不切断老端数据面,但 `_apply_login` 的 `account_changed` 行为仍待 named-user 细化。
+
+**相关文档**:
+- [`docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md`](2026-09-16_RECONNECT_AND_KEEPALIVE.md) —— 08:30 事故复盘 + 5 层防御总览
+- [`docs/2026-09-16_DECOUPLED_QR_SWITCH.md`](2026-09-16_DECOUPLED_QR_SWITCH.md) —— 解耦 QR 切换的架构设计
+
+---
+
+## 12. 状态
+
+- 严重等级:P0 → **已闭环**(2026-09-16)
+- 当前进程:`pid 2467379`,运行 `3ec232b`
+- 测试套件:37 pytest + 8 unittest 全过

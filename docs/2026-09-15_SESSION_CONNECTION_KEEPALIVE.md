@@ -103,3 +103,52 @@ git diff --check
 
 复核同时要求并已补充：真正从状态文件读取的 token 清空断言、非 `-14` 错误不被分类为 stale token、
 并发重连只执行一次以及绑定过期后恢复原 session 的回归测试。
+
+---
+
+## 8. 后续追加(2026-09-16):多事故闭环 + 协议"无心跳"确认
+
+> 本 doc §3 中 "`getupdates` 长轮询本身就是 iLink 连接保活机制" 的设计假设在 **2026-09-16 08:30** 事故中被部分证伪(07:52 与 08:36 的 `-14` 都发生在长轮询活跃期间)。但**长轮询仍是 keepalive 的核心** —— 它维持 TCP 连接、把消息送进 drain 流水线;只是**不能**被视为"token 续命器"。
+
+### 8.1 协议"无心跳"事实
+
+iLink 2.4.6 完整 API 列表(`weixin-openclaw-api-py-docs.md:60-69`)共 8 个端点:
+
+```
+POST /ilink/bot/getupdates      # 长轮询
+POST /ilink/bot/getconfig       # typing_ticket
+POST /ilink/bot/sendtyping      # 输入状态
+POST /ilink/bot/sendmessage     # 发消息
+POST /ilink/bot/notifystart     # 生命周期
+POST /ilink/bot/notifystop
+POST /ilink/bot/getuploadurl    # 媒体
+POST /ilink/bot/get_bot_qrcode  # 登录
+GET  /ilink/bot/get_qrcode_status
+```
+
+**没有 `/heartbeat` / `/ping` / `/refresh_token`**。客户端任何活动**都不能延长**服务端 token 有效期(协议 §2.7.3)。"`getupdates` 长轮询保活 token"是错误假设;token 由服务端独立计时,`-14` 即"已过期",客户端无能为力。
+
+### 8.2 2026-09-16 08:30 事故 + 5 层防御
+
+[`docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md`](2026-09-16_RECONNECT_AND_KEEPALIVE.md) §3 详述了 08:30 事故(用户点"切换账号" + 3 张 QR 不扫 → `MAX_QR_REFRESH_COUNT` → `RuntimeError` → 长轮询永久沉默)。该事故 100% 已修复,5 层防御全部部署:
+
+| 层 | Commit | 修复 |
+|---|---|---|
+| 1 | `4f563a5` | `_drain_lock` 互斥 + pending 保留 |
+| 2 | `708ec8c` | 重连失败回滚旧 token |
+| 3 | `f2eeb12` | server-driven 失败自动 backoff (60s/300s/900s) |
+| 4 | `3ec232b` | observability + **解耦 QR 切换**(架构层根治) |
+| 5 | `e6939f3` | `qr_status` 日志 |
+
+详见 [`docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md`](2026-09-16_RECONNECT_AND_KEEPALIVE.md) §0 / §5。
+
+### 8.3 本文 §3 设计原则仍正确
+
+| §3 原则 | 仍正确? |
+|---|---|
+| 登录成功后 `BotSession` 独立于浏览器继续运行 | ✅ 是 |
+| `getupdates` 长轮询本身就是 keepalive(连接级) | ⚠️ **部分**:长轮询维持连接,但**不**续命 token |
+| `-14` 才触发受控重扫码 | ✅ 是 |
+| 未完成扫码的临时会话按浏览器 TTL 回收 | ✅ 是 |
+
+**修正**:把"`getupdates` 长轮询本身就是 iLink 连接保活机制"理解为**连接级保活**(TCP / 客户端状态),不是**token 级保活**(服务端 token 有效期)。token 由服务端独立计时,客户端无能为力。
