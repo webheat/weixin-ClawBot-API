@@ -778,10 +778,31 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
             return web.json_response({"error": "session_starting"}, status=409)
         request_relogin = getattr(session, "request_relogin", None)
         if callable(request_relogin):
+            # ``request_relogin("web switch")`` takes the new decoupled path
+            # (docs/2026-09-16_DECOUPLED_QR_SWITCH.md §3): the current
+            # bot_token stays alive and only an actual scan swaps it.  It
+            # returns immediately with ``{"status": "qr_pending", ...}`` so we
+            # don't need to await the actual QR confirmation here — the
+            # background task ``BotSession._run_qr_switch`` handles it.  This
+            # is the same shape that legacy ``request_relogin("web switch")``
+            # produced (a login_result dict), so the existing ``except`` arms
+            # continue to work for any non-decoupled BotSession implementations.
             async def trigger_relogin() -> None:
                 try:
-                    await _maybe_await(request_relogin("web switch"))
+                    result = await _maybe_await(request_relogin("web switch"))
+                    # Fire-and-forget: log the new return shape so the trace
+                    # explicitly shows the decoupled path (e.g.
+                    # ``status=qr_pending``) rather than a full login result.
+                    if isinstance(result, dict):
+                        log.info(
+                            "web switch session=%s status=%s reason=%s",
+                            b.session_id,
+                            result.get("status", "-"),
+                            result.get("reason", "-"),
+                        )
                 except TypeError:
+                    # Pre-refactor signature used a keyword argument — fall
+                    # back rather than fail the request.
                     await _maybe_await(request_relogin(reason="web switch"))
                 except Exception as exc:
                     log.warning("web relogin failed session=%s err=%s", b.session_id, exc)

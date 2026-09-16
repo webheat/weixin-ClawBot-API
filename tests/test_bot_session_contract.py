@@ -299,6 +299,14 @@ async def test_reconnect_does_not_reuse_stale_token(
 async def test_concurrent_relogin_requests_share_one_reconnect(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
+    """Concurrent server-driven relogin requests share one _reconnect.
+
+    Only ``stale-token`` (and other server-driven reasons) still go through
+    the listener / ``_reconnect`` clearing path.  ``web switch`` and
+    ``manual`` now use the decoupled path (the current bot_token stays
+    alive while the QR is pending); see
+    docs/2026-09-16_DECOUPLED_QR_SWITCH.md §3.
+    """
     sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
     sess.bot_token = "authenticated-token"
     entered = asyncio.Event()
@@ -316,7 +324,7 @@ async def test_concurrent_relogin_requests_share_one_reconnect(
     listener = asyncio.create_task(sess._relogin_listener())
     try:
         first = asyncio.create_task(sess.request_relogin("stale-token"))
-        second = asyncio.create_task(sess.request_relogin("web switch"))
+        second = asyncio.create_task(sess.request_relogin("session-expiry"))
         await asyncio.wait_for(entered.wait(), timeout=1)
         assert calls == 1
         release.set()
@@ -465,24 +473,36 @@ async def test_scheduled_retry_relogin_skipped_for_user_driven_reasons(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
     """User-driven reasons ('web switch', 'manual') MUST NOT trigger background
-    retries — we must respect explicit user cancellation."""
+    retries — we must respect explicit user cancellation.
+
+    ``request_relogin`` for these reasons uses the new decoupled path
+    (see :py:meth:`BotSession._request_qr_switch`); the listener /
+    ``_reconnect`` / ``_scheduled_retry_relogin`` machinery is never touched.
+    """
     sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
     sess.bot_token = "stale-token"
 
+    reconnect_calls = 0
+    initiate_calls = 0
     sleep_calls: list[float] = []
-    call_count = 0
+
+    async def fake_reconnect() -> dict[str, Any]:
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        raise RuntimeError("user cancelled via web")
+
+    async def fake_initiate() -> str:
+        nonlocal initiate_calls
+        initiate_calls += 1
+        raise RuntimeError("user cancelled via web")
 
     async def fake_sleep(delay: float) -> None:
         if delay < 1:
             return
         sleep_calls.append(delay)
 
-    async def fake_reconnect() -> dict[str, Any]:
-        nonlocal call_count
-        call_count += 1
-        raise RuntimeError("user cancelled via web")
-
     monkeypatch.setattr(sess, "_reconnect", fake_reconnect)
+    monkeypatch.setattr(sess, "_initiate_qr_switch", fake_initiate)
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     listener = asyncio.create_task(sess._relogin_listener())
@@ -494,26 +514,42 @@ async def test_scheduled_retry_relogin_skipped_for_user_driven_reasons(
         listener.cancel()
         await asyncio.gather(listener, return_exceptions=True)
 
-    assert call_count == 1, f"_reconnect called {call_count} times, expected 1"
-    assert sleep_calls == [], f"expected no sleep calls, got {sleep_calls}"
+    assert reconnect_calls == 0, (
+        f"decoupled path must not call _reconnect, got {reconnect_calls}"
+    )
+    assert initiate_calls == 1, (
+        f"expected one _initiate_qr_switch call, got {initiate_calls}"
+    )
+    assert sleep_calls == [], f"expected no backoff sleeps, got {sleep_calls}"
 
 
 @pytest.mark.asyncio
 async def test_manual_relogin_does_not_schedule_retry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
-    """'/重新连接' command → request_relogin('manual') → no retry on failure."""
+    """'/重新连接' command → request_relogin('manual') → decoupled path,
+    no retry on failure.
+
+    User-driven reason takes the new decoupled path (no listener,
+    no scheduled retries)."""
     sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
     sess.bot_token = "stale-token"
 
-    call_count = 0
+    reconnect_calls = 0
+    initiate_calls = 0
 
     async def fake_reconnect() -> dict[str, Any]:
-        nonlocal call_count
-        call_count += 1
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        raise RuntimeError("manual relogin failed")
+
+    async def fake_initiate() -> str:
+        nonlocal initiate_calls
+        initiate_calls += 1
         raise RuntimeError("manual relogin failed")
 
     monkeypatch.setattr(sess, "_reconnect", fake_reconnect)
+    monkeypatch.setattr(sess, "_initiate_qr_switch", fake_initiate)
 
     listener = asyncio.create_task(sess._relogin_listener())
     try:
@@ -524,7 +560,8 @@ async def test_manual_relogin_does_not_schedule_retry(
         listener.cancel()
         await asyncio.gather(listener, return_exceptions=True)
 
-    assert call_count == 1
+    assert reconnect_calls == 0
+    assert initiate_calls == 1
 
 
 @pytest.mark.asyncio
@@ -571,6 +608,446 @@ async def test_scheduled_retry_relogin_exhausts_after_three_attempts(
     assert sleep_delays == [60, 300, 900], (
         f"expected backoff [60, 300, 900], got {sleep_delays}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Decoupled QR switch tests (docs/2026-09-16_DECOUPLED_QR_SWITCH.md §4)
+#
+# "web switch" and "manual" reasons must NOT touch the current bot_token
+# until the user actually scans the new QR.  The long-poll connection it
+# backs keeps running on the old token throughout the QR wait.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_qr_switch_initiate_does_not_clear_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """``_initiate_qr_switch`` fetches a fresh QR without clearing bot_token.
+
+    The current ``bot_token`` and ``_token_ref[0]`` must stay "old-token"
+    before, during, and after the call; only the QR state and the persisted
+    ``ilink_bot_id`` etc. (which the existing flow already preserves) are
+    allowed to be touched.  No ``_apply_login`` / ``_reconnect`` call is
+    expected because the user has not scanned yet.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "old-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+    sess.ilink_bot_id = "old-bot-id"
+
+    apply_calls = 0
+    reconnect_calls = 0
+
+    async def track_apply(*args: Any, **kwargs: Any) -> None:
+        nonlocal apply_calls
+        apply_calls += 1
+
+    async def track_reconnect() -> dict[str, Any]:
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        return {"bot_token": "fresh-token"}
+
+    monkeypatch.setattr(sess, "_apply_login", track_apply)
+    monkeypatch.setattr(sess, "_reconnect", track_reconnect)
+
+    import bot as protocol
+
+    async def fake_fetch_login_qrcode(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "qrcode": "switch-qr-abc",
+            "qrcode_img_content": "data:image/png;base64,AAA",
+        }
+
+    monkeypatch.setattr(protocol, "fetch_login_qrcode", fake_fetch_login_qrcode)
+
+    qrcode = await sess._initiate_qr_switch()
+    assert qrcode == "switch-qr-abc"
+
+    assert sess.bot_token == "old-token", (
+        "initiate must not mutate bot_token (decoupled path invariant)"
+    )
+    assert sess._token_ref[0] == "old-token", (
+        "initiate must not mutate _token_ref (decoupled path invariant)"
+    )
+    assert sess.baseurl == "https://old.invalid"
+    assert sess._base_url_ref[0] == "https://old.invalid"
+    assert sess.runtime_state["bot_token"] == "old-token"
+    # The web UI sees a freshly generated QR, but the session's auth state
+    # is unchanged.  No atomic swap ran, and no reconnect was triggered.
+    assert apply_calls == 0
+    assert reconnect_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_qr_switch_expire_preserves_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """QR expire / timeout / already_connected → no atomic swap, token stays.
+
+    Mirrors open-platform / OAuth behaviour: the QR is just a display
+    artifact with a TTL.  NOT scanning the QR must not affect the backend
+    server connection.  ``_apply_login`` MUST NOT be called.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "old-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+    sess.ilink_bot_id = "old-bot-id"
+
+    apply_calls = 0
+
+    async def track_apply(*args: Any, **kwargs: Any) -> None:
+        nonlocal apply_calls
+        apply_calls += 1
+
+    monkeypatch.setattr(sess, "_apply_login", track_apply)
+
+    import bot as protocol
+
+    async def fake_fetch_login_qrcode(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"qrcode": "switch-qr-expired", "qrcode_img_content": "x"}
+
+    async def fake_wait_login_confirmation(
+        *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        return {"expired": True}
+
+    monkeypatch.setattr(protocol, "fetch_login_qrcode", fake_fetch_login_qrcode)
+    monkeypatch.setattr(protocol, "wait_login_confirmation", fake_wait_login_confirmation)
+
+    # Drive the full path: request_relogin("web switch") → _request_qr_switch
+    # → _initiate_qr_switch (background task) + _await_qr_confirmation_and_swap.
+    result = await sess.request_relogin("web switch")
+    assert result["status"] == "qr_pending"
+    assert sess._pending_qr_task is not None
+    # Let the background switch task finish (it polls then expires).
+    await asyncio.wait_for(sess._pending_qr_task, timeout=2)
+
+    assert sess.bot_token == "old-token", (
+        "expired switch must preserve bot_token"
+    )
+    assert sess._token_ref[0] == "old-token", (
+        "expired switch must preserve _token_ref"
+    )
+    assert sess.ilink_bot_id == "old-bot-id", (
+        "expired switch must preserve ilink_bot_id"
+    )
+    assert sess.runtime_state["bot_token"] == "old-token"
+    assert apply_calls == 0, (
+        "expired switch must NOT call _apply_login (no atomic swap)"
+    )
+    # qr_state downgrades to error so the UI doesn't keep showing a dead QR.
+    assert sess.qr_state.status == "error"
+    assert "未扫描" in (sess.qr_state.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_qr_switch_confirm_atomic_swap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Confirmed scan → atomic swap under ``_reconnect_lock`` + ``_drain_lock``.
+
+    The token flip from "old-token" to "new-token" must happen inside the
+    ``_reconnect_lock`` / ``_drain_lock`` pair so it cannot race an
+    in-flight ``_drain_batch`` that is reading ``_token_ref[0]`` (invariant
+    from docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5.2).
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "old-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+    sess.ilink_bot_id = "old-bot-id"
+    sess.runtime_state["get_updates_buf"] = "old-cursor"
+    sess.runtime_state["pending_messages"] = []
+    sess.runtime_state["processed_message_ids"] = []
+    sess.welcomed_users = set()
+    sess.contexts = {}
+    sess.typing_ticket_cache = {}
+
+    apply_lock_state: dict[str, Any] = {}
+    locks_held_during_apply: list[tuple[bool, bool]] = []
+    apply_called = asyncio.Event()
+
+    original_apply = sess._apply_login
+
+    async def spying_apply(result: dict[str, Any], *, initial: bool = False) -> None:
+        apply_lock_state["reconnect_lock_held"] = sess._reconnect_lock.locked()
+        apply_lock_state["drain_lock_held"] = sess._drain_lock.locked()
+        locks_held_during_apply.append(
+            (sess._reconnect_lock.locked(), sess._drain_lock.locked())
+        )
+        try:
+            await original_apply(result, initial=initial)
+        finally:
+            apply_called.set()
+
+    monkeypatch.setattr(sess, "_apply_login", spying_apply)
+
+    # An in-flight drain holds _drain_lock.  The atomic swap MUST wait for
+    # this drain to finish (otherwise it would race with a mid-flight send).
+    drain_entered = asyncio.Event()
+    drain_release = asyncio.Event()
+
+    async def slow_drain() -> None:
+        async with sess._drain_lock:
+            drain_entered.set()
+            await drain_release.wait()
+
+    drain_task = asyncio.create_task(slow_drain())
+    await asyncio.wait_for(drain_entered.wait(), timeout=1)
+
+    import bot as protocol
+
+    async def fake_fetch_login_qrcode(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"qrcode": "switch-qr-confirmed", "qrcode_img_content": "x"}
+
+    async def fake_wait_login_confirmation(
+        *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        return {
+            "bot_token": "new-token",
+            "baseurl": "https://new.invalid",
+            "ilink_bot_id": "new-bot-id",
+            "ilink_user_id": "new-user-id",
+        }
+
+    async def fake_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(protocol, "fetch_login_qrcode", fake_fetch_login_qrcode)
+    monkeypatch.setattr(protocol, "wait_login_confirmation", fake_wait_login_confirmation)
+    monkeypatch.setattr(protocol, "notify_lifecycle", fake_notify)
+
+    result = await sess.request_relogin("web switch")
+    assert result["status"] == "qr_pending"
+
+    # Capture the background task before _run_qr_switch's finally block
+    # nulls out self._pending_qr_task on completion.
+    pending_task = sess._pending_qr_task
+    assert pending_task is not None
+
+    # The background task should be blocked on _drain_lock while the slow
+    # drain is in flight; token must NOT yet be swapped.
+    await asyncio.sleep(0.05)
+    assert sess.bot_token == "old-token"
+    assert not apply_called.is_set(), (
+        "atomic swap must wait for in-flight _drain_batch to finish"
+    )
+
+    # Release the in-flight drain; the background task must now acquire
+    # both locks and atomically swap the credential.
+    drain_release.set()
+    await drain_task
+    await asyncio.wait_for(pending_task, timeout=2)
+    assert apply_called.is_set()
+
+    assert sess.bot_token == "new-token", (
+        "confirmed switch must atomically swap bot_token"
+    )
+    assert sess._token_ref[0] == "new-token"
+    assert sess.baseurl == "https://new.invalid"
+    assert sess._base_url_ref[0] == "https://new.invalid"
+    assert sess.ilink_bot_id == "new-bot-id"
+    assert sess.ilink_user_id == "new-user-id"
+    # Atomicity: the swap held both locks.
+    assert locks_held_during_apply == [(True, True)], (
+        f"atomic swap must run with both _reconnect_lock and _drain_lock "
+        f"held, got {locks_held_during_apply}"
+    )
+    # Status reflects the new login.
+    assert sess.qr_state.status == "logged_in"
+
+
+@pytest.mark.asyncio
+async def test_request_relogin_web_switch_uses_decoupled_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """``request_relogin('web switch')`` takes the decoupled path.
+
+    Specifically:
+      - It calls ``_initiate_qr_switch`` (NOT ``_login`` or ``_reconnect``).
+      - It does NOT block on a QR confirmation future; the background
+        ``_pending_qr_task`` handles the actual swap.
+      - It does NOT touch ``_relogin_event`` (the listener / clearing path
+        used by server-driven reasons is left alone).
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "old-token"
+    sess._token_ref[0] = sess.bot_token
+    sess.runtime_state["bot_token"] = sess.bot_token
+
+    initiate_calls = 0
+    login_calls = 0
+    reconnect_calls = 0
+
+    async def fake_initiate() -> str:
+        nonlocal initiate_calls
+        initiate_calls += 1
+        return "switch-qr-token"
+
+    async def fake_login(*, reconnect: bool = False) -> dict[str, Any]:
+        nonlocal login_calls
+        login_calls += 1
+        return {"bot_token": "fresh-token"}
+
+    async def fake_reconnect() -> dict[str, Any]:
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        return {"bot_token": "fresh-token"}
+
+    monkeypatch.setattr(sess, "_initiate_qr_switch", fake_initiate)
+    monkeypatch.setattr(sess, "_login", fake_login)
+    monkeypatch.setattr(sess, "_reconnect", fake_reconnect)
+
+    # Make the background switch task a no-op so the test determinates fast.
+    async def fake_run_qr_switch(qrcode: str) -> None:
+        return None
+
+    monkeypatch.setattr(sess, "_run_qr_switch", fake_run_qr_switch)
+
+    relogin_event_fired = False
+    original_set = sess._relogin_event.set
+
+    def tracking_set() -> None:
+        nonlocal relogin_event_fired
+        relogin_event_fired = True
+        original_set()
+
+    sess._relogin_event.set = tracking_set  # type: ignore[method-assign]
+
+    listener = asyncio.create_task(sess._relogin_listener())
+    try:
+        result = await sess.request_relogin("web switch")
+        # Background task is scheduled but the function returned immediately.
+        assert isinstance(result, dict)
+        assert result["status"] == "qr_pending"
+        assert result["reason"] == "web switch"
+        assert sess._pending_qr_task is not None
+
+        assert initiate_calls == 1, "decoupled path must call _initiate_qr_switch"
+        assert login_calls == 0, (
+            "decoupled path must NOT call _login (that's the clearing path)"
+        )
+        assert reconnect_calls == 0, (
+            "decoupled path must NOT call _reconnect directly"
+        )
+        # The decoupled path leaves the existing token intact.
+        assert sess.bot_token == "old-token"
+        assert sess._token_ref[0] == "old-token"
+        assert sess.runtime_state["bot_token"] == "old-token"
+        # Listener was not poked — only server-driven reasons wake it.
+        assert relogin_event_fired is False, (
+            "decoupled path must not signal _relogin_event (preserves "
+            "the listener / clearing path for server-driven reasons)"
+        )
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
+        if sess._pending_qr_task is not None and not sess._pending_qr_task.done():
+            sess._pending_qr_task.cancel()
+            await asyncio.gather(sess._pending_qr_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_request_relogin_stale_token_uses_clearing_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """``request_relogin('stale-token')`` MUST keep the clearing path.
+
+    The 78e1dfd invariant must not regress: ``_reconnect`` clears
+    ``bot_token`` BEFORE ``_login`` so that iLink's binded_redirect cannot
+    return a stale token.  ``stale-token`` is a server-driven reason and
+    therefore continues to flow through ``_relogin_lock`` /
+    ``_reconnect`` — NOT through the decoupled path.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "stale-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+
+    observed: dict[str, Any] = {}
+    login_called = asyncio.Event()
+
+    async def fake_login(*, reconnect: bool = False) -> dict[str, Any]:
+        observed["reconnect"] = reconnect
+        observed["token_during_login"] = sess.bot_token
+        observed["saved_token_during_login"] = sess.runtime_state.get("bot_token")
+        login_called.set()
+        return {
+            "bot_token": "fresh-token",
+            "baseurl": "https://new.invalid",
+            "ilink_bot_id": "new-bot-id",
+        }
+
+    async def fake_apply_login(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def fake_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(sess, "_login", fake_login)
+
+    async def fake_apply_login(result: dict[str, Any], *, initial: bool = False) -> None:
+        # Mirror the real _apply_login just enough to advance the credential,
+        # because this test asserts on the post-_apply_login values.  The
+        # binded_redirect defence (78e1dfd) is verified separately in
+        # test_reconnect_binded_redirect_does_not_rollback_token.
+        new_token = str(result.get("bot_token") or "").strip()
+        new_base = str(result.get("baseurl") or sess.baseurl)
+        new_id = str(result.get("ilink_bot_id") or sess.ilink_bot_id)
+        sess.bot_token = new_token
+        sess._token_ref[0] = new_token
+        sess.baseurl = new_base
+        sess._base_url_ref[0] = new_base
+        sess.ilink_bot_id = new_id
+        sess.runtime_state["bot_token"] = new_token
+        sess.qr_state.status = "logged_in"
+
+    monkeypatch.setattr(sess, "_apply_login", fake_apply_login)
+
+    # The decoupled entry point MUST NOT be called for stale-token.
+    initiate_calls = 0
+
+    async def fake_initiate() -> str:
+        nonlocal initiate_calls
+        initiate_calls += 1
+        return "never-called-qr"
+
+    monkeypatch.setattr(sess, "_initiate_qr_switch", fake_initiate)
+
+    import bot as protocol
+    monkeypatch.setattr(protocol, "notify_lifecycle", fake_notify)
+
+    listener = asyncio.create_task(sess._relogin_listener())
+    try:
+        result = await sess.request_relogin("stale-token")
+        await asyncio.wait_for(login_called.wait(), timeout=1)
+        # The clearing path is intact: bot_token was emptied BEFORE _login.
+        assert observed["reconnect"] is True
+        assert observed["token_during_login"] == "", (
+            "stale-token path MUST clear bot_token before _login "
+            "(78e1dfd invariant)"
+        )
+        assert observed["saved_token_during_login"] == ""
+        assert result["bot_token"] == "fresh-token"
+        assert sess.bot_token == "fresh-token"
+        # The decoupled path was never reached.
+        assert initiate_calls == 0, (
+            "stale-token must NOT take the decoupled path"
+        )
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
 
 
 def test_only_explicit_minus_14_is_classified_as_stale_token() -> None:
