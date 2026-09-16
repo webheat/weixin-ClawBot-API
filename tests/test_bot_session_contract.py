@@ -460,6 +460,129 @@ async def test_reply_delivery_failure_keeps_batch_replayable(
     assert not sess.runtime_state["pending_messages"]
 
 
+@pytest.mark.asyncio
+async def test_drain_lock_serializes_drain_and_reconnect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """In-flight _drain_batch must finish before _reconnect clears bot_token.
+
+    Regression test for the in-flight AI / reconnect race described in
+    docs/2026-09-15_IN_FLIGHT_RELOGIN_RACE.md and §5.2 of
+    docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md. Without _drain_lock,
+    _reconnect would atomically clear bot_token while _drain_batch is mid
+    AI call; the in-flight _send_reliable would then hit -14 and the
+    message would be silently lost.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "valid-token"
+    sess._token_ref[0] = "valid-token"
+    sess.runtime_state["bot_token"] = "valid-token"
+
+    drain_started = asyncio.Event()
+    drain_release = asyncio.Event()
+    reconnect_finished = asyncio.Event()
+    login_called = asyncio.Event()
+
+    # Pretend an AI/send reply is in flight: hold _drain_lock for a while.
+    async def slow_drain() -> None:
+        async with sess._drain_lock:
+            drain_started.set()
+            await drain_release.wait()
+
+    drain_task = asyncio.create_task(slow_drain())
+    await asyncio.wait_for(drain_started.wait(), timeout=1)
+
+    # Patch _login so we can prove _reconnect actually waited, not just that
+    # it queued.
+    async def fake_login(*, reconnect: bool = False) -> dict[str, Any]:
+        login_called.set()
+        reconnect_finished.set()
+        return {
+            "bot_token": "fresh-token",
+            "baseurl": "https://new.invalid",
+            "ilink_bot_id": "bot-id",
+        }
+
+    monkeypatch.setattr(sess, "_login", fake_login)
+    import bot as protocol
+
+    async def fake_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(protocol, "notify_lifecycle", fake_notify)
+
+    reconnect_task = asyncio.create_task(sess._reconnect())
+
+    # Give the event loop a chance to schedule _reconnect.
+    await asyncio.sleep(0.1)
+    assert not login_called.is_set(), (
+        "_reconnect started login while _drain_lock was held — "
+        "in-flight race is not protected"
+    )
+    assert sess.bot_token == "valid-token", (
+        "_reconnect cleared bot_token while _drain_lock was held — "
+        "in-flight race is not protected"
+    )
+
+    # Release the drain; reconnect must now proceed.
+    drain_release.set()
+    await drain_task
+    await asyncio.wait_for(reconnect_finished.wait(), timeout=1)
+    assert login_called.is_set()
+    assert sess.bot_token == "fresh-token"
+    await reconnect_task
+
+
+@pytest.mark.asyncio
+async def test_stale_token_during_drain_preserves_pending_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A -14 from _send_reliable must NOT drop in-flight messages.
+
+    Regression test for §5.3 of docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md:
+    when handle_message raises ILinkAPIError(ret=-14), _drain_batch must
+    preserve unprocessed messages in pending_messages (so _message_loop
+    can replay them after request_relogin succeeds) and re-raise so the
+    outer loop's request_relogin("stale-token") path fires.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "stale-token"
+    sess._token_ref[0] = "stale-token"
+    sess.runtime_state["bot_token"] = "stale-token"
+    sess.runtime_state["get_updates_buf"] = "old-cursor"
+    _install_reply_spy(monkeypatch, sess)
+
+    import bot as protocol
+
+    async def stale_handler(msg: dict[str, Any]) -> None:
+        # Simulate _send_reliable raising -14 mid-reply.
+        raise protocol.ILinkAPIError("session timeout", path="sendmessage", ret=-14)
+
+    monkeypatch.setattr(sess, "handle_message", stale_handler)
+
+    m1 = message("first")
+    m2 = message("second")
+    m3 = message("third")
+    payload = {"get_updates_buf": "new-cursor", "msgs": [m1, m2, m3]}
+
+    # process_update_batch should propagate the stale-token error.
+    with pytest.raises(protocol.ILinkAPIError) as excinfo:
+        await sess.process_update_batch(payload)
+    assert excinfo.value.is_stale_token
+
+    # Unprocessed messages (m1 onward, since handler raised on m1) must be
+    # preserved in pending_messages so _message_loop can replay after
+    # request_relogin completes.
+    assert sess.runtime_state["pending_messages"], (
+        "pending_messages was wiped on stale-token — messages will be lost"
+    )
+    assert sess.runtime_state["pending_cursor"] == "new-cursor"
+    # Cursor must NOT advance so the batch replays.
+    assert sess.runtime_state["get_updates_buf"] == "old-cursor"
+    # No message was successfully processed.
+    assert not sess.runtime_state["processed_message_ids"]
+
+
 def test_two_sessions_have_no_mutable_per_user_state_in_common(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

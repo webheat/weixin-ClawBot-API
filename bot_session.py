@@ -131,6 +131,10 @@ class BotSession:
         self._relogin_lock = asyncio.Lock()
         self._pending_relogin: asyncio.Future | None = None
         self._reconnect_lock = asyncio.Lock()
+        # Serializes _drain_batch vs _reconnect so the token-clear in
+        # _reconnect() cannot race with an in-flight AI / send reply.
+        # See docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5.2.
+        self._drain_lock = asyncio.Lock()
         # Keep an authenticated session alive while its credential is being
         # replaced.  _reconnect() intentionally clears bot_token before QR
         # login, so the token alone cannot describe this transitional state.
@@ -335,7 +339,11 @@ class BotSession:
 
     async def _reconnect(self) -> dict[str, Any]:
         from bot import notify_lifecycle
-        async with self._reconnect_lock:
+        # Hold _drain_lock for the entire reconnect: any in-flight _drain_batch
+        # finishes before we clear bot_token; any new _drain_batch that arrives
+        # during QR login waits for us. See
+        # docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5.2.
+        async with self._reconnect_lock, self._drain_lock:
             self.qr_state.is_regenerating = True
             self.qr_state.status = "qr_pending"
             # Never pass a stale token back through local_token_list.  When
@@ -668,24 +676,54 @@ class BotSession:
         return hashlib.sha256(json.dumps(msg, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     async def _drain_batch(self, messages: list[dict[str, Any]], cursor: str | None) -> None:
-        processed = list(map(str, self.runtime_state.get("processed_message_ids") or []))[-1000:]
-        seen = set(processed)
-        for msg in messages:
-            mid = self._message_id(msg)
-            if mid in seen:
-                continue
-            # Public hook intentionally used here: deployments/tests may wrap
-            # ``handle_message`` for tracing or idempotency.
-            await self.handle_message(msg)
-            seen.add(mid)
-            processed.append(mid)
-            processed = processed[-1000:]
-            self.runtime_state["processed_message_ids"] = processed
+        """Drain one batch of inbound iLink messages.
+
+        Holds ``self._drain_lock`` across the whole body so that an in-flight
+        ``_reconnect()`` cannot clear the bot token mid-batch. If a stale-token
+        (``-14``) error escapes from ``handle_message`` (typically via
+        ``_send_reliable``), the unprocessed messages are preserved in
+        ``runtime_state["pending_messages"]`` and the exception is re-raised
+        so the outer ``_message_loop`` triggers ``request_relogin``; the
+        ``get_updates_buf`` cursor is *not* advanced, so the batch replays
+        after the new token is in place.
+        """
+        async with self._drain_lock:
+            from bot import ILinkAPIError
+            processed = list(map(str, self.runtime_state.get("processed_message_ids") or []))[-1000:]
+            seen = set(processed)
+            for idx, msg in enumerate(messages):
+                mid = self._message_id(msg)
+                if mid in seen:
+                    continue
+                # Public hook intentionally used here: deployments/tests may wrap
+                # ``handle_message`` for tracing or idempotency.
+                try:
+                    await self.handle_message(msg)
+                except ILinkAPIError as exc:
+                    if getattr(exc, "is_stale_token", False):
+                        # Preserve unprocessed messages for replay after relogin.
+                        remaining = [
+                            m for i, m in enumerate(messages)
+                            if i >= idx and self._message_id(m) not in seen
+                        ]
+                        self.runtime_state["pending_messages"] = remaining
+                        if cursor:
+                            self.runtime_state["pending_cursor"] = cursor
+                        self.save_state()
+                        # Re-raise so _message_loop's outer except triggers
+                        # request_relogin("stale-token") — preserves the
+                        # existing relogin control flow.
+                        raise
+                    raise
+                seen.add(mid)
+                processed.append(mid)
+                processed = processed[-1000:]
+                self.runtime_state["processed_message_ids"] = processed
+                self.save_state()
+            self.runtime_state["pending_messages"] = []
+            if cursor:
+                self.runtime_state["get_updates_buf"] = cursor
             self.save_state()
-        self.runtime_state["pending_messages"] = []
-        if cursor:
-            self.runtime_state["get_updates_buf"] = cursor
-        self.save_state()
 
     async def handle_message(self, msg: dict[str, Any]) -> None:
         """Process one inbound message in this account's namespace."""
