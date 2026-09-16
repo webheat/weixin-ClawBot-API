@@ -360,6 +360,12 @@ class BotSession:
             self._token_ref[0] = ""
             self.runtime_state["bot_token"] = ""
             self.save_state()
+            # Capture the rollback decision eagerly: a previous token is only
+            # safe to restore when this was a real reauthentication (not a
+            # first-time login) AND the failure is not the binded_redirect
+            # kind that 78e1dfd fixed — restoring there would re-arm the
+            # "already_connected" reuse loop in login_with_qrcode.
+            restore_token = had_authenticated_connection and current
             try:
                 result = await self._login(reconnect=True)
                 if result.get("already_connected"):
@@ -375,6 +381,22 @@ class BotSession:
                 self._reauthentication_required = False
                 return result
             except Exception as exc:
+                # Roll back the previously-cleared token so a transient QR
+                # failure (timeout / MAX_QR_REFRESH_COUNT / network) does
+                # not leave the session in a "half-dead" state where the QR
+                # UI says error but /api/* still returns 401. Skipped for
+                # the binded_redirect guard above (78e1dfd invariant) and
+                # for first-time logins where no prior token exists.
+                if restore_token and "binded_redirect" not in str(exc):
+                    from utils.logging_setup import get_logger
+                    get_logger("reconnect").warning(
+                        "reconnect failed; restoring previous bot_token err=%s",
+                        exc,
+                    )
+                    self.bot_token = current
+                    self._token_ref[0] = current
+                    self.runtime_state["bot_token"] = current
+                    self.save_state()
                 # A failed QR attempt must remain recoverable from the web
                 # control plane.  Do not let browser-binding expiry reap a
                 # previously authenticated session while it has no token.

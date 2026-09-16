@@ -328,6 +328,87 @@ async def test_concurrent_relogin_requests_share_one_reconnect(
         await asyncio.gather(listener, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_reconnect_failure_restores_previous_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A failed _reconnect must restore bot_token so /api/* stays alive.
+
+    Regression test for the "half-dead" state observed on 2026-09-16:
+    after MAX_QR_REFRESH_COUNT, bot_token stayed empty and the long-poll
+    loop spun forever on `if not token: await asyncio.sleep(1)`. With the
+    rollback in _reconnect, the bot keeps the previous token and the loop
+    can still call iLink (which will then return -14 again, triggering a
+    fresh request_relogin cycle). See docs/2026-09-16 §5 (option D).
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "old-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+
+    async def failing_login(*, reconnect: bool = False) -> dict[str, Any]:
+        raise RuntimeError("二维码多次失效或登录失败，请稍后重试。")
+
+    async def noop_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(sess, "_login", failing_login)
+    import bot as protocol
+    monkeypatch.setattr(protocol, "notify_lifecycle", noop_notify)
+
+    with pytest.raises(RuntimeError, match="二维码多次失效"):
+        await sess._reconnect()
+
+    assert sess.bot_token == "old-token"
+    assert sess._token_ref[0] == "old-token"
+    assert sess.runtime_state["bot_token"] == "old-token"
+    # The web UI must still observe the failure surface.
+    assert sess.qr_state.status == "error"
+    assert "二维码多次失效" in sess.qr_state.last_error
+
+
+@pytest.mark.asyncio
+async def test_reconnect_binded_redirect_does_not_rollback_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """binded_redirect failures must NOT restore bot_token (78e1dfd invariant).
+
+    Without the substring guard, rolling back the token would re-arm the
+    ``login_with_qrcode already_connected`` reuse loop on the next attempt.
+    See docs/2026-09-15_IN_FLIGHT_RELOGIN_RACE.md §4.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "old-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+
+    async def binded_redirect_login(*, reconnect: bool = False) -> dict[str, Any]:
+        raise RuntimeError("iLink 返回 binded_redirect，但没有可复用的本地 token")
+
+    async def noop_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(sess, "_login", binded_redirect_login)
+    import bot as protocol
+    monkeypatch.setattr(protocol, "notify_lifecycle", noop_notify)
+
+    with pytest.raises(RuntimeError, match="binded_redirect"):
+        await sess._reconnect()
+
+    # Token must stay cleared — restoring it would re-arm the
+    # login_with_qrcode already_connected reuse loop on the next attempt.
+    assert sess.bot_token == ""
+    assert sess._token_ref[0] == ""
+    assert sess.runtime_state["bot_token"] == ""
+    # _reauthentication_required should still be set so the binding TTL
+    # does not reap the session during this transient no-token window.
+    assert sess._reauthentication_required is True
+
+
 def test_only_explicit_minus_14_is_classified_as_stale_token() -> None:
     from bot import ILinkAPIError
 
