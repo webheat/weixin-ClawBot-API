@@ -334,7 +334,9 @@ class BotSession:
             await notify_lifecycle(self.http, "ilink/bot/msg/notifystop", old_token, old_base)
         if changed or initial:
             self.typing_ticket_cache.clear()
-            await notify_lifecycle(self.http, "ilink/bot/msg/notifystart", self.bot_token, self.baseurl)
+            notify_ok = await notify_lifecycle(self.http, "ilink/bot/msg/notifystart", self.bot_token, self.baseurl)
+            from utils.logging_setup import get_logger
+            get_logger("diagnostics").log(20 if notify_ok else 40, "diag stage=notifystart session=%s ok=%s", self.session_id, notify_ok)
         # Per-user IMA KB 绑定（docs/IMA_PER_USER_BINDING.md §3）：运行时**不**
         # 写 ima_bindings.json —— 绑定只能由用户在 web UI 或 /bindkb 命令主动
         # 设置。这里只读一次、记一行日志，便于排查"这个 owner 当前 KB 是什么"。
@@ -980,6 +982,8 @@ class BotSession:
         if task is not None and not task.done():
             return
         self._tasks["message"] = self._supervised("message", self._message_loop())
+        from utils.logging_setup import get_logger
+        get_logger("diagnostics").info("diag stage=message_worker_created session=%s", self.session_id)
         # getupdates is the protocol keepalive.  A local wall-clock timer
         # must not force a user to scan a new QR while the token is valid.
         from bot import RECONNECT_CONFIG
@@ -1034,6 +1038,8 @@ class BotSession:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                from utils.logging_setup import get_logger
+                get_logger("diagnostics").exception("diag stage=worker_failed session=%s task=%s error_type=%s", self.session_id, name, type(exc).__name__)
                 self._fatal.set()
                 await self._emit("task_failed", task=name, error=str(exc))
                 raise
@@ -1130,6 +1136,8 @@ class BotSession:
         context = str(msg.get("context_token") or "")
         if not from_id or not context:
             return
+        from utils.logging_setup import get_logger
+        get_logger("diagnostics").info("diag stage=inbound session=%s from_suffix=%s", self.session_id, from_id[-6:])
         # iLink's voice_item.text is its server-side ASR result.  Once it is
         # present, this deliberately follows the exact same command/LLM path
         # as ordinary text; no voice capability explanation is sent.
@@ -1257,15 +1265,19 @@ class BotSession:
             if self.ai is None:
                 reply = "AI 服务尚未配置，请联系管理员。"
             else:
+                from utils.logging_setup import get_logger
+                get_logger("diagnostics").info("diag stage=ai_begin session=%s", self.session_id)
                 loop = asyncio.get_running_loop()
                 reply = await loop.run_in_executor(
                     None, partial(self.ai.chat, text, **self._ai_chat_kwargs())
                 )
+                get_logger("diagnostics").info("diag stage=ai_complete session=%s", self.session_id)
             reply = str(reply or "抱歉，我暂时没有生成有效回复。").strip()
             # AI replies are part of the reliable message transaction.  Unlike
             # optional welcome/typing messages, delivery failure must raise so
             # the inbound cursor is not committed and the batch can replay.
             await self._send_reliable(msg, from_id, context, reply, "ai-reply")
+            get_logger("diagnostics").info("diag stage=reply_sent session=%s from_suffix=%s", self.session_id, from_id[-6:])
         finally:
             if typing:
                 await send_typing_safe(self.http, from_id, ticket, 2,
@@ -1376,6 +1388,9 @@ class BotSession:
                 ensure_business_success(result, "getupdates")
                 failures = 0
                 msgs = [m for m in (result.get("msgs") or []) if isinstance(m, dict)]
+                if msgs:
+                    from utils.logging_setup import get_logger
+                    get_logger("diagnostics").info("diag stage=getupdates_messages session=%s count=%d", self.session_id, len(msgs))
                 new_cursor = result.get("get_updates_buf")
                 if msgs:
                     self.runtime_state["pending_messages"] = msgs
@@ -1388,6 +1403,8 @@ class BotSession:
             except asyncio.CancelledError:
                 raise
             except ILinkAPIError as exc:
+                from utils.logging_setup import get_logger
+                get_logger("diagnostics").warning("diag stage=getupdates_error session=%s stale=%s error_type=%s", self.session_id, getattr(exc, "is_stale_token", False), type(exc).__name__)
                 if getattr(exc, "is_stale_token", False):
                     try:
                         await self.request_relogin("stale-token")
