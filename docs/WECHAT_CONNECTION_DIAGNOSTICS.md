@@ -41,7 +41,13 @@ curl -s http://127.0.0.1:18300/healthz
 - `getupdates_messages`：至少有一次拉取返回了消息。
 - `inbound`：消息进入处理器；`ai_begin` / `ai_complete`：AI 请求处理边界。
 - `reply_sent`：服务端 sendmessage 调用通过现有业务成功校验，不代表对方客户端一定显示。
+  `kind=` 标明是哪条路径发的（`help` / `time` / `ai-reply` / `reconnect-*` /
+  `voice-transcript-missing` 等）—— **所有可靠回复路径都会打这一条**。
+  看不到 `reply_sent` 就说明回复根本没发出去（而不是「发了但没显示」）。
 - `worker_failed`：后台工作任务异常退出，优先检查同时间堆栈。
+
+> ⚠️ `/help`、`/time` 等命令**不经过 AI**，所以不会出现 `ai_begin` / `ai_complete`。
+> 要验证 AI 路径必须发一条普通文字。
 
 日志默认沿用现有 logging 配置，部分旧日志可能含有消息预览、用户标识或接口路径。**发送任何日志给第三方前务必脱敏**：删除 token、Cookie、API Key、二维码、完整账号 ID、手机号、聊天正文和知识库内容。
 

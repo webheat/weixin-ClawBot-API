@@ -57,6 +57,61 @@
 才能让 `inbound → ai_begin → ai_complete → reply_sent` 这条链真正跑一遍并留下证据。
 在此之前，任何关于「消息为什么没回复」的结论都是猜测。
 
+#### 现场验证（2026-10-27 06:20）
+
+用户在 `7I@im.wechat` 发了 `/help`，链路走通：
+
+```
+06:20:54.120 diag stage=getupdates_messages count=1
+06:20:54.125 diag stage=inbound from_suffix=wechat
+06:20:54.125 recv msg from=7I@im.wechat type=text len=5 preview='/help'
+06:20:54.531 POST ilink/bot/sendmessage → 200 {"message_id":7520610437408708488}
+```
+
+用户确认**微信客户端收到了帮助内容** → 「扫码成功但无回复」在 `7I@im.wechat` 上**不复现**，
+`getupdates` / `inbound` / `sendmessage` 三段都正常。
+
+**但这次验证暴露了第五个问题**（见下）——`reply_sent` 没触发，尽管回复确实发出去了。
+
+### P0 — `reply_sent` 埋点只覆盖 1/7 条回复路径（已修）
+
+上面那次 `/help` 走完全程、`sendmessage` 返回 200，但日志里**没有 `diag stage=reply_sent`**。
+
+原因：`reply_sent` 原来挂在 `handle_message` 的 **AI 分支末尾**（旧 `bot_session.py:1378`），
+而 7 条回复路径里只有 1 条经过那里：
+
+| 路径 | `_send_reliable(kind=…)` | 原来有 `reply_sent`？ |
+|---|---|---|
+| 重连确认 Y/N | `reconnect-confirm` | ❌ |
+| 语音无转写提示 | `voice-transcript-missing` | ❌ |
+| `/help` | `help` | ❌ |
+| `/time` | `time` | ❌ |
+| `/重新连接` 提示 | `reconnect-prompt` | ❌ |
+| 发稿桥回复 | （1352 行） | ❌ |
+| **AI 回复** | `ai-reply` | ✅ 仅此一条 |
+
+命令分支全部在 `reply_sent` 之前 `return`。
+
+**为什么这是 P0**：这正好是本次排查要用的那个信号。「扫码成功但无回复」的排查逻辑是
+「看 `reply_sent` 有没有」—— 但命令类回复发出去了却没有这个标记，
+**排查时会误判成「回复根本没发出去」，从而把方向带到完全错误的地方**。
+换句话说，这个埋点本身会制造假线索。
+
+**处置**：把埋点下沉到 `_send_reliable`（所有可靠回复的唯一出口），并加 `kind=` 字段
+区分是哪条路径发的：
+
+```python
+# bot_session.py:_send_reliable 末尾，ensure_business_success 之后
+get_logger("diagnostics").info(
+    "diag stage=reply_sent session=%s kind=%s from_suffix=%s",
+    self.session_id, kind, to_id[-6:],
+)
+```
+
+配套契约测试 `tests/test_bot_session_contract.py::test_reply_sent_marker_covers_every_reply_path`
+（命令分支 + AI 分支各应一条，且都带 `kind=`）。已验证该测试在修复前**确实失败**
+（只拿到 1 条标记）、修复后通过 —— 不是空跑的护栏。
+
 ### P1 — 诊断手册的采集命令 grep 配方有误
 
 手册 §采集日志 给的配方：
@@ -160,12 +215,14 @@ XIAOLVSHU_BRIDGE_REF=184034081d0d2c15d0d5bf04bbcc0d72ad2f2890
 
 | # | 事项 | 责任 | 状态 |
 |---|---|---|---|
-| 1 | 在微信里发一条消息，让 `inbound → reply_sent` 链真正跑一遍 | 用户 | ⬜ 待做 |
+| 1 | 在微信里发一条**普通文字**，验证 AI 路径（`ai_begin` → `ai_complete` → `reply_sent`） | 用户 | ⬜ 进行中 |
 | 2 | 决定桥工作区那 157 行改动：提交还是 stash | 桥的作者 | ⬜ 待决 |
 | 3 | 提交并推送后，`deploy.sh` 恢复完整部署能力 | 运维 | ⬜ 阻塞于 #2 |
 
-第 1 项是本次审计的**主要缺口**：没有它，埋点只是一段没被跑过的代码，
-「扫码成功但无回复」这个故障至今没有定位到具体环节。
+第 1 项进展：`/help` 已验证通过（命令路径 → 服务端 200 → 客户端收到）。
+`/help` 是命令、走不到 AI，所以 `ai_begin` / `ai_complete` 仍是 0 次 ——
+**AI 路径仍待验证**。这一步很关键：AI 路径才是「暂无法连接 OpenClaw」最可能出问题的地方
+（AI 超时/报错会导致整条回复失败，而命令路径不经过 AI）。
 
 ---
 
@@ -173,5 +230,7 @@ XIAOLVSHU_BRIDGE_REF=184034081d0d2c15d0d5bf04bbcc0d72ad2f2890
 
 - [`docs/WECHAT_CONNECTION_DIAGNOSTICS.md`](WECHAT_CONNECTION_DIAGNOSTICS.md) — 诊断手册（本次修订了 grep 配方）
 - [`deploy/README.md`](../deploy/README.md) — 部署流程（本次增加「部署记录」小节）
-- `bot_session.py:339/1084/1140/1238/1367/1372/1378/1491/1505` — 9 个埋点位置
+- `bot_session.py:339/1084/1140/1238/1367/1372/1491/1505` — 埋点位置
+- `bot_session.py:_send_reliable` — `reply_sent` 埋点现址（本次从 AI 分支下沉到此）
+- `tests/test_bot_session_contract.py::test_reply_sent_marker_covers_every_reply_path` — 回归护栏
 - `utils/xiaolvshu.py:37` — `_check_bridge_version()`（读进程 env 的 pin）

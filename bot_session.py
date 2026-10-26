@@ -1189,6 +1189,13 @@ class BotSession:
             )
             raise
         ensure_business_success(result, "sendmessage")
+        # 埋点放在这里而不是各个调用点 —— _send_reliable 是所有「可靠回复」的
+        # 唯一出口（命令分支、AI 分支、语音提示、重连确认…）。只挂在 AI 分支
+        # 的话，命令类回复发出去了却看不到 reply_sent，排查时会误判成「没回复」。
+        get_logger("diagnostics").info(
+            "diag stage=reply_sent session=%s kind=%s from_suffix=%s",
+            self.session_id, kind, to_id[-6:],
+        )
 
     def _kb_scope(self) -> str:
         """该账号的知识库隔离键。
@@ -1374,8 +1381,8 @@ class BotSession:
             # AI replies are part of the reliable message transaction.  Unlike
             # optional welcome/typing messages, delivery failure must raise so
             # the inbound cursor is not committed and the batch can replay.
+            # （reply_sent 埋点在 _send_reliable 内部统一打，这里不再重复。）
             await self._send_reliable(msg, from_id, context, reply, "ai-reply")
-            get_logger("diagnostics").info("diag stage=reply_sent session=%s from_suffix=%s", self.session_id, from_id[-6:])
         finally:
             if typing:
                 await send_typing_safe(self.http, from_id, ticket, 2,

@@ -1890,3 +1890,49 @@ async def test_adoption_ignores_other_accounts(
     assert contexts == {}
     assert cursor == ""
     assert json.loads(other.read_text(encoding="utf-8"))["reauth_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_reply_sent_marker_covers_every_reply_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, caplog: Any
+) -> None:
+    """``reply_sent`` must fire for command replies too, not just AI replies.
+
+    回归于 2026-10-27：``reply_sent`` 原来只挂在 AI 分支（handle_message 末尾），
+    命令分支（``/help``、``/time``、``/重新连接``、语音提示…）在它之前就
+    ``return`` 了 —— 回复明明发出去了，日志里却没有 ``reply_sent``，
+    排查「扫码成功但无回复」时会误判成「回复没发出去」。
+
+    埋点必须下沉到 ``_send_reliable``（所有可靠回复的唯一出口）。
+    """
+    import logging
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sent = _install_reply_spy(monkeypatch, sess)
+
+    caplog.set_level(logging.INFO, logger="clawbot.diagnostics")
+    try:
+        # 命令分支（早期 return，不经过 AI 路径）
+        help_message = message("/help")
+        help_message["message_id"] = "help-1"
+        await sess.handle_message(help_message)
+
+        # AI 分支
+        ai_message = message("你好，回复测试")
+        ai_message["message_id"] = "ai-1"
+        await sess.handle_message(ai_message)
+    finally:
+        await sess.stop()
+
+    markers = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "clawbot.diagnostics"
+        and "diag stage=reply_sent" in rec.getMessage()
+    ]
+    assert len(markers) >= 2, (
+        "命令分支和 AI 分支都应各打一条 reply_sent；"
+        f"实际只拿到 {len(markers)} 条：{markers}"
+    )
+    # 每条都应带上回复种类，否则无法区分是哪条路径发的
+    assert all("kind=" in m for m in markers), f"reply_sent 缺少 kind 字段：{markers}"
