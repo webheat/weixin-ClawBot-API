@@ -65,3 +65,6 @@ nohup.out
 dist/
 build/
 *.spec.bak
+# 每账号私有知识库（docs/kb-users/<账号>/）+ 各自的语义索引
+docs/kb-users/*
+!docs/kb-users/README.md

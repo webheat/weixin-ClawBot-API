@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import os
 import re
 import threading
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -1084,6 +1086,35 @@ class BotSession:
             raise
         ensure_business_success(result, "sendmessage")
 
+    def _kb_scope(self) -> str:
+        """该账号的知识库隔离键。
+
+        用 ``ilink_user_id``（bot 账号，微信账号级稳定）而不是
+        ``ilink_bot_id``（每次扫码轮换）。净化成 ``[A-Za-z0-9_]`` 当目录名。
+        """
+        uid = str(self.ilink_user_id or "").strip()
+        if not uid:
+            return ""
+        return re.sub(r"[^A-Za-z0-9]+", "_", uid).strip("_")
+
+    def _ai_chat_kwargs(self) -> dict[str, Any]:
+        """传给 ``ai.chat`` 的额外参数。
+
+        ``kb_scope`` 只有 ``_AIWithIma`` 那层认（它的 ``chat`` 收 **kwargs）；
+        没配 IMA 时是裸 provider（``chat(message, model=..., ...)``），
+        硬塞会 TypeError —— 所以先看一眼签名。
+        """
+        chat = getattr(self.ai, "chat", None)
+        if chat is None:
+            return {}
+        try:
+            params = inspect.signature(chat).parameters
+        except (TypeError, ValueError):
+            return {}
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return {"kb_scope": self._kb_scope()}
+        return {}
+
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         from bot import (
             COMMANDS_MSG,
@@ -1214,7 +1245,9 @@ class BotSession:
                 reply = "AI 服务尚未配置，请联系管理员。"
             else:
                 loop = asyncio.get_running_loop()
-                reply = await loop.run_in_executor(None, self.ai.chat, text)
+                reply = await loop.run_in_executor(
+                    None, partial(self.ai.chat, text, **self._ai_chat_kwargs())
+                )
             reply = str(reply or "抱歉，我暂时没有生成有效回复。").strip()
             # AI replies are part of the reliable message transaction.  Unlike
             # optional welcome/typing messages, delivery failure must raise so

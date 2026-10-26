@@ -97,15 +97,16 @@ class SemanticKBIndex:
         model_name: str = DEFAULT_MODEL,
         min_score: float = DEFAULT_MIN_SCORE,
         cache_dir: Optional[str | os.PathLike[str]] = None,
+        extra_dirs: Optional[Iterable[str | os.PathLike[str]]] = None,
     ):
-        self.dir = Path(directory)
-        if not self.dir.is_absolute():
-            here = Path(__file__).resolve().parent.parent  # 项目根
-            candidate = here / self.dir
-            if candidate.is_dir():
-                self.dir = candidate
-            else:
-                self.dir = Path.cwd() / directory
+        self.dir = self._resolve(directory)
+        # overlay 目录：该账号私有的知识库。只有一个账号的语义索引里会带上它，
+        # 所以每个账号的 db_path 也要分开（见 ``_AIWithIma._maybe_semantic_kb``）。
+        self.extra_dirs: list[Path] = []
+        for item in (extra_dirs or []):
+            resolved = self._resolve(item)
+            if resolved.is_dir() and resolved != self.dir:
+                self.extra_dirs.append(resolved)
         if db_path is None:
             # 默认放 KB 父目录下（``docs/.semantic_kb.sqlite3``），便于 gitignore
             self.db_path = self.dir.parent / ".semantic_kb.sqlite3"
@@ -130,9 +131,45 @@ class SemanticKBIndex:
         # 构造时不主动 rebuild（避免 import 时就触发模型下载）；首次 search 时检查
         self._indexed = False
 
+    @staticmethod
+    def _resolve(directory: str | os.PathLike[str]) -> Path:
+        """相对路径 → 项目根 / cwd 下的绝对路径。"""
+        path = Path(directory)
+        if path.is_absolute():
+            return path
+        here = Path(__file__).resolve().parent.parent  # 项目根
+        candidate = here / path
+        # 目录本身可能还没建（每账号私有库）→ 父目录在就算它有效
+        if candidate.is_dir() or candidate.parent.is_dir():
+            return candidate
+        return Path.cwd() / path
+
     @property
     def exists(self) -> bool:
-        return self.dir.is_dir()
+        return self.dir.is_dir() or bool(self.extra_dirs)
+
+    def _scan_dirs(self) -> list[tuple[Path, str]]:
+        """(目录, DB key 前缀) —— 基座在前，overlay 在后。
+
+        overlay 前缀带序号（``user/0/``），既避免相对路径撞名，也能从
+        DB 里的 key 反推回文件在哪。
+        """
+        out: list[tuple[Path, str]] = []
+        if self.dir.is_dir():
+            out.append((self.dir, ""))
+        for index, extra in enumerate(self.extra_dirs):
+            out.append((extra, f"user/{index}/"))
+        return out
+
+    def _path_for_key(self, key: str) -> str:
+        """DB key → 绝对路径。"""
+        if key.startswith("user/"):
+            parts = key.split("/", 2)
+            if len(parts) == 3 and parts[1].isdigit():
+                index = int(parts[1])
+                if 0 <= index < len(self.extra_dirs):
+                    return str(self.extra_dirs[index] / parts[2])
+        return str(self.dir / key)
 
     # ---- model lazy load -------------------------------------------------
 
@@ -200,21 +237,23 @@ class SemanticKBIndex:
             return
         t0 = time.perf_counter()
         new_files: dict[str, list[tuple[int, str, float]]] = {}
-        for path in sorted(self.dir.rglob("*.md")):
-            try:
-                stat = path.stat()
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            body = _strip_front_matter(text)
-            chunks = _chunk_text(body, self.CHUNK_SIZE, self.CHUNK_OVERLAP)
-            try:
-                rel = str(path.relative_to(self.dir))
-            except ValueError:
-                rel = str(path)
-            new_files[rel] = [
-                (i, c, stat.st_mtime) for i, c in enumerate(chunks)
-            ]
+        for root, prefix in self._scan_dirs():
+            for path in sorted(root.rglob("*.md")):
+                try:
+                    stat = path.stat()
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                body = _strip_front_matter(text)
+                chunks = _chunk_text(body, self.CHUNK_SIZE, self.CHUNK_OVERLAP)
+                try:
+                    rel = str(path.relative_to(root))
+                except ValueError:
+                    rel = str(path)
+                key = f"{prefix}{rel}"
+                new_files[key] = [
+                    (i, c, stat.st_mtime) for i, c in enumerate(chunks)
+                ]
 
         if not new_files:
             log_sem.info("semantic rebuild: no .md files found in %s", self.dir)
@@ -321,13 +360,14 @@ class SemanticKBIndex:
             return
         try:
             current_max = 0.0
-            for p in self.dir.rglob("*.md"):
-                try:
-                    mt = p.stat().st_mtime
-                except OSError:
-                    continue
-                if mt > current_max:
-                    current_max = mt
+            for root, _prefix in self._scan_dirs():
+                for p in root.rglob("*.md"):
+                    try:
+                        mt = p.stat().st_mtime
+                    except OSError:
+                        continue
+                    if mt > current_max:
+                        current_max = mt
             existing = self._load_existing_mtimes()
             current_max_existing = max(existing.values()) if existing else 0.0
             if current_max > current_max_existing:
@@ -392,7 +432,7 @@ class SemanticKBIndex:
                 content=texts[idx],
                 snippet=texts[idx][:200],
                 highlight_content="",
-                url=str(self.dir / paths[idx]),
+                url=self._path_for_key(paths[idx]),
                 knowledge_base_id="semantic",
                 score=score,
             )

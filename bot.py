@@ -2441,39 +2441,69 @@ class _AIWithIma:
         # 本地 Markdown KB 兜底索引（lazy：只有命中 IMA 0 条时才会建索引）
         self._local_kb: Optional[LocalKBIndex] = None
         self._local_kb_attempted = False
+        self._local_kb_scope: str = ""
         # 语义检索 KB 兜底索引（lazy：IMA + local 都 0 命中才触发）
         # 需 fastembed + 模型下载；首次 search 会触发重建（30~60s 阻塞），
         # 日志走 ``clawbot.semantic``，warn 级排查。
         self._semantic_kb = None
         self._semantic_kb_attempted = False
+        self._semantic_kb_scope: str = ""
 
-    def _maybe_local_kb(self) -> Optional[LocalKBIndex]:
-        """lazy 构造本地 KB 索引，仅在开关开启时。"""
-        if self._local_kb_attempted:
+    def _kb_scope_dir(self, scope: str) -> Optional[str]:
+        """该账号私有的知识库目录（没配 / 不存在 → None）。
+
+        ``CLAWBOT_USER_KB_DIR`` 是每账号知识库的根目录，实际目录是
+        ``<root>/<scope>``；``scope`` 由调用方给（通常是 ilink_user_id 净化
+        后的 key）。目录不存在就当没有私有库 —— 基座照样能用。
+        """
+        root = (self._env.get("CLAWBOT_USER_KB_DIR") or "").strip()
+        if not root or not scope:
+            return None
+        try:
+            base = LocalKBIndex._resolve(root)
+        except Exception:  # noqa: BLE001 —— 路径异常不能让回复失败
+            return None
+        return str(base / scope)
+
+    def _maybe_local_kb(self, scope: str = "") -> Optional[LocalKBIndex]:
+        """lazy 构造本地 KB 索引，仅在开关开启时。
+
+        ``scope`` = 该账号的隔离键。私有目录作为 overlay 叠在共享基座上：
+        基座人人可读，私有目录只有这个账号看得到（``local:<user/0/...>``）。
+        """
+        if self._local_kb_attempted and self._local_kb_scope == scope:
             return self._local_kb
         self._local_kb_attempted = True
+        self._local_kb_scope = scope
         if self._env.get("CLAWBOT_LOCAL_FALLBACK", "").strip().lower() not in (
             "1", "true", "yes", "on",
         ):
             return None
         kb_dir = self._env.get("CLAWBOT_LOCAL_KB_DIR", "docs/knowledge")
+        extra = self._kb_scope_dir(scope)
         try:
-            self._local_kb = LocalKBIndex(kb_dir)
+            self._local_kb = LocalKBIndex(
+                kb_dir, extra_dirs=[extra] if extra else None
+            )
         except Exception as exc:  # 路径/权限异常不能让回复失败
             log_ai.warning("ai local_kb init failed dir=%s err=%s", kb_dir, exc)
             self._local_kb = None
         return self._local_kb
 
-    def _maybe_semantic_kb(self):
+    def _maybe_semantic_kb(self, scope: str = ""):
         """lazy 构造语义检索索引。仅在 ``SEMANTIC_KB_ENABLED=1`` 时有效。
 
         失败（fastembed 未装 / 模型下不下来 / 路径错）一律静默降级返回 ``None``，
         让上层走纯 LLM。索引路径默认 ``docs/knowledge/``，落库到
         ``docs/.semantic_kb.sqlite3``（已 gitignore）。
+
+        **按账号隔离**：``scope`` 非空时，私有目录作为 overlay 一起索引，
+        SQLite 也落到该账号自己的目录下 —— 不同账号的语义库互不干扰。
         """
-        if self._semantic_kb_attempted:
+        if self._semantic_kb_attempted and self._semantic_kb_scope == scope:
             return self._semantic_kb
         self._semantic_kb_attempted = True
+        self._semantic_kb_scope = scope
         if SemanticKBIndex is None:
             log_ai.info(
                 "ai semantic_kb unavailable: utils.semantic_kb.SemanticKBIndex "
@@ -2486,12 +2516,16 @@ class _AIWithIma:
         ):
             return None
         kb_dir = self._env.get("SEMANTIC_KB_DIR", "docs/knowledge")
+        extra = self._kb_scope_dir(scope)
+        db_path = str(Path(extra) / ".semantic_kb.sqlite3") if extra else None
         try:
             min_score_raw = self._env.get("SEMANTIC_KB_MIN_SCORE", "").strip()
             min_score = float(min_score_raw) if min_score_raw else 0.0
             self._semantic_kb = SemanticKBIndex(
                 kb_dir, min_score=min_score,
                 cache_dir=self._env.get("CLAWBOT_FASTEMBED_CACHE") or None,
+                db_path=db_path,
+                extra_dirs=[extra] if extra else None,
             )
         except Exception as exc:  # 路径/权限/模型下载异常不能让回复失败
             log_ai.warning("ai semantic_kb init failed dir=%s err=%s", kb_dir, exc)
@@ -2609,6 +2643,9 @@ class _AIWithIma:
         # Per-user KB 绑定键：调用方（handle_message）从 IMABindings 查
         # ilink_user_id 得到。None = 走 IMA_ILINK_DEFAULT_KB。
         kb_id = kwargs.pop("kb_id", None)
+        # 知识库隔离键（每个 bot 账号一个）：决定本地/语义兜底用哪个私有目录。
+        # 空 = 只有共享基座。
+        kb_scope = str(kwargs.pop("kb_scope", None) or "")
 
         # 默认路由：仅 LLM（IMA 未配置）
         mode = "llm-only"
@@ -2668,7 +2705,7 @@ class _AIWithIma:
             # IMA 0 命中 → 本地 Markdown 兜底（CLAWBOT_LOCAL_FALLBACK=1）
             # 解决 IMA 关键词匹配对部分词不友好、本地却能 substring 命中的问题。
             if not hits:
-                local_kb = self._maybe_local_kb()
+                local_kb = self._maybe_local_kb(kb_scope)
                 if local_kb and local_kb.exists:
                     local_t0 = time.perf_counter()
                     local_hits = local_kb.search(search_terms, limit=self._ima.cfg.search_limit)
@@ -2696,7 +2733,7 @@ class _AIWithIma:
             # 检索本身能消化自然语言，无需 keyword_extract 后的 terms）。
             # 首次 search 会触发 embedding 重建（~30–60s 阻塞），日志里看得到。
             if not hits:
-                semantic_kb = self._maybe_semantic_kb()
+                semantic_kb = self._maybe_semantic_kb(kb_scope)
                 if semantic_kb and semantic_kb.exists:
                     sem_t0 = time.perf_counter()
                     try:
