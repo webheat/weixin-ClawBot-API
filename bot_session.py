@@ -1372,9 +1372,14 @@ class BotSession:
             else:
                 from utils.logging_setup import get_logger
                 get_logger("diagnostics").info("diag stage=ai_begin session=%s", self.session_id)
-                loop = asyncio.get_running_loop()
-                reply = await loop.run_in_executor(
-                    None, partial(self.ai.chat, text, **self._ai_chat_kwargs())
+                # asyncio.to_thread 而不是 loop.run_in_executor：后者提交到
+                # executor 线程，而 executor 线程**不继承 contextvars** ——
+                # USER_LOG_CONTEXT 在线程里读出来是 "-"，
+                # 于是 clawbot.ai / clawbot.ima / clawbot.semantic 的日志
+                # 全部丢掉了 user= 维度。多用户共享进程里就无法判断
+                # 某次 AI/IMA 调用属于哪个账号。to_thread 会复制当前 context。
+                reply = await asyncio.to_thread(
+                    partial(self.ai.chat, text, **self._ai_chat_kwargs())
                 )
                 get_logger("diagnostics").info("diag stage=ai_complete session=%s", self.session_id)
             reply = str(reply or "抱歉，我暂时没有生成有效回复。").strip()

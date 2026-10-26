@@ -1936,3 +1936,53 @@ async def test_reply_sent_marker_covers_every_reply_path(
     )
     # 每条都应带上回复种类，否则无法区分是哪条路径发的
     assert all("kind=" in m for m in markers), f"reply_sent 缺少 kind 字段：{markers}"
+
+
+@pytest.mark.asyncio
+async def test_ai_call_logs_keep_the_user_dimension(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, caplog: Any
+) -> None:
+    """AI 路径的日志必须带 user= 维度，否则多用户进程里无法定位是谁的调用。
+
+    回归于 2026-10-27：AI 调用走 ``loop.run_in_executor``，而 executor 线程
+    **不继承 contextvars** —— ``USER_LOG_CONTEXT`` 在线程里读出来是默认值
+    ``"-"``。生产日志里 ``clawbot.ai`` / ``clawbot.ima`` / ``clawbot.semantic``
+    全部 ``[user=-]``，多用户共享进程下无法判断某次 AI/IMA 调用属于哪个账号。
+
+    ``asyncio.to_thread`` 会复制当前 context，因此能保住维度。
+    """
+    import logging
+
+    from utils.logging_setup import USER_LOG_CONTEXT, get_logger
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    _install_reply_spy(monkeypatch, sess)
+
+    seen: list[str] = []
+
+    class _LoggingAI:
+        """在 AI 调用内部打一条日志 —— 模拟真实 provider 的 clawbot.ai 输出。"""
+
+        def chat(self, text: str, **_: Any) -> str:
+            seen.append(USER_LOG_CONTEXT.get())
+            get_logger("ai").info("ai call start from=%s", "probe")
+            return "AI reply"
+
+    sess.ai = _LoggingAI()
+
+    caplog.set_level(logging.INFO, logger="clawbot.ai")
+    token = USER_LOG_CONTEXT.set("session-user-xyz")
+    try:
+        msg = message("你好，回复测试")
+        msg["message_id"] = "ai-user-dim"
+        await sess.handle_message(msg)
+    finally:
+        USER_LOG_CONTEXT.reset(token)
+        await sess.stop()
+
+    assert seen, "AI 根本没被调用 —— 测试前置条件不成立"
+    assert seen[0] == "session-user-xyz", (
+        f"AI 调用线程里丢失了 USER_LOG_CONTEXT：读到 {seen[0]!r}，"
+        "预期 'session-user-xyz'。executor 线程不继承 contextvars，"
+        "需要用 asyncio.to_thread（或 copy_context().run）来保留维度。"
+    )

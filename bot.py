@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import base64
+import contextvars
 import io
 import inspect
 import json
@@ -2214,8 +2215,16 @@ async def main():
                 )
                 try:
                     loop = asyncio.get_running_loop()
+                    # copy_context().run(...) 而不是裸 run_in_executor：
+                    # executor 线程不继承 contextvars，USER_LOG_CONTEXT 在线程里
+                    # 读出来是 "-" —— clawbot.ai / clawbot.ima 的日志会丢掉
+                    # user= 维度，多用户进程里无法定位是谁的调用。
+                    # 这里保留专用的 executor（max_workers=4）而不是换成
+                    # asyncio.to_thread，因为那个用的是默认 executor（上限不同）。
+                    ctx = contextvars.copy_context()
                     reply = await loop.run_in_executor(
-                        executor, partial(ai.chat, text, kb_id=kb_id),
+                        executor,
+                        lambda: ctx.run(partial(ai.chat, text, kb_id=kb_id)),
                     )
                 except Exception as exc:
                     dur_ms = (time.perf_counter() - t_ai_start) * 1000
