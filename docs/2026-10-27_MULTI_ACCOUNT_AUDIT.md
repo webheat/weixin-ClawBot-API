@@ -161,7 +161,89 @@ nginx 发出:    "9.9.9.9, 203.0.113.7"
 
 ---
 
-## 4. 没修的（记入 `TODO.md`）
+## 4. 隔离基准应该是**账号**，不是会话（P0 · 2026-10-27 追加）
+
+前面 3 个问题都是「共享资源被互相拖累」。这一条是更根本的：**隔离的基准本身搞错了**。
+
+### 五层标识符，各管一段
+
+| 层 | 标识符 | 稳定性 | 用途 |
+|---|---|---|---|
+| 浏览器 ↔ 会话 | `session_id`（opaque token） | 8h TTL | 只是浏览器手柄，跟微信账号无关 |
+| 会话 ↔ **账号** | **`ilink_user_id`** | **跨扫码不变** | **真正的身份**：KB 目录、IMA 绑定、日志 owner |
+| 本次扫码实例 | `ilink_bot_id` | **每次扫码轮换** | 判断「是不是换账号了」 |
+| 聊天对端 | `from_user_id` | — | 谁在给 bot 发消息 |
+| 发稿桥隔离键 | `from_user_id` | — | 每人独立 vault / 输出目录 / 公众号凭据 |
+
+**账号**和**扫码实例**必须分清：同一个 `ilink_user_id` 在生产上有两个
+`ilink_bot_id`（`yg` 账号扫码前后各一个）。用错的后果很具体：
+
+- 拿 `ilink_bot_id` 当 KB 目录名 → 用户每次扫码知识库目录就变了，等于没隔离
+- 拿 `ilink_user_id` 判断账号切换 → 永远判定成「没换」，切账号时旧上下文串过去
+
+### 查实：恢复路径的去重只拦了一半
+
+`shared_runtime._restore_persisted_sessions` 原本是：
+
+```python
+if not has_token and uid and uid in claimed:   # ← 只拦「无 token」的
+```
+
+**两个都带 token 的同账号会话，两个都会被复活。** 于是两个 bot 同时长轮询
+同一个账号 → 消息被两边随机抢走 → 用户看到「有时候没人回」。
+
+（运行时 `bot_manager._evict_same_account` 会在**登录时**踢掉同账号的旧会话，
+但那是「谁后登录谁赢」的竞态；恢复阶段就只复活一个，才是从根上避免。）
+
+### 查实：选谁活下来的判据不可靠
+
+注释写「同类则最近更新的优先」，但：
+
+1. `live` 那一组**根本没排序**（按 `session_id` 字典序）
+2. 就算按 mtime 排也不对 —— **state 文件的 mtime 会被 `save_state()` 刷新，
+   包括被驱逐的旧会话**（`BotSession.stop()` 里也调 `save_state()`）。
+   「最近写」≠「最后登录」。
+
+改用 **`login_time`**（只在真正登录成功时更新，`bot_session.py:326`）——
+它才代表「这个会话是最后接管这个账号的」。
+
+### 修法
+
+- 恢复路径去重对**所有**会话生效：`if uid and uid in claimed`
+- live 和 reauth 两组都按 `login_time` 倒序排
+- 运行时驱逐逻辑（`_evict_same_account`）本来就按账号判据工作，但**从未被
+  测试覆盖** —— 补上回归测试（并验证过：禁用驱逐逻辑后测试确实失败）
+
+### 账号隔离 ≠ 只留一个
+
+不同账号必须能并发。补了两个测试守住这条：
+
+- `test_restore_keeps_different_accounts_concurrently` —— 3 个不同账号 → 3 个都复活
+- `test_different_accounts_do_not_evict_each_other` —— 不同账号不互相踢
+
+生产验证：修复后用真实 state 文件跑恢复逻辑 → 复活 3 个会话、3 个不同账号、
+无重复；部署后线上 `restored 3 persisted session(s)`，`apply_login` 依次是
+`0o@im.wechat` / `yg@im.wechat` / `7I@im.wechat`，长轮询正常、0 错误。
+
+> 当前的生产数据**恰好**没有「同账号两个带 token 的会话」（旧那个文件的
+> token 已被清空），所以这个 bug 一直是**潜伏**状态 —— 触发条件是用户对同一
+> 账号扫码两次（两个浏览器标签页，或旧会话还活着时换浏览器）。
+
+### 回归测试
+
+均已验证在修复前失败、修复后通过：
+
+| 测试 | 修复前的表现 |
+|---|---|
+| `test_restore_dedups_two_live_sessions_of_the_same_account` | 复活了 2 个 → 失败 |
+| `test_restore_prefers_the_most_recently_logged_in_session` | 用 mtime 排序 → 选中被驱逐的旧会话 → 失败 |
+| `test_same_account_second_session_evicts_the_first` | 禁用 `_evict_same_account` → 失败 |
+| `test_restore_keeps_different_accounts_concurrently` | 守住「不同账号要并发」 |
+| `test_different_accounts_do_not_evict_each_other` | 守住「不同账号不互踢」 |
+
+---
+
+## 5. 没修的（记入 `TODO.md`）
 
 | # | 问题 | 严重程度 | 触发条件 |
 |---|---|---|---|
@@ -174,7 +256,7 @@ nginx 发出:    "9.9.9.9, 203.0.113.7"
 
 ---
 
-## 5. 顺带记录的日志问题（由并行的日志 worktree 处理）
+## 6. 顺带记录的日志问题（由并行的日志 worktree 处理）
 
 审计时发现、但**不属于本轮范围**（日志由另一个 worktree 在做）：
 
@@ -190,12 +272,15 @@ nginx 发出:    "9.9.9.9, 203.0.113.7"
 
 ---
 
-## 6. 相关文件
+## 7. 相关文件
 
-- `bot_session.py` — `_ai_chat_kwargs_async()`（KB 绑定）、AI 调用点
+- `bot_session.py` — `_ai_chat_kwargs_async()`（KB 绑定）、AI 调用点、
+  `login_time` 的更新点（`bot_session.py:326`）
 - `shared_web.py` — `_client_key()`（限流键）
-- `shared_runtime.py` — `_configure_default_executor()`（默认池容量）
+- `shared_runtime.py` — `_configure_default_executor()`（默认池容量）、
+  `_restore_persisted_sessions()`（账号维度去重 + login_time 排序）
 - `utils/xiaolvshu.py` — `_BRIDGE_EXECUTOR`（桥的独立池）
 - `docs/USER_PROVISIONING_AND_KB_ISOLATION.md` §5 — 已知限制（已更新）
 - `TODO.md` — 本轮未修项 + IMA 默认 KB 失效
-- 分支：`fix/multi-account-isolation`（已并入 main）
+- `bot_manager.py` — `_evict_same_account()`（运行时按账号驱逐）
+- 分支：`fix/multi-account-isolation` / `fix/account-based-isolation`（均已并入 main）
