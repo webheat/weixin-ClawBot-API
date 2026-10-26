@@ -92,3 +92,16 @@ say "完成"
 echo "  桥  $(cd "$BRIDGE_DIR" && git rev-parse --short HEAD 2>/dev/null || echo '-')"
 echo "  A   $(cd "$APP_DIR" && git rev-parse --short HEAD)"
 echo "  线上日志： journalctl -u $SERVICE -f  |  tail -f $APP_DIR/logs/clawbot_shared.log"
+
+# 部署记录 —— 「线上跑的是哪一版」必须是可查的事实，不能靠记忆。
+# 写进 git 忽略的 logs/deployments.log（append-only），不污染工作区。
+DEPLOY_LOG="$APP_DIR/logs/deployments.log"
+mkdir -p "$(dirname "$DEPLOY_LOG")"
+{
+  printf '%s  A=%s  bridge=%s  %s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S %Z')" \
+    "$(cd "$APP_DIR" && git rev-parse --short HEAD 2>/dev/null || echo '-')" \
+    "$(cd "$BRIDGE_DIR" && git rev-parse --short HEAD 2>/dev/null || echo '-')" \
+    "mode=$([[ $DO_BRIDGE -eq 1 ]] && echo full || echo app-only) restart=$([[ $RESTART -eq 1 ]] && echo yes || echo no)"
+} >> "$DEPLOY_LOG"
+echo "  部署记录： $DEPLOY_LOG"

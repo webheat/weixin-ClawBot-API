@@ -19,11 +19,20 @@
 ```bash
 systemctl status clawbot-shared.service --no-pager
 journalctl -u clawbot-shared.service --since '30 minutes ago' --no-pager -o cat \
-  | grep -E 'diag stage=|notify_lifecycle|send_reliable|task_failed|Traceback|ERROR|WARNING'
+  | grep -E 'diag stage=|notify_lifecycle|send_reliable failed|Traceback|ERROR|WARNING'
 curl -s http://127.0.0.1:18300/healthz
 ```
 
 如果部署服务名不同，先用 `systemctl list-units '*clawbot*'` 找到实际单元。
+
+配方里的关键词说明：
+
+- `diag stage=` 覆盖全部 9 个埋点阶段，包括 `diag stage=worker_failed`
+  （后台任务异常退出）。
+- `send_reliable failed` 是**发送失败路径**的日志文本（`bot_session.py:1187`），
+  正常路径不出现 —— 没命中说明发信没走过失败分支。
+- ⚠️ 不要 grep `task_failed`：那是 `_emit` 的内部事件名（`bot_session.py:1142`），
+  走 web UI 事件流，**从不写进日志**。日志里的实际文本是 `diag stage=worker_failed`。
 
 ## 日志解释
 
