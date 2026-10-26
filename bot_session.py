@@ -1146,7 +1146,8 @@ class BotSession:
         return task
 
     async def _send_reliable(self, msg: dict[str, Any], to_id: str,
-                             context_token: str, text: str, kind: str) -> None:
+                             context_token: str, text: str, kind: str,
+                             flow: str = "") -> None:
         """Send a transactional reply with a replay-stable client id."""
         from bot import (
             API_TIMEOUT,
@@ -1184,17 +1185,32 @@ class BotSession:
             )
         except ILinkAPIError as exc:
             get_logger("message").warning(
-                "send_reliable failed path=sendmessage err=%s",
-                _redact_text(str(exc)),
+                "send_reliable failed path=sendmessage kind=%s flow=%s err=%s",
+                kind, flow or "-", _redact_text(str(exc)),
             )
             raise
-        ensure_business_success(result, "sendmessage")
+        except Exception as exc:  # noqa: BLE001 —— 网络异常不是 ILinkAPIError
+            get_logger("message").warning(
+                "send_reliable failed path=sendmessage kind=%s flow=%s err=%s",
+                kind, flow or "-", _redact_text(f"{type(exc).__name__}: {exc}"),
+            )
+            raise
+        try:
+            ensure_business_success(result, "sendmessage")
+        except ILinkAPIError as exc:
+            # HTTP 200 但业务失败（ret/errcode != 0）—— 跟传输失败一样要记，
+            # 否则「没发出去」这件事在日志里完全没有痕迹。
+            get_logger("message").warning(
+                "send_reliable failed path=sendmessage kind=%s flow=%s err=%s",
+                kind, flow or "-", _redact_text(str(exc)),
+            )
+            raise
         # 埋点放在这里而不是各个调用点 —— _send_reliable 是所有「可靠回复」的
         # 唯一出口（命令分支、AI 分支、语音提示、重连确认…）。只挂在 AI 分支
         # 的话，命令类回复发出去了却看不到 reply_sent，排查时会误判成「没回复」。
         get_logger("diagnostics").info(
-            "diag stage=reply_sent session=%s kind=%s from_suffix=%s",
-            self.session_id, kind, to_id[-6:],
+            "diag stage=reply_sent session=%s kind=%s from_suffix=%s flow=%s",
+            self.session_id, kind, to_id[-6:], flow or "-",
         )
 
     def _kb_scope(self) -> str:
@@ -1242,7 +1258,11 @@ class BotSession:
         if not from_id or not context:
             return
         from utils.logging_setup import get_logger
-        get_logger("diagnostics").info("diag stage=inbound session=%s from_suffix=%s", self.session_id, from_id[-6:])
+        flow = self._flow_id(msg)
+        get_logger("diagnostics").info(
+            "diag stage=inbound session=%s flow=%s from_suffix=%s",
+            self.session_id, flow, from_id[-6:],
+        )
         # iLink's voice_item.text is its server-side ASR result.  Once it is
         # present, this deliberately follows the exact same command/LLM path
         # as ordinary text; no voice capability explanation is sent.
@@ -1279,7 +1299,7 @@ class BotSession:
             await self._send_reliable(
                 msg, from_id, context,
                 "好的，正在重新连接..." if normalized == "Y" else "已取消重新连接",
-                "reconnect-confirm",
+                "reconnect-confirm", flow=flow,
             )
             if normalized == "Y":
                 await self.request_relogin("manual")
@@ -1288,7 +1308,7 @@ class BotSession:
             await self._send_reliable(
                 msg, from_id, context,
                 VOICE_TRANSCRIPT_UNAVAILABLE_MSG,
-                "voice-transcript-missing",
+                "voice-transcript-missing", flow=flow,
             )
             return
 
@@ -1301,7 +1321,9 @@ class BotSession:
             await send_msg_safe(self.http, from_id, context, INTRO_DETAIL_MSG,
                                 self._token_ref, self._base_url_ref)
         if normalized == "/HELP" or text == "/指令":
-            await self._send_reliable(msg, from_id, context, COMMANDS_MSG, "help")
+            await self._send_reliable(
+                msg, from_id, context, COMMANDS_MSG, "help", flow=flow
+            )
             return
         if normalized == "/TIME":
             from bot import RECONNECT_CONFIG
@@ -1323,14 +1345,14 @@ class BotSession:
             else:
                 text_reply = "当前连接由后台持续维护，服务端 token 失效时会自动恢复。"
             await self._send_reliable(
-                msg, from_id, context, text_reply, "time"
+                msg, from_id, context, text_reply, "time", flow=flow
             )
             return
         if text == "/重新连接":
             self.manual_reconnect_pending[from_id] = True
             await self._send_reliable(
                 msg, from_id, context, "确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消",
-                "reconnect-prompt",
+                "reconnect-prompt", flow=flow,
             )
             return
         # 发布类消息（贴图号 / 图文 → 公众号草稿箱）走 xiaolvshu 桥。
@@ -1341,12 +1363,20 @@ class BotSession:
         # 认领失败（不是发布意图）返回 None，照常落回 AI 对话。
         try:
             from utils.xiaolvshu import handle as xiaolvshu_handle
-        except Exception:  # noqa: BLE001 —— 桥模块坏了不能拖垮聊天
+        except Exception as exc:  # noqa: BLE001 —— 桥模块坏了不能拖垮聊天
+            from utils.logging_setup import get_logger
+            get_logger("publish").error(
+                "flow=%s stage=publish_unavailable err=%s", flow, exc,
+            )
             xiaolvshu_handle = None
         if xiaolvshu_handle is not None:
             try:
-                xreply = await xiaolvshu_handle(text, from_id)
+                xreply = await xiaolvshu_handle(text, from_id, flow=flow)
             except Exception as exc:  # noqa: BLE001
+                from utils.logging_setup import get_logger
+                get_logger("publish").exception(
+                    "flow=%s stage=publish_exception err=%s", flow, exc,
+                )
                 xreply = f"❌ 发布链路出错：{type(exc).__name__}: {exc}"
             if xreply is not None:
                 # 发稿归属全靠 from_user_id（桥的 --user 参数 = 这个值），
@@ -1357,7 +1387,12 @@ class BotSession:
                     from_id, text[:60], len(xreply or ""),
                 )
                 await self._send_reliable(
-                    msg, from_id, context, xreply, "xiaolvshu"
+                    msg, from_id, context, xreply, "xiaolvshu", flow=flow
+                )
+                from utils.logging_setup import get_logger
+                get_logger("publish").info(
+                    "flow=%s stage=reply_sent kind=xiaolvshu reply_len=%d",
+                    flow, len(xreply or ""),
                 )
                 return
         ticket = await get_typing_ticket_safe(self.http, from_id, context,
@@ -1382,7 +1417,9 @@ class BotSession:
             # optional welcome/typing messages, delivery failure must raise so
             # the inbound cursor is not committed and the batch can replay.
             # （reply_sent 埋点在 _send_reliable 内部统一打，这里不再重复。）
-            await self._send_reliable(msg, from_id, context, reply, "ai-reply")
+            await self._send_reliable(
+                msg, from_id, context, reply, "ai-reply", flow=flow
+            )
         finally:
             if typing:
                 await send_typing_safe(self.http, from_id, ticket, 2,
@@ -1394,6 +1431,19 @@ class BotSession:
             if msg.get(key):
                 return str(msg[key])
         return hashlib.sha256(json.dumps(msg, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def _flow_id(self, msg: dict[str, Any]) -> str:
+        """一次「用户发消息 → clawbot 处理 → 回信息」的关联 id。
+
+        发稿闭环横跨三层（微信入站 → utils/xiaolvshu 调桥 → 回信），
+        每层各记各的日志 —— 没有这个 id 就只能靠时间戳猜哪条是哪条。
+        同一 id 出现在每一条相关日志的 ``flow=`` 字段里，
+        ``grep flow=<id>`` 就能捞出这一次的完整链路。
+        """
+        digest = hashlib.sha256(
+            f"{self.session_id}:{self._message_id(msg)}".encode("utf-8")
+        ).hexdigest()[:8]
+        return digest
 
     async def _drain_batch(self, messages: list[dict[str, Any]], cursor: str | None) -> None:
         """Drain one batch of inbound iLink messages.

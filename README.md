@@ -229,6 +229,8 @@ POST sendtyping { status: 2 }（finally 中尽力执行）
 | `clawbot.api` | 每次 iLink HTTP 自动 trace（DEBUG） |
 | `clawbot.state` | `weixin_state.json` 读写 |
 | `clawbot.ima` | ima 检索 / 写入 / 配置 |
+| `clawbot.publish` | 发稿闭环（贴图号 / 图文 → 公众号草稿箱）：认领 / 调桥 / 桥的结果 / 回信 |
+| `clawbot.diagnostics` | 连接链路埋点（`diag stage=inbound` / `reply_sent` / `worker_failed` …） |
 
 ### 环境变量
 
@@ -264,6 +266,16 @@ grep -E "reconnect (start|warning|force|credentials|getupdates)" logs/clawbot.lo
 grep -E "ima (search|POST|envelope|exhausted)" logs/clawbot.log | tail -10
 # → "envelope err code=401" → API key 失效
 # → "exhausted after 5 attempts" → 上游 5xx 或网络问题
+
+# 6. 「发贴图号」没反应 / 不知道发到哪一步了
+#    每一步都带同一个 flow id，grep 一个 id 就是一整条链路
+grep -E "flow=[0-9a-f]{8}" logs/clawbot.log | tail -40
+# → 完全没有 publish_intent：命令没被认领（认错了说法或模块没加载）
+# → 有 publish_intent 没有 bridge_call：桥模块 import 失败（看 publish_unavailable）
+# → 有 bridge_call 没有 bridge_result：桥卡住了（看 bridge_stderr / bridge_error）
+# → 有 bridge_result ok=False code=need_select：命中多篇，等用户 /选 N
+# → 有 publish_result 没有 reply_sent：回信发不出去（看 clawbot.message 的 send_reliable failed）
+# → 有 reply_sent 但微信没收到 → 问题在 iLink 侧
 ```
 
 DEBUG 级别会输出每次 iLink HTTP 的 method / path / status / body（脱敏后）。复盘协议漂移类问题时打开：

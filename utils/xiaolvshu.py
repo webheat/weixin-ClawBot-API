@@ -19,7 +19,30 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
+
+from utils.logging_setup import get_logger
+
+# 发稿链路的流程日志走独立 logger（clawbot.publish）。
+#
+# 为什么不用 clawbot.message：那条是「消息收发」的通用日志，而发稿是
+# **跨仓库**的（子进程调桥），出问题时要单独 grep 出来看一条完整链路。
+# 一次发稿的每一步都带同一个 flow id，grep 一个 flow 就能把
+# 「用户发消息 → 认领 → 调桥 → 桥的输出 → 回复 → 回复送达」串起来。
+log_publish = get_logger("publish")
+
+# 日志里不要出现文件系统绝对路径。
+#
+# 回信文本里有 vault 路径（「你的 vault：/opt/clawbot-xiaolvshu/users/xxx/vault」），
+# 那条路径对排障没用，却把每个用户的目录布局摊进了共享日志。记路径前先抹掉。
+_PATH_RE = re.compile(r"(?<![\w/:])(/[^\s，。！？：、）)】\"']{4,})")
+
+
+def _scrub(value: str, limit: int = 120) -> str:
+    """截断 + 抹掉绝对路径 —— 给日志用，不是给用户看的。"""
+    text = _PATH_RE.sub("<path>", str(value or ""))
+    return text[:limit]
 
 BRIDGE = os.environ.get(
     "XIAOLVSHU_BRIDGE", "/opt/obsidian-xiaolvshu/scripts/xiaolvshu_bridge.py"
@@ -168,32 +191,67 @@ def detect_intent(text: str):
 
 # ── 调桥 ────────────────────────────────────────────────────────────────────
 
-def _run_bridge(args: list[str], uid: str) -> dict:
+def _run_bridge(args: list[str], uid: str, flow: str = "") -> dict:
     _check_bridge_version()
     cmd = [PYTHON, BRIDGE, "--user", uid, *args]
+    log_publish.info(
+        "flow=%s stage=bridge_call args=%s timeout=%.0fs",
+        flow or "-", " ".join(args), TIMEOUT,
+    )
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=TIMEOUT, cwd="/tmp"
         )
     except subprocess.TimeoutExpired:
+        elapsed = int((time.monotonic() - started) * 1000)
+        log_publish.warning(
+            "flow=%s stage=bridge_error code=timeout elapsed_ms=%d timeout=%.0fs",
+            flow or "-", elapsed, TIMEOUT,
+        )
         return {"ok": False, "code": "timeout",
                 "error": f"超过 {int(TIMEOUT)} 秒还没跑完"}
     except OSError as e:
+        elapsed = int((time.monotonic() - started) * 1000)
+        log_publish.error(
+            "flow=%s stage=bridge_error code=spawn_failed elapsed_ms=%d err=%s",
+            flow or "-", elapsed, e,
+        )
         return {"ok": False, "code": "spawn_failed", "error": str(e)}
+    elapsed = int((time.monotonic() - started) * 1000)
+    # 桥的 stderr 是它自己排障用的（插图找不到、标题超限……），平时被丢掉。
+    # 发稿链路出问题时这几行往往就是唯一线索 —— 记进日志（DEBUG，不刷屏）。
+    for line in (proc.stderr or "").splitlines():
+        line = line.strip()
+        if line:
+            log_publish.debug("flow=%s stage=bridge_stderr %s", flow or "-", line[:300])
     # stdout 末尾一行是 JSON（前面可能有渲染日志，但桥把它们都赶到 stderr 了）
     for line in reversed(proc.stdout.splitlines()):
         line = line.strip()
         if line.startswith("{"):
             try:
-                return json.loads(line)
+                result = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            log_publish.info(
+                "flow=%s stage=bridge_result ok=%s code=%s elapsed_ms=%d "
+                "kind=%s title=%r cards=%s media_id=%s",
+                flow or "-", bool(result.get("ok")), result.get("code") or "-",
+                elapsed, result.get("kind") or "-",
+                _scrub(result.get("title") or "", 40),
+                result.get("cards", "-"), result.get("media_id") or "-",
+            )
+            return result
     tail = (proc.stderr or proc.stdout or "").strip()[-600:]
+    log_publish.error(
+        "flow=%s stage=bridge_error code=no_json_line elapsed_ms=%d rc=%s tail=%r",
+        flow or "-", elapsed, proc.returncode, tail[-300:],
+    )
     return {"ok": False, "code": "bridge_failed", "error": tail or "桥没有输出"}
 
 
-async def call_bridge(args: list[str], uid: str) -> dict:
-    return await asyncio.to_thread(_run_bridge, args, uid)
+async def call_bridge(args: list[str], uid: str, flow: str = "") -> dict:
+    return await asyncio.to_thread(_run_bridge, args, uid, flow)
 
 
 # ── 回复文本 ────────────────────────────────────────────────────────────────
@@ -275,43 +333,104 @@ def format_result(action: str, res: dict) -> str:
 
 # ── 入口 ────────────────────────────────────────────────────────────────────
 
-async def _publish(uid: str, kind: str, keyword: str, force: bool = False) -> str:
+async def _publish(uid: str, kind: str, keyword: str, force: bool = False,
+                    flow: str = "") -> str:
     """把一篇推到草稿箱。kind 可以是 newspic / article / auto（auto = 桥去猜）。
 
     多命中时桥会返回 need_select 并把候选存进 pending，之后 /选 N 接着发。
     """
     if not keyword:
+        log_publish.info(
+            "flow=%s stage=publish_skipped reason=no_keyword", flow or "-",
+        )
         return "发哪篇？给个标题关键词，比如「发贴图号 沉香」。"
     args = ["publish", "--type", kind, "--keyword", keyword]
     if force:
         args.append("--force")
-    res = await call_bridge(args, uid)
-    return format_result("publish", res)
+    res = await call_bridge(args, uid, flow=flow)
+    reply = format_result("publish", res)
+    log_publish.info(
+        "flow=%s stage=publish_result ok=%s code=%s reply_len=%d reply=%r",
+        flow or "-", bool(res.get("ok")), res.get("code") or "-",
+        len(reply or ""), _scrub(reply),
+    )
+    if res.get("code") == "need_select":
+        # 多命中 → 用户回「/选 N」接着发。候选列表记下来，
+        # 否则用户回了个序号也查不出当时选的是哪几篇。
+        cands = res.get("candidates") or []
+        log_publish.info(
+            "flow=%s stage=publish_need_select candidates=%d titles=%s",
+            flow or "-", len(cands),
+            [_scrub(c.get("title") or "", 30) for c in cands][:8],
+        )
+    return reply
 
 
-async def handle(text: str, uid: str) -> str | None:
-    """认领这条消息。返回 None = 不是发布类消息，交给 AI 照常回答。"""
+async def handle(text: str, uid: str, flow: str = "") -> str | None:
+    """认领这条消息。返回 None = 不是发布类消息，交给 AI 照常回答。
+
+    ``flow`` 是这次调用的追踪 id（调用方给）。同一条消息的每个阶段
+    （intent → bridge_call → bridge_result → publish_result）都带它，
+    ``grep flow=<id>`` 就能拿到一条完整的发稿链路。
+    """
     cmd = parse_command(text)
     if cmd is None:
         intent = detect_intent(text)
         if intent is None:
+            log_publish.debug(
+                "flow=%s stage=publish_unclaimed reason=not_publish_intent",
+                flow or "-",
+            )
             return None
         kind, keyword = intent
-        return await _publish(uid, kind, keyword)
+        log_publish.info(
+            "flow=%s stage=publish_intent source=natural kind=%s keyword=%r uid=%s",
+            flow or "-", kind, _scrub(keyword, 60), uid,
+        )
+        return await _publish(uid, kind, keyword, flow=flow)
 
     action, payload = cmd
     if action == "publish":
+        # payload 是 (kind, keyword) —— 拆开记，别把 tuple 的 repr 写进日志
         kind, keyword = payload
-        return await _publish(uid, kind, keyword)
+        log_publish.info(
+            "flow=%s stage=publish_intent source=command action=%s kind=%s "
+            "keyword=%r uid=%s",
+            flow or "-", action, kind, _scrub(keyword, 60), uid,
+        )
+        return await _publish(uid, kind, keyword, flow=flow)
+    log_publish.info(
+        "flow=%s stage=publish_intent source=command action=%s payload=%r uid=%s",
+        flow or "-", action, _scrub(payload, 60), uid,
+    )
     if action == "republish":
-        return await _publish(uid, "auto", payload, force=True)
+        return await _publish(uid, "auto", payload, force=True, flow=flow)
     if action == "list":
-        res = await call_bridge(["search", "--keyword", payload], uid)
-        return format_result("list", res)
+        res = await call_bridge(["search", "--keyword", payload], uid, flow=flow)
+        reply = format_result("list", res)
+        log_publish.info(
+            "flow=%s stage=publish_result action=list ok=%s hits=%d reply_len=%d",
+            flow or "-", bool(res.get("ok")), len(res.get("results") or []),
+            len(reply or ""),
+        )
+        return reply
     if action == "status":
-        res = await call_bridge(["status"], uid)
-        return format_result("status", res)
+        res = await call_bridge(["status"], uid, flow=flow)
+        reply = format_result("status", res)
+        log_publish.info(
+            "flow=%s stage=publish_result action=status ok=%s entries=%d reply_len=%d",
+            flow or "-", bool(res.get("ok")), len(res.get("entries") or []),
+            len(reply or ""),
+        )
+        return reply
     if action == "select":
-        res = await call_bridge(["select", "--index", str(payload)], uid)
-        return format_result("publish", res)
+        res = await call_bridge(["select", "--index", str(payload)], uid, flow=flow)
+        reply = format_result("publish", res)
+        log_publish.info(
+            "flow=%s stage=publish_result action=select index=%s ok=%s code=%s "
+            "reply_len=%d reply=%r",
+            flow or "-", payload, bool(res.get("ok")), res.get("code") or "-",
+            len(reply or ""), _scrub(reply),
+        )
+        return reply
     return None

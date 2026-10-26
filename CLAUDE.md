@@ -217,8 +217,39 @@ All diagnostic logs go through `logging.getLogger("clawbot.<subsystem>")`:
 | `clawbot.state` | `weixin_state.json` read/write |
 | `clawbot.ima` | ima search / write / config |
 | `clawbot.ima_bindings` | per-user `ima_bindings.json` lookup / bind / unbind |
+| `clawbot.publish` | 发稿闭环（贴图号 / 图文 → 公众号草稿箱）：认领 / 调桥 / 桥的结果 / 回信 |
+| `clawbot.diagnostics` | 连接链路埋点（`diag stage=inbound` / `reply_sent` / `worker_failed` …） |
 
 User-facing output (banners, menu, command echo) stays on `print` — don't move it to logger.
+
+### 发稿闭环的流程日志（`clawbot.publish`）
+
+一次「用户发消息 → clawbot 认领 → 调桥 → 桥出结果 → 回信给用户」横跨三层
+（`bot_session._handle_message` → `utils/xiaolvshu.handle` → `utils/xiaolvshu._run_bridge`）。
+每条相关日志都带同一个 `flow=<8位hex>` 关联 id，`grep flow=<id>` 就能捞出完整链路。
+
+| stage | 记在哪 | 含义 |
+|---|---|---|
+| `publish_intent` | `utils/xiaolvshu.handle` | 认领了这条消息（`source=command` / `natural`，含 kind + keyword） |
+| `publish_unclaimed` | 同上（DEBUG） | 不是发稿意图 → 落回 AI 对话 |
+| `publish_skipped` | `utils/xiaolvshu._publish` | 认领了但没有关键词（用户光说「发贴图号」） |
+| `bridge_call` | `_run_bridge` | 子进程调桥（args + timeout） |
+| `bridge_stderr` | 同上（DEBUG） | 桥自己的排障输出（插图找不到、标题超限……），平时被丢掉，出问题时是唯一线索 |
+| `bridge_result` | 同上 | 桥的 JSON 结果（ok / code / elapsed_ms / kind / title / cards / media_id） |
+| `bridge_error` | 同上 | `timeout` / `spawn_failed` / `no_json_line`（带 stderr 尾巴） |
+| `publish_result` | `utils/xiaolvshu.handle` | 这次发稿的最终结论（ok / code / 回信内容前 120 字） |
+| `publish_need_select` | 同上 | 多命中，候选列表（用户回 `/选 N` 时可对账） |
+| `publish_exception` | `bot_session` | 桥调用抛异常 |
+| `publish_unavailable` | `bot_session` | 桥模块 import 失败 → 发稿功能整个不可用 |
+| `reply_sent` | `bot_session` | 回信已发出（同时在 `clawbot.diagnostics` 的 `diag stage=reply_sent` 里带 flow） |
+
+回信**发不出去**时记在 `clawbot.message`（不是 `clawbot.publish`）：
+`send_reliable failed path=sendmessage kind=... flow=... err=...`。
+「有 `publish_result` 但没有 `reply_sent`」就是这个断点。
+
+`clawbot.diagnostics` 的 `diag stage=inbound` / `diag stage=reply_sent` 也带同一个
+`flow=` —— 两套日志可以用同一个 id 交叉引用。回归测试：
+[`tests/test_publish_flow_logging.py`](tests/test_publish_flow_logging.py)。
 
 ## References inside this repo
 
@@ -228,6 +259,7 @@ User-facing output (banners, menu, command echo) stays on `print` — don't move
 - `docs/IMA_WEB_UI.md` — three binding entry points (web UI + `/bindkb` command + CLI) + auth model + cross-device recovery flow.
 - `docs/IMA_PER_USER_BINDING_REVIEW.md` — outstanding review items from 2026-09-16 implementation; P0/P1/P2 checklist for the next reviewer.
 - `docs/FORWARDED_MESSAGES.md` — what `extract_message_text` reads from `item_list` (text / voice / ref_msg / app_msg / url), dedup strategy, 8-case smoke test patterns, URL is text-only (never fetched).
+- `docs/PUBLISH_FLOW_LOGGING.md` — 发稿闭环（用户发消息 → 认领 → 调桥 → 回信）的流程日志：flow id 怎么来、每个 stage 各自记什么、卡在哪一环怎么查。
 - `docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md` — 2026-10-25 incident: 「切换账号」during 初始扫码 → parallel initial login raised `RuntimeError` → `session.stop()` discarded the applied token. Root cause, fix, new invariants, and grep recipes.
 - `docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md` — 2026-10-26 incident: iLink token 过期 (`-14`) 后进二维码窗口，发版重启打断窗口 → state 只剩空 `bot_token` → 账号永久掉线。`reauth_required` 标志落盘 + 恢复路径复活（时效窗 + 同账号去重）。
 - `docs/multi-user.md` — single-tenant limits, scenario A vs B, comparison with XTmai reference impl, recommended fixes (#2 broadcast, #3 gather, #4 retry) ranked by ROI.
