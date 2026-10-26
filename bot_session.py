@@ -1226,6 +1226,44 @@ class BotSession:
             return {"kb_scope": self._kb_scope()}
         return {}
 
+    async def _ai_chat_kwargs_async(self) -> dict[str, Any]:
+        """``_ai_chat_kwargs`` + per-user 的 IMA 云端 KB 绑定（``kb_id``）。
+
+        ``_AIWithIma.chat`` 认 ``kb_id`` kwarg（``bot.py`` 里
+        ``kb_id = kwargs.pop("kb_id", None)``），为 ``None`` 时回落到
+        ``ImaConfig.default_knowledge_base_id`` —— 也就是**所有账号共用同一个
+        云端知识库**。per-user 绑定（``ima_bindings.json``，按
+        ``ilink_user_id`` 查）必须在这里传下去，否则绑了也不生效：
+        web UI 写的绑定是死的。
+
+        ⚠️ 查绑定是 async（``get_default_bindings``）且会读文件，所以这个
+        方法必须是 async —— 调用点在 ``_handle_message`` 里，AI 调用本身
+        仍然在 ``asyncio.to_thread`` 里跑（保持不阻塞 event loop）。
+        """
+        kwargs = self._ai_chat_kwargs()
+        if not kwargs:
+            # 不是 _AIWithIma（裸 provider）→ 没有 kb_id 概念
+            return kwargs
+        owner_id = str(self.ilink_user_id or "").strip()
+        if not owner_id:
+            return kwargs
+        from utils.logging_setup import get_logger
+        try:
+            from utils.ima_bindings import get_default_bindings as _get_bindings
+            bindings = await _get_bindings()
+            kb_id = bindings.lookup_kb_id(owner_id)
+        except Exception as exc:  # 持久化层异常不能让回复失败
+            get_logger("ima_bindings").warning(
+                "ai kb binding lookup failed user=%s err=%s", owner_id[-12:], exc
+            )
+            return kwargs
+        if kb_id:
+            kwargs["kb_id"] = kb_id
+            get_logger("ima_bindings").info(
+                "ai kb route user=%s kb=%s", owner_id[-12:], kb_id
+            )
+        return kwargs
+
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         from bot import (
             COMMANDS_MSG,
@@ -1372,9 +1410,13 @@ class BotSession:
             else:
                 from utils.logging_setup import get_logger
                 get_logger("diagnostics").info("diag stage=ai_begin session=%s", self.session_id)
+                # per-user 的 IMA 云端 KB 绑定要在这里查出来传下去 ——
+                # 不传 kb_id 的话所有账号都回落到全局 IMA_ILINK_DEFAULT_KB，
+                # per-user 绑定（web UI 写的）就形同虚设。
+                chat_kwargs = await self._ai_chat_kwargs_async()
                 loop = asyncio.get_running_loop()
                 reply = await loop.run_in_executor(
-                    None, partial(self.ai.chat, text, **self._ai_chat_kwargs())
+                    None, partial(self.ai.chat, text, **chat_kwargs)
                 )
                 get_logger("diagnostics").info("diag stage=ai_complete session=%s", self.session_id)
             reply = str(reply or "抱歉，我暂时没有生成有效回复。").strip()

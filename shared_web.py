@@ -287,15 +287,38 @@ def _public_prefix(request: web.Request, configured: str, *, trust_proxy: bool) 
 def _client_key(request: web.Request, *, trust_proxy: bool = False) -> str:
     """Use the edge proxy's canonical client address for throttling.
 
-    ``X-Forwarded-For`` is only trustworthy when the app is reachable through
-    a proxy that overwrites it.  Deployments exposing this app directly simply
-    omit the header and fall back to ``request.remote``.
+    ``trust_proxy=True`` 只应在「应用只能经由一个会**覆盖**转发头的可信代理
+    到达」时开启。本项目满足：应用只监听 ``127.0.0.1``（外部无法直连），
+    nginx 用 ``proxy_set_header X-Real-IP $remote_addr`` **覆盖**该头，
+    所以客户端自带的 ``X-Real-IP`` 会被丢弃 —— 收到的永远是真实对端。
+
+    ⚠️ ``X-Forwarded-For`` 不能取第一个元素。nginx 用
+    ``$proxy_add_x_forwarded_for``，它把 ``$remote_addr`` **追加**到
+    客户端自带的 XFF 之后::
+
+        客户端发 XFF: 9.9.9.9        （伪造）
+        nginx 发出:   "9.9.9.9, 203.0.113.7"
+        第一个 = 伪造值  ← 不能用
+        最后一个 = 真实对端 ✓
+
+    所以这里优先用 nginx 覆盖过的 ``X-Real-IP``；没有它再取 XFF 的**最后**
+    一段（最靠近 nginx 那一跳，即真实对端）。
+
+    不信任代理时退回 ``request.remote``：此时所有经同一代理的请求会共享
+    同一个键 —— 限流变成全站一个桶，一个用户狂点会 429 掉所有人。
     """
     if trust_proxy:
+        # nginx 用 proxy_set_header 覆盖 X-Real-IP → 不可伪造
+        real_ip = request.headers.get("X-Real-IP", "").strip()
+        if real_ip:
+            return real_ip
         forwarded = request.headers.get("X-Forwarded-For", "")
         if forwarded:
-            return forwarded.split(",", 1)[0].strip() or (request.remote or "unknown")
-        return request.headers.get("X-Real-IP", "").strip() or request.remote or "unknown"
+            # 取最后一段：最靠近 nginx 的一跳 = 真实对端
+            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
+        return request.remote or "unknown"
     return request.remote or "unknown"
 
 
