@@ -2491,6 +2491,7 @@ class _AIWithIma:
             min_score = float(min_score_raw) if min_score_raw else 0.0
             self._semantic_kb = SemanticKBIndex(
                 kb_dir, min_score=min_score,
+                cache_dir=self._env.get("CLAWBOT_FASTEMBED_CACHE") or None,
             )
         except Exception as exc:  # 路径/权限/模型下载异常不能让回复失败
             log_ai.warning("ai semantic_kb init failed dir=%s err=%s", kb_dir, exc)

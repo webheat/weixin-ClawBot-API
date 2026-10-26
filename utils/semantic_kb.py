@@ -96,6 +96,7 @@ class SemanticKBIndex:
         db_path: Optional[str | os.PathLike[str]] = None,
         model_name: str = DEFAULT_MODEL,
         min_score: float = DEFAULT_MIN_SCORE,
+        cache_dir: Optional[str | os.PathLike[str]] = None,
     ):
         self.dir = Path(directory)
         if not self.dir.is_absolute():
@@ -110,6 +111,17 @@ class SemanticKBIndex:
             self.db_path = self.dir.parent / ".semantic_kb.sqlite3"
         else:
             self.db_path = Path(db_path)
+        # fastembed 默认把模型缓存到 tempfile.gettempdir()/fastembed_cache ——
+        # 也就是 /tmp。/tmp 会被 reboot 清掉，于是每次重启后第一次检索都要重新
+        # 下载 91MB；而下载发生在 executor 线程里，会把优雅关机拖到 30s 超时
+        # （systemd SIGKILL）。2026-10-26 的几次发版就是这样把正在等扫码的
+        # 会话打断的。见 docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md。
+        if cache_dir:
+            self.cache_dir = Path(cache_dir)
+        else:
+            self.cache_dir = (
+                Path(__file__).resolve().parent.parent / ".cache" / "fastembed"
+            )
         self.model_name = model_name
         self.min_score = float(min_score) if min_score else 0.0
         self._embedder = None  # lazy: fastembed.TextEmbedding
@@ -132,7 +144,9 @@ class SemanticKBIndex:
                 "loading fastembed model %s (首次会从 HuggingFace 拉 ~93MB)",
                 self.model_name,
             )
-            self._embedder = TextEmbedding(model_name=self.model_name)
+            self._embedder = TextEmbedding(
+                model_name=self.model_name, cache_dir=str(self.cache_dir)
+            )
         return self._embedder
 
     def _embed(self, texts: list[str]) -> list:

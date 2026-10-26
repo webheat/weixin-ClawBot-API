@@ -28,6 +28,9 @@ docs/.semantic_kb.sqlite3
 docs/.semantic_kb.sqlite3-journal
 *.semantic_kb.sqlite3
 
+# fastembed 模型缓存（91MB，放这里才不会因为 /tmp 被清而每次重启重下）
+.cache/
+
 # Python
 __pycache__/
 *.py[cod]
