@@ -1650,3 +1650,122 @@ def test_restored_session_keeps_reauth_required(
     # Such a session must survive browser-binding expiry: it still owns an
     # account, it just needs a new credential.
     assert sess.has_authenticated_connection is True
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26 事故链最后一环：二维码窗口没人扫码 → 账号被永久打死
+# 见 docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_parks_session_when_qr_window_expires(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """没人扫码 → 会话 park 住，而不是被 start() 的异常打死。
+
+    事故链：token 服务端过期(-14) → 清 token → 进二维码窗口 → 窗口内没人
+    扫码 → ``login_with_qrcode`` 抛 MAX_QR_REFRESH_EXCEEDED → ``start()``
+    抛错 → ``BotManager._bootstrap`` 把会话从内存摘掉 → 账号从此没有会话。
+
+    park 之后：会话仍在 manager 里，``reauth_required`` 继续落盘，页面随时
+    可以重新拉二维码（解耦 QR 切换路径）。
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+
+    async def failing_login(*, reconnect: bool = False) -> dict[str, Any]:
+        raise RuntimeError("二维码多次失效或登录失败，请稍后重试。")
+
+    monkeypatch.setattr(sess, "_login", failing_login)
+
+    async def idle_loop() -> None:
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(sess, "_message_loop", idle_loop)
+
+    try:
+        await asyncio.wait_for(sess.start(), timeout=5)
+        started = sess._started
+        awaiting = sess._awaiting_scan
+        status = sess.qr_state.status
+        reauth = sess._reauthentication_required
+        has_message = "message" in sess._tasks
+    finally:
+        await sess.stop()
+
+    assert started is True, "二维码窗口过期不能打死会话"
+    assert awaiting is True
+    assert status == "awaiting_scan"
+    assert reauth is True
+    assert has_message is False, "没有凭据时不能起长轮询"
+
+    persisted = json.loads((tmp_path / "alice.json").read_text(encoding="utf-8"))
+    assert persisted["reauth_required"] is True, (
+        "parked 会话必须继续标记「需要重新扫码」，否则重启后账号会被丢掉"
+    )
+
+
+@pytest.mark.asyncio
+async def test_parked_session_starts_message_loop_after_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """park 住之后扫码成功 → 原子换凭据 + 拉起长轮询。
+
+    没有这一步，park 住的会话即使拿到了 token 也不会收消息（症状：用户
+    扫码显示「登录成功」，但机器人不回复）。
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+
+    async def failing_login(*, reconnect: bool = False) -> dict[str, Any]:
+        raise RuntimeError("二维码多次失效或登录失败，请稍后重试。")
+
+    monkeypatch.setattr(sess, "_login", failing_login)
+
+    loop_started = asyncio.Event()
+
+    async def idle_loop() -> None:
+        loop_started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(sess, "_message_loop", idle_loop)
+
+    import bot as protocol
+
+    async def fake_fetch_login_qrcode(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"qrcode": "parked-qr", "qrcode_img_content": "x"}
+
+    async def fake_wait_login_confirmation(
+        *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        return {
+            "bot_token": "fresh-token",
+            "baseurl": "https://new.invalid",
+            "ilink_bot_id": "new-bot-id",
+            "ilink_user_id": "owner@im.wechat",
+        }
+
+    async def fake_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(protocol, "fetch_login_qrcode", fake_fetch_login_qrcode)
+    monkeypatch.setattr(protocol, "wait_login_confirmation", fake_wait_login_confirmation)
+    monkeypatch.setattr(protocol, "notify_lifecycle", fake_notify)
+
+    try:
+        await asyncio.wait_for(sess.start(), timeout=5)
+        assert sess._awaiting_scan is True
+        result = await sess.request_relogin("web switch")
+        assert result["status"] == "qr_pending"
+        pending = sess._pending_qr_task
+        assert pending is not None
+        await asyncio.wait_for(pending, timeout=5)
+        await asyncio.wait_for(loop_started.wait(), timeout=5)
+        token = sess.bot_token
+        awaiting = sess._awaiting_scan
+        status = sess.qr_state.status
+    finally:
+        await sess.stop()
+
+    assert token == "fresh-token", "扫码确认后必须换上新凭据"
+    assert awaiting is False
+    assert status == "logged_in"

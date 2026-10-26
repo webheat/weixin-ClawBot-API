@@ -146,6 +146,11 @@ class BotSession:
         self._reauthentication_required = bool(
             self.runtime_state.get("reauth_required")
         )
+        # True while the session is parked waiting for a human to scan a QR.
+        # The session stays alive (no token, no message loop) instead of being
+        # torn down, so the account can be recovered at any time.
+        # See docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md.
+        self._awaiting_scan = False
         self._initializing = False
         self._started = False
         self._stopped = False
@@ -321,6 +326,7 @@ class BotSession:
         self.qr_state.logged_in_at = self.login_time
         # A fresh credential means the account no longer waits for a scan.
         self._reauthentication_required = False
+        self._awaiting_scan = False
         self.save_state()
         if changed and old_token:
             await notify_lifecycle(self.http, "ilink/bot/msg/notifystop", old_token, old_base)
@@ -691,6 +697,9 @@ class BotSession:
         # race an in-flight AI / send reply that is mid-_drain_batch.
         async with self._reconnect_lock, self._drain_lock:
             await self._apply_login(new_credentials)
+            # A session that was parked (no token when the switch started) has
+            # no long-poll yet — start it now that we finally hold credentials.
+            self._ensure_message_loop()
         log_reconnect.info(
             "qr_switch confirmed and applied bot_id=%s",
             bot_id_short,
@@ -872,6 +881,7 @@ class BotSession:
         self._relogin_task = asyncio.create_task(self._relogin_listener(), name=f"relogin-{self.session_id}")
         self._initializing = True
         already_applied = False
+        parked = False
         try:
             if self.bot_token:
                 result = {"bot_token": self.bot_token, "baseurl": self.baseurl,
@@ -920,6 +930,18 @@ class BotSession:
                             self._initial_cancel.clear()
                             result = await self._login()
                             already_applied = False
+                except RuntimeError as exc:
+                    # 2026-10-26：二维码窗口内没人扫码，**不能因此打死账号**。
+                    # login_with_qrcode 在 MAX_QR_REFRESH_COUNT(3) 次刷新后抛
+                    # RuntimeError；以前这个异常一路冒到 BotManager._bootstrap
+                    # → session.stop() → 账号从此没有会话（state 文件还在，
+                    # 但必须重新扫码才能回来，而且没人看得到那张二维码）。
+                    # 现在把会话 park 住：页面随时可以点「切换用户」重新拉
+                    # 二维码（解耦路径不碰 token，扫码确认后才原子换凭据）。
+                    parked = await self._park_awaiting_scan(exc)
+                    if not parked:
+                        raise
+                    result = {}
                 finally:
                     if "cancel_task" in locals() and not cancel_task.done():
                         cancel_task.cancel()
@@ -931,17 +953,77 @@ class BotSession:
         finally:
             self._initializing = False
             self._ready_event.set()
+        if parked:
+            # No credentials yet → no long-poll can run.  The session stays
+            # alive so the browser can re-arm the QR at any time; the message
+            # loop is started by _ensure_message_loop() once a scan lands.
+            self._started = True
+            await self._emit("started")
+            return self
         if not already_applied:
             await self._apply_login(result, initial=True)
         self._started = True
+        self._ensure_message_loop()
+        await self._emit("started")
+        return self
+
+    def _ensure_message_loop(self) -> None:
+        """（重新）拉起 getupdates 长轮询。
+
+        长轮询是 iLink 连接的保活手段，没有 token 时它跑不起来，所以只在拿到
+        凭据之后启动。幂等：已经在跑就直接返回 —— 这样「扫码确认后补启动」
+        和「start() 正常启动」可以共用同一个入口。
+        """
+        task = self._tasks.get("message")
+        if task is not None and not task.done():
+            return
         self._tasks["message"] = self._supervised("message", self._message_loop())
         # getupdates is the protocol keepalive.  A local wall-clock timer
         # must not force a user to scan a new QR while the token is valid.
         from bot import RECONNECT_CONFIG
-        if RECONNECT_CONFIG.get("proactive_relogin", False):
+        if RECONNECT_CONFIG.get("proactive_relogin", False) and "timer" not in self._tasks:
             self._tasks["timer"] = self._supervised("timer", self._timer_loop())
-        await self._emit("started")
-        return self
+
+    async def _park_awaiting_scan(self, reason: object) -> bool:
+        """二维码窗口内没人扫码 → 把会话停在「等待扫码」，而不是打死账号。
+
+        背景（2026-10-26 事故链的最后一环）::
+
+            iLink token 服务端过期(-14) → 清 token → 进二维码窗口
+              → 窗口内没人扫码 → login_with_qrcode 抛 MAX_QR_REFRESH_EXCEEDED
+              → start() 抛错 → BotManager._bootstrap 把会话从内存摘掉
+              → 账号从此没有会话（state 文件还在，但没人看得到那张二维码）
+
+        park 之后会话留在 manager 里：
+
+        - 页面随时可以点「切换用户」重新拉二维码（``request_relogin
+          ("web switch")`` 走解耦路径：不碰 token，扫码确认后才原子换凭据）；
+        - 扫码确认后 ``_await_qr_confirmation_and_swap`` 调用
+          ``_ensure_message_loop()`` 把长轮询拉起来；
+        - ``reauth_required=True`` 继续落盘 → 重启后仍会被复活。
+
+        返回 True 表示已经 park 住（调用方不要再往上抛）。
+        """
+        from bot import _redact_text
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        self._awaiting_scan = True
+        self._reauthentication_required = True
+        self.qr_state.status = "awaiting_scan"
+        self.qr_state.last_error = "二维码未扫描或已过期，请点击下方按钮重新生成"
+        self.qr_state.is_regenerating = False
+        try:
+            self.save_state()
+        except Exception as exc:  # 落盘失败不应该把会话打死
+            log_reconnect.warning("parked session state save failed err=%s",
+                                  _redact_text(exc))
+        log_reconnect.info(
+            "session parked awaiting scan sid=%s owner=%s reason=%s",
+            self.session_id,
+            (self.ilink_user_id or "-")[-12:],
+            _redact_text(reason),
+        )
+        return True
 
     def _supervised(self, name: str, awaitable: Awaitable[Any]) -> asyncio.Task:
         async def runner() -> None:

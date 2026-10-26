@@ -141,3 +141,73 @@ restored 1 session(s) waiting for a QR re-scan (no token): eph_edbaaf… — 该
       证据：模型缓存目录 mtime = 11:50:56，而 11:46:20 / 11:50:20 / 11:51:46
       三次 `State 'stop-sigterm' timed out. Killing.` 正好夹在这个下载窗口里。
 - [ ] iLink 2.4.6 没有心跳端点这件事本身没解 —— 见 §5。账号每隔一段时间就要人扫一次码。
+
+---
+
+## 7. 补充修复（2026-10-26 16:16）：二维码窗口过期 ≠ 账号被打死
+
+### 7.1 现象
+
+§4 的修复让「重启打断二维码窗口」不再永久打死账号，但暴露出**同一事故链的
+最后一环**（16:16 生产日志）：
+
+```
+15:28:08  login start refresh_count=1/3 deadline_in_s=480   ← 恢复路径出码
+15:30:09  qr expired, regenerating (#2)                     ← 没人扫
+15:32:11  qr expired, regenerating (#3)                     ← 没人扫
+15:34:11  login aborted refresh_count=3 reason=max_refresh_exceeded
+15:34:11  session.stop … reauth_required=True caller=start-…
+```
+
+`BotSession.start()` 在「二维码窗口内没人扫码」时抛 `RuntimeError`
+（`login_with_qrcode` 的 `MAX_QR_REFRESH_COUNT` 用尽）→ 异常一路冒到
+`BotManager._bootstrap` → **会话被从 manager 里摘掉**。
+
+后果：`reauth_required=True` 还在 state 文件里，但**没有任何活着的会话**，
+也没有任何浏览器绑定指向它（用户的绑定早过期，见 §3.2 顺带一提）——
+那张二维码**没有人看得见**。账号又一次变成「永久掉线」。
+
+### 7.2 修复：park 而不是 die
+
+| 位置 | 改动 |
+|---|---|
+| `bot_session.start` | 初始二维码失败（RuntimeError）→ `_park_awaiting_scan()`：**不再抛**，会话留在 manager 里，`qr_state.status="awaiting_scan"` |
+| `bot_session._park_awaiting_scan` | 置 `_awaiting_scan=True` / `_reauthentication_required=True` 并落盘；页面显示「二维码已过期，点击下方按钮重新生成」 |
+| `bot_session._ensure_message_loop` | 从 `start()` 抽出的幂等长轮询启动器 —— 扫码确认后补启动 |
+| `bot_session._await_qr_confirmation_and_swap` | 原子换凭据之后调用 `_ensure_message_loop()`：park 住的会话拿到 token 后**要真的开始收消息** |
+| `shared_web.INDEX_HTML` | 前端识别 `awaiting_scan`：隐藏过期二维码 + 按钮文案改成「重新生成二维码」 |
+
+于是恢复路径变成：
+
+```
+二维码窗口没人扫 → 会话 park（不死）→ 用户回到页面 → 点「重新生成二维码」
+  → request_relogin("web switch") 走解耦路径（不碰 token）
+  → 扫码确认 → _apply_login 原子换凭据 → _ensure_message_loop() 拉起长轮询
+```
+
+**关键点**：`_request_qr_switch` 本来就设计成「token 不动、QR 只是展示物、
+过期即 no-op」，所以它对「一个 token 都还没有的会话」同样成立 ——
+park 不需要引入新机制，只是把初始登录的失败从「致命」降级为「可重试」。
+
+### 7.3 测试
+
+- `tests/test_bot_session_contract.py::test_start_parks_session_when_qr_window_expires`
+- `tests/test_bot_session_contract.py::test_parked_session_starts_message_loop_after_scan`
+
+（49 pytest + 8 unittest 全过）
+
+### 7.4 仍然没解决的（协议限制 / 下一个坑）
+
+- 服务端 token 过期本身避免不了（§3.1）—— 账号每隔一段时间就要人扫一次码。
+- 恢复路径复活的 reauth 会话**可能没有任何浏览器绑定指向它**（绑定 TTL 8h，
+  恢复 cookie 30 天但会随绑定一起被 GC）。这种情况下那张二维码依然没人看得见，
+  用户只能重新走「扫码登录」建一个新会话 —— 能用，但账号的 `contexts` /
+  `get_updates_buf` 接不上（`account_changed` 会清空）。
+- **resume token 会随会话一起消失**（`shared_web.resume_existing` → 会话不在
+  manager 里就 `revoke_resume`）。而「重新扫码 = 换 session_id」，
+  所以任何一次会话替换（账号切换 / `_evict_same_account` / GC）都会让浏览器的
+  30 天恢复 cookie 失效，用户回到页面就变成「陌生人」，只能重新扫码。
+  治本做法是让 resume token **跟着账号（`ilink_user_id`）走**而不是跟着
+  session_id 走 —— 会话被替换时把 token 重新指向同账号的新会话。
+  本次事故里 `browser_sessions.json` 就只剩 1 条 binding / 1 条 resume，
+  `yg` 那条早就没了。

@@ -487,9 +487,10 @@ catch(e){document.querySelector('#error').textContent='拉取状态失败：'+e}
 function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function render(s){let st=document.querySelector('#status'),q=document.querySelector('#qr'),f=document.querySelector('#verify'),sw=document.querySelector('#switch');
  document.querySelector('#error').textContent=s.last_error||'';sw.style.display='inline-block';
+ sw.textContent=s.status==='awaiting_scan'?'重新生成二维码':'切换用户';
  if(s.status==='logged_in'){st.innerHTML='<span class=ok>登录成功 ✓</span>';q.innerHTML='✓';f.style.display='none';} else {
-   st.textContent=s.is_regenerating?'正在生成新二维码...':(s.status==='qr_pending'?'请用微信扫描下方二维码':(s.status==='scanned'?'已扫码，请在手机上确认...':s.status));
-   q.innerHTML=s.is_regenerating?'⟳':(s.has_qr_png?'<img alt=QR src="'+root+'/qrcode.png?v='+s.qr_seq+'">':'—');f.style.display=s.verify_prompt?'flex':'none';
+   st.textContent=s.is_regenerating?'正在生成新二维码...':(s.status==='qr_pending'?'请用微信扫描下方二维码':(s.status==='scanned'?'已扫码，请在手机上确认...':(s.status==='awaiting_scan'?'二维码已过期，点击下方按钮重新生成':s.status)));
+   q.innerHTML=s.is_regenerating?'⟳':(s.status==='awaiting_scan'?'—':(s.has_qr_png?'<img alt=QR src="'+root+'/qrcode.png?v='+s.qr_seq+'">':'—'));f.style.display=s.verify_prompt?'flex':'none';
  }
  renderKb(s);}
 function renderKb(s){
