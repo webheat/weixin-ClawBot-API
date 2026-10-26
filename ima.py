@@ -60,6 +60,18 @@ class ImaConfig:
     fetch_body: bool = False  # IMA_ILINK_FETCH_BODY=1 开启：search 后再调 get_doc_content 拿正文
     keyword_extract: bool = False  # IMA_ILINK_KEYWORD_EXTRACT=1 开启：search 前用 LLM 抽取 1-3 个关键词
 
+    def configured(self) -> bool:
+        """True iff client_id AND api_key are both non-empty.
+
+        Lives on the config (not only on :class:`ImaClient`) because callers
+        check "IMA 是否可用" *before* building a client — e.g.
+        ``shared_web._build_ima_client`` and the ``/BINDKB`` command.  When
+        this method only existed on ``ImaClient`` those call sites raised
+        ``AttributeError: 'ImaConfig' object has no attribute 'configured'``
+        and the whole web-UI binding path silently degraded to "IMA 未配置".
+        """
+        return bool(self.client_id and self.api_key)
+
     @classmethod
     def from_env(cls, env_files: Optional[Iterable[str]] = None) -> "ImaConfig":
         """Build config from a list of ``.env`` files + ``os.environ``.
@@ -361,7 +373,7 @@ class ImaClient:
 
     def configured(self) -> bool:
         """True iff client_id AND api_key are both non-empty (matches Go)."""
-        return bool(self.cfg.client_id and self.cfg.api_key)
+        return self.cfg.configured()
 
     def _post(self, endpoint: str, payload: dict) -> dict:
         """POST JSON to ``base_url/endpoint`` with the standard 5-retry ladder.

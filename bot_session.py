@@ -152,6 +152,11 @@ class BotSession:
         self._pending_qr_token: Optional[str] = None
         self._pending_qr_started_at: float = 0.0
         self._pending_qr_task: Optional[asyncio.Task] = None
+        # Outcome of the last decoupled QR switch.  ``_pending_qr_task`` is
+        # cleared as soon as the task finishes, so a caller that arrives
+        # *after* the switch completed (e.g. BotSession.start() waking up
+        # late) still needs to know whether a scan happened.
+        self._pending_qr_result: dict[str, Any] = {}
 
         self.ai = ai_client if ai_client is not None else self._make_ai(self.config)
 
@@ -534,10 +539,24 @@ class BotSession:
         qrcode = await self._initiate_qr_switch()
         self._pending_qr_token = qrcode
         self._pending_qr_started_at = time.time()
+        self._pending_qr_result = {}
         self._pending_qr_task = asyncio.create_task(
             self._run_qr_switch(qrcode),
             name=f"qr-switch-{self.session_id}",
         )
+        # An initial QR login may still be in flight (the user pressed
+        # "切换账号" before scanning the very first QR).  It MUST be
+        # cancelled *now* — once the switch task exists, so that
+        # BotSession.start() can find it via ``_pending_qr_task``.
+        #
+        # Without this, the initial flow keeps polling its own QR in
+        # parallel; once its MAX_QR_REFRESH_COUNT is exhausted,
+        # login_with_qrcode raises out of start() → session.stop → the
+        # token that the confirmed switch had already applied is thrown
+        # away and the iLink side is told to stop (notifystop).  That is
+        # exactly how the 2026-10-25 incident killed both sessions.
+        if self._initializing:
+            self._initial_cancel.set()
         await self._emit("qr_switch_started", reason=reason, qrcode=qrcode)
         return {"status": "qr_pending", "reason": reason, "qrcode": qrcode}
 
@@ -663,11 +682,15 @@ class BotSession:
         )
         return new_credentials
 
-    async def _run_qr_switch(self, qrcode: str) -> None:
+    async def _run_qr_switch(self, qrcode: str) -> dict[str, Any]:
         """Background task: poll the switch QR and apply on confirm.
 
-        Not retried on failure — user-driven relogin respects explicit user
-        cancellation, mirroring the ``request_relogin("web switch")`` /
+        Returns the new credentials when the QR was confirmed and applied
+        (the caller — :py:meth:`start` — uses this to learn that the
+        session ended up authenticated), or ``{}`` when the QR expired /
+        was not scanned / the poll failed.  Not retried on failure —
+        user-driven relogin respects explicit user cancellation, mirroring
+        the ``request_relogin("web switch")`` /
         # ``request_relogin("manual")`` no-retry invariant from
         ``docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5``.
         """
@@ -676,12 +699,15 @@ class BotSession:
         log_reconnect = get_logger("reconnect")
         deadline_s = int(RECONNECT_CONFIG.get("qrcode_scan_timeout", 480))
         try:
-            await self._await_qr_confirmation_and_swap(qrcode, deadline_s)
+            result = await self._await_qr_confirmation_and_swap(qrcode, deadline_s)
+            self._pending_qr_result = result or {}
+            return result or {}
         except asyncio.CancelledError:
             log_reconnect.info("qr_switch cancelled reason=task_cancelled")
             raise
         except Exception as exc:
             log_reconnect.warning("qr_switch background failed err=%s", exc)
+            return {}
         finally:
             # Clear pending state.  The current QR (if not confirmed) is dead
             # anyway; if the UI is still showing it, downgrade to error so
@@ -696,6 +722,51 @@ class BotSession:
                 self.qr_state.last_error = "二维码未扫描或已过期"
             self.qr_state.is_regenerating = False
             self._pending_qr_task = None
+
+    async def _await_qr_switch_result(self) -> dict[str, Any]:
+        """Wait for the in-flight decoupled QR switch to settle.
+
+        Used by :py:meth:`start` when the initial QR login was cancelled
+        by a user-driven switch.  The switch task applies the credentials
+        itself (see :py:meth:`_await_qr_confirmation_and_swap`), so this
+        helper only has to hand the outcome back:
+
+        - ``{"bot_token": ...}`` — the user scanned, the new credentials
+          are already applied;
+        - ``{}`` — the QR expired / was never scanned / the poll failed,
+          i.e. the session still has no usable credentials.
+
+        Never raises for a business failure (an expired QR is a normal
+        outcome, not an error) — only ``asyncio.CancelledError``.
+        """
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        while True:
+            task = self._pending_qr_task
+            if task is None:
+                # The switch already finished (its task is cleared in the
+                # ``finally`` block) — fall back to the recorded outcome.
+                log_reconnect.info(
+                    "qr_switch result already settled confirmed=%s",
+                    bool(self._pending_qr_result.get("bot_token")),
+                )
+                return dict(self._pending_qr_result or {})
+            try:
+                result = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # The switch task itself was cancelled (a newer switch
+                # superseded it) → follow the new one.  A cancellation of
+                # *this* coroutine leaves the inner task alive, so
+                # ``task.cancelled()`` is False and we re-raise.
+                if (task.cancelled()
+                        and self._pending_qr_task is not None
+                        and self._pending_qr_task is not task):
+                    continue
+                raise
+            except Exception as exc:
+                log_reconnect.warning("qr_switch failed err=%s", exc)
+                return {}
+            return result or {}
 
     async def _relogin_listener(self) -> None:
         while True:
@@ -810,10 +881,30 @@ class BotSession:
                     self._ready_event.set()
                     async with self._relogin_lock:
                         pending = self._pending_relogin
-                    if pending is None:
-                        raise RuntimeError("initial login cancelled without relogin request")
-                    result = await asyncio.shield(pending)
-                    already_applied = True
+                    if pending is not None:
+                        result = await asyncio.shield(pending)
+                        already_applied = True
+                    else:
+                        # Decoupled QR-switch path ("web switch" / "manual"):
+                        # the switch task owns the login now.  It applies the
+                        # new credentials itself, so we only wait for its
+                        # outcome.  If the user never scanned, the switch
+                        # expires without credentials — fall back to a fresh
+                        # initial QR login instead of leaving the session
+                        # dead (the pre-fix behaviour killed the session
+                        # here, taking the applied token down with it).
+                        result = await self._await_qr_switch_result()
+                        if result.get("bot_token"):
+                            already_applied = True
+                        else:
+                            from utils.logging_setup import get_logger
+                            get_logger("reconnect").info(
+                                "qr_switch expired without confirmation; "
+                                "falling back to initial login",
+                            )
+                            self._initial_cancel.clear()
+                            result = await self._login()
+                            already_applied = False
                 finally:
                     if "cancel_task" in locals() and not cancel_task.done():
                         cancel_task.cancel()

@@ -8,6 +8,8 @@ Python 3.12+ client that speaks Tencent's [OpenClaw Weixin](https://github.com/T
 
 ## Current state (read first)
 
+- **Fixed (2026-10-26) — 「切换账号」during 初始扫码 kills the session**. Root cause + full timeline: [`docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md`](docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md). User hit 「开始」then 「切换账号」**2 秒后**; the switch QR was scanned and applied (`qr_switch confirmed and applied`), but the **parallel** initial login kept polling its own unscanned QR → 3 expiries → `RuntimeError` out of `BotSession.start()` → `session.stop()` → the just-acquired token was thrown away (`session.stop ... had_token=True`). Fix: `_request_qr_switch` now sets `_initial_cancel` when `self._initializing` (kills the parallel initial login), and `start()` waits on `_await_qr_switch_result()` instead of dying; if the switch QR was never scanned it **falls back to a fresh initial login** instead of leaving a credential-less dead session. New attrs: `_pending_qr_result`. Tests: `test_switch_during_initial_login_keeps_applied_token` / `..._falls_back_when_qr_not_scanned` in `tests/test_bot_session_contract.py` (both fail pre-fix). **Invariant: a user-driven switch must never kill the session, and must never discard a token the switch already applied.**
+- **Fixed (2026-10-26) — `ImaConfig.configured()` was missing**. `configured()` existed only on `ImaClient`, but `shared_web.py:444` and `bot.py:2095` call it on an **`ImaConfig`** instance → `AttributeError`. `shared_web`'s call sits inside `try/except Exception`, so the whole web-UI KB-binding path silently degraded to 「IMA 未配置」. Fixed by moving `configured()` down to `ImaConfig` (`ImaClient.configured()` now forwards).
 - **New feature (2026-10-26) — 公众号发稿桥（多用户隔离）**. `/发贴图号 <kw>` / `/发公众号 <kw>` / `/发列表` / `/发状态` / `/选 N` / `/重发 <kw>` 由 `utils/xiaolvshu.py` 认领（自然语言/语音意图也认：动词 + 目标词都出现在开头 14 字才接管），转交 `/opt/obsidian-xiaolvshu/scripts/xiaolvshu_bridge.py` 子进程（stdout 一行 JSON）。**隔离键是 `from_user_id`（发消息的人），不是 `ilink_user_id`（登录的 bot 账号）** —— 共享 bot 的场景下这两者不同。每人独立 vault / 输出目录 / 发布台账 / 公众号凭据（`/etc/clawbot/xiaolvshu/<slug>.env`），桥拒跨 vault 路径（`cross_vault`）。只进草稿箱不群发。改这块先读 `/opt/obsidian-xiaolvshu/README.md` 的「ClawBot 桥」一节。
 - **Active incident (2026-09-16, ongoing) — bot `pid 2365525` alive but iLink dead ~5h**. User reports "暂时无法连接openclaw" (paraphrase of bot silence; literal string NOT in code — see `docs/knowledge/qa-*`). Caused by `POST /clawbot/switch` → 3 QR expired → `MAX_QR_REFRESH_COUNT` → `RuntimeError` → `bot_token=""` permanently (`bot_session.py:336-381` 清 token 后 QR 失败不留回滚). **No self-healing** — `request_relogin` is fire-and-forget (`bot_session.py:358-369`); `0bed146` 删了所有用户提醒. Recovery: Web UI 再点"切换账号" 或微信发 `/重新连接` + 扫一次码. Critical design finding: iLink 2.4.6 has **no heartbeat / keepalive endpoint** (`weixin-openclaw-api-py-docs.md:60-69` 全 8 个端点无 `/heartbeat` / `/ping` / `/refresh_token`); `-14` 是服务端 token 过期判断,客户端活动**不能延长**(`§2.7.3` 协议明确). "让用户无感"的真路径是 in-flight race lock + `_send_reliable` 失败保留 `pending`,**不是**周期性心跳. 完整时间线 / 恢复步骤 / 三方案对比见 [`docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md`](docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md).
 - **Recent cleanup (2026-09-15) — session-based single-process model**. `python bot.py` 默认进入 `shared_runtime.py`：一个 `BotManager` 管理 N 个隔离的 `BotSession`，共享一个 `aiohttp` 连接池和一个 `shared_web` 登录入口。访客进入 `/clawbot/` 拿到一个不透明的 URL-safe session token（铸造点 `shared_web.py:397`）—— 没有命名用户、没有 OAuth、没有 `--user` / `--legacy-single` / `--named-user` CLI。opaque cookie + CSRF + 限流 + TTL GC 是唯一入口。已删除：`qr_portal.py`、`utils/bot_launcher.py`、`utils/oauth_bindings.py`、`wechat_oauth.py`、`docs/WECHAT_OAUTH.md`、`docs/multi-user.md`、`docs/SESSION_BOT_LIFECYCLE.md`（旧 session-lifecycle 文档，2026-09-15 一并清理）。The user identifier that matters is `ilink_user_id` (WeChat-account-stable, only available after QR confirmation); the opaque token is just a session handle.
@@ -71,12 +73,17 @@ python bot.py
 # Debug-level protocol trace (writes clawbot.api DEBUG to logs/clawbot.log)
 CLAWBOT_LOG_LEVEL=DEBUG python bot.py 2>&1 | tee /tmp/debug.log
 
+# Contract tests (pytest for the session/manager/runtime contracts;
+# test_shared_web.py is a unittest module and must be run separately)
+./venv/bin/pytest tests/ --ignore=tests/test_shared_web.py -q
+./venv/bin/python -m unittest tests.test_shared_web
+
 # Build portable U盘 bundle (one-dir PyInstaller; ~105 MB; see docs/PORTABLE.md)
 ./venv/bin/pyinstaller weixin-clawbot.spec
 # Output: dist/weixin-clawbot/ — copy directory + .env to USB root
 ```
 
-There is no test suite, no linter config, and no `Makefile`. The `pyinstaller` and `cairosvg` entries in `requirements.txt` are optional. 5-line diagnosis grep recipes live in `README.md` — do not duplicate them here.
+There **is** a contract test suite (`tests/`, pytest + one unittest module) covering `BotSession` / `BotManager` / `shared_runtime` lifecycle invariants — run it before claiming a session-lifecycle change works. There is no linter config and no `Makefile`. The `pyinstaller` and `cairosvg` entries in `requirements.txt` are optional. 5-line diagnosis grep recipes live in `README.md` — do not duplicate them here.
 
 ## High-level architecture
 
@@ -179,6 +186,7 @@ sudo nginx -t && sudo systemctl reload nginx
 - **`get_updates_buf` is opaque**: store verbatim, forward verbatim. Only the iLink server can advance it.
 - **`context_token` must come from the inbound message** and is required by `sendmessage`. Token rotation across reconnect/reinstall is expected.
 - **Account switch (`ilink_bot_id` change) clears `get_updates_buf`, `contexts`, `last_contact`, and `welcomed_users`**. Same-account relogin preserves them.
+- **A user-driven QR switch must never kill the session, and must never discard a token it already applied.** The initial QR login and a decoupled switch are two independent login flows; if they overlap, the initial one must be cancelled (`_initial_cancel`) and `start()` must wait on the switch outcome — never let the initial flow's `RuntimeError` reach `session.stop()` with a live token. See [`docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md`](docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md).
 - **`ilink_user_id` is the stable identity for per-user IMA KB binding** — NOT `ilink_bot_id` (rotates per QR; see `docs/2026-09-15_IN_FLIGHT_RELOGIN_RACE.md:392-410` + commit `f298d82`) and NOT `from_user_id` (chat peer, not bot owner). Bindings live in `ima_bindings.json`, **not** inside `weixin_state_<session_token>.json` (the latter dies with the browser cookie and would break cross-device survival). Web UI `/ima/bind` always re-validates submitted `kb_id` against live `ImaClient.list_searchable_kbs()` to defeat client spoofing of `kb_name` / `kb_type`.
 - **Portal never leaks user list (privacy)**: 无 cookie 访客的页面**必须**是单一登录按钮（OAuth / start-session / 错误页），**不得**渲染任何用户、端口、env 文件路径、bot 状态。`/healthz` 只返 `{ok: True, login_mode: ...}` 不带 `users` 字段。proxy 502 fallback 不暴露 name/port/exception。`/select` 已删除（OAuth 模式下任何人 GET `/select?name=` 已知用户即拿到 cookie = 账号劫持；现在 cookie 只能由 `/oauth/cb` 或 `/clawbot/start` 设置）。
 - **First QR is fixed endpoint `BASE_URL = https://ilinkai.weixin.qq.com`**. After `scaned_but_redirect`, switch to the server-returned `baseurl`. This switch is one-way per session.
@@ -212,6 +220,7 @@ User-facing output (banners, menu, command echo) stays on `print` — don't move
 - `docs/IMA_WEB_UI.md` — three binding entry points (web UI + `/bindkb` command + CLI) + auth model + cross-device recovery flow.
 - `docs/IMA_PER_USER_BINDING_REVIEW.md` — outstanding review items from 2026-09-16 implementation; P0/P1/P2 checklist for the next reviewer.
 - `docs/FORWARDED_MESSAGES.md` — what `extract_message_text` reads from `item_list` (text / voice / ref_msg / app_msg / url), dedup strategy, 8-case smoke test patterns, URL is text-only (never fetched).
+- `docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md` — 2026-10-25 incident: 「切换账号」during 初始扫码 → parallel initial login raised `RuntimeError` → `session.stop()` discarded the applied token. Root cause, fix, new invariants, and grep recipes.
 - `docs/multi-user.md` — single-tenant limits, scenario A vs B, comparison with XTmai reference impl, recommended fixes (#2 broadcast, #3 gather, #4 retry) ranked by ROI.
 - `docs/PORTABLE.md` — PyInstaller `--onedir` build steps, USB layout, `noexec` mount workaround.
 - `docs/SESSION_2026-09-07_ima_pipeline.md` — chronological record of the IMA rewrite + 4 new knobs + KB bootstrap. **Read this before touching `_AIWithIma.chat`** — it documents the 3-state machine (`ima` / `local` / `llm_only`) and the reasons each knob exists.

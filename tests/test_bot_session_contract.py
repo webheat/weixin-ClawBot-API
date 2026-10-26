@@ -1360,3 +1360,186 @@ def test_ima_and_fallback_options_are_scoped_to_one_session() -> None:
     assert ai._ima.cfg.client_id == "client-a"
     assert ai._ima.cfg.search_limit == 7
     assert ai._env["CLAWBOT_LOCAL_KB_DIR"] == "kb-a"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-25 incident: "switch account" pressed while the FIRST QR login was
+# still pending must not kill the session, and must not throw away the token
+# the switch already applied.
+#
+# Log signature (logs/clawbot_shared.log.2026-10-25):
+#   18:41:57 POST /start  -> initial QR login starts
+#   18:41:59 POST /switch -> decoupled QR switch starts (2s later!)
+#   18:42:49 switch QR confirmed -> credentials applied
+#   18:48:00 initial QR expired x3 -> "login aborted refresh_count=3
+#           reason=max_refresh_exceeded" -> RuntimeError out of start()
+#           -> session.stop() + notifystop -> the applied token was lost.
+#
+# See docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md.
+# ---------------------------------------------------------------------------
+
+
+def _install_qr_race_doubles(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    switch_result: dict[str, Any],
+    init_polls: list[dict[str, Any]],
+) -> tuple[list[str], asyncio.Event]:
+    """Patch the iLink QR helpers so the two flows can be told apart.
+
+    The decoupled switch path calls ``fetch_login_qrcode(http)`` with **no**
+    ``local_token_list``; the initial login path calls
+    ``fetch_login_qrcode(session, local_token_list)`` with a list.  That
+    difference is what lets one fake serve both flows.
+    """
+    import bot as protocol
+
+    calls: list[str] = []
+    init_polling = asyncio.Event()
+
+    async def fake_fetch_login_qrcode(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if len(args) < 2 and kwargs.get("local_token_list") is None:
+            calls.append("fetch-switch")
+            return {"qrcode": "switch-qr", "qrcode_img_content": "switch-payload"}
+        calls.append("fetch-init")
+        return {"qrcode": "init-qr", "qrcode_img_content": "init-payload"}
+
+    async def fake_wait_login_confirmation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        qrcode = args[1] if len(args) > 1 else kwargs.get("qrcode")
+        if qrcode == "switch-qr":
+            calls.append("poll-switch")
+            return dict(switch_result)
+        calls.append("poll-init")
+        init_polling.set()
+        cancel_event = kwargs.get("cancel_event")
+        # Only the FIRST initial poll waits for the switch to cancel it; a
+        # later initial poll (the fallback login) must return right away.
+        if calls.count("poll-init") == 1 and cancel_event is not None:
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                # The initial login must be cancelled by the switch, not left
+                # to burn all MAX_QR_REFRESH_COUNT QR cycles.
+                return {"cancelled": True}
+        if init_polls:
+            return dict(init_polls.pop(0))
+        return {"expired": True}
+
+    async def fake_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(protocol, "fetch_login_qrcode", fake_fetch_login_qrcode)
+    monkeypatch.setattr(protocol, "wait_login_confirmation", fake_wait_login_confirmation)
+    monkeypatch.setattr(protocol, "notify_lifecycle", fake_notify)
+    return calls, init_polling
+
+
+def _idle_session(monkeypatch: pytest.MonkeyPatch, sess: Any) -> None:
+    """Keep the long-poll out of the way — this race is about login only."""
+
+    async def idle() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sess, "_message_loop", idle)
+    monkeypatch.setattr(sess, "_timer_loop", idle)
+
+
+@pytest.mark.asyncio
+async def test_switch_during_initial_login_keeps_applied_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A switch pressed during the first QR login must not kill the session.
+
+    Pre-fix this raised ``RuntimeError("二维码多次失效或登录失败")`` out of
+    ``start()`` after the initial login burned all three QR cycles, and the
+    session was stopped — taking the token the switch had just applied with
+    it.  Post-fix the initial login is cancelled as soon as the switch
+    starts, and ``start()`` waits for the switch outcome instead.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    _idle_session(monkeypatch, sess)
+
+    calls, init_polling = _install_qr_race_doubles(
+        monkeypatch,
+        switch_result={
+            "bot_token": "switch-token",
+            "baseurl": "https://switch.invalid",
+            "ilink_bot_id": "switch-bot-id",
+            "ilink_user_id": "owner@im.wechat",
+        },
+        init_polls=[],
+    )
+
+    start_task = asyncio.create_task(sess.start())
+    try:
+        # Wait until the initial QR login is actually polling its QR.
+        await asyncio.wait_for(init_polling.wait(), timeout=5)
+        switch = await sess.request_relogin("web switch")
+        assert switch["status"] == "qr_pending"
+        # Pre-fix this raised RuntimeError here.
+        await asyncio.wait_for(start_task, timeout=5)
+        # ``stop()`` resets ``_started``/``_stopped`` — snapshot first.
+        started, stopped = sess._started, sess._stopped
+        token, bot_id = sess.bot_token, sess.ilink_bot_id
+    finally:
+        await sess.stop()
+
+    assert started is True, "the session must survive the switch"
+    assert stopped is False
+    assert token == "switch-token", (
+        "the token applied by the confirmed switch must not be thrown away"
+    )
+    assert bot_id == "switch-bot-id"
+    # The initial login must be cancelled, not left to refresh its QR until
+    # MAX_QR_REFRESH_COUNT is exhausted (that was the incident).
+    assert calls.count("poll-init") == 1, (
+        f"initial QR login should be cancelled by the switch, got {calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_switch_during_initial_login_falls_back_when_qr_not_scanned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Switch QR never scanned -> fall back to a fresh initial QR login.
+
+    The switch is a display artifact: if the user does not scan it, the
+    session must still end up authenticated (via a new initial QR) instead
+    of dying with no credentials at all.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    _idle_session(monkeypatch, sess)
+
+    calls, init_polling = _install_qr_race_doubles(
+        monkeypatch,
+        switch_result={"expired": True},
+        # The second initial login (after the switch expired) is scanned.
+        init_polls=[
+            {
+                "bot_token": "initial-token",
+                "baseurl": "https://initial.invalid",
+                "ilink_bot_id": "initial-bot-id",
+                "ilink_user_id": "owner@im.wechat",
+            }
+        ],
+    )
+
+    start_task = asyncio.create_task(sess.start())
+    try:
+        await asyncio.wait_for(init_polling.wait(), timeout=5)
+        switch = await sess.request_relogin("web switch")
+        assert switch["status"] == "qr_pending"
+        await asyncio.wait_for(start_task, timeout=5)
+        started, stopped = sess._started, sess._stopped
+        token = sess.bot_token
+    finally:
+        await sess.stop()
+
+    assert started is True
+    assert stopped is False
+    assert token == "initial-token", (
+        "an unscanned switch QR must fall back to the initial QR login"
+    )
+    assert calls.count("poll-switch") == 1
