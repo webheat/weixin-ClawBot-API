@@ -133,5 +133,11 @@ restored 1 session(s) waiting for a QR re-scan (no token): eph_edbaaf… — 该
 - [ ] 浏览器绑定 8h TTL 对「只在微信里用、很少开网页」的用户偏短；
       建议配合 30 天的 resume cookie 一起看（本次修复已让 resume cookie 在
       会话复活后重新生效）。
-- [ ] 关机路径偶发 30s 超时被 SIGKILL（`State 'stop-sigterm' timed out`），
-      与本次事故同源：发版窗口打断了重连。值得查一下是什么在拖住退出。
+- [x] ~~关机路径偶发 30s 超时被 SIGKILL~~ —— 已定位并修复（commit `84327d8`）：
+      fastembed 默认把 91MB 模型缓存到 `/tmp/fastembed_cache`，reboot 即失效，
+      每次重启后第一次检索都要重新下载；而下载跑在 executor 线程里，
+      `loop.shutdown_default_executor()` 会等它 → 关机被拖过 30s → systemd SIGKILL。
+      现在缓存固定在 `<项目根>/.cache/fastembed`。
+      证据：模型缓存目录 mtime = 11:50:56，而 11:46:20 / 11:50:20 / 11:51:46
+      三次 `State 'stop-sigterm' timed out. Killing.` 正好夹在这个下载窗口里。
+- [ ] iLink 2.4.6 没有心跳端点这件事本身没解 —— 见 §5。账号每隔一段时间就要人扫一次码。
