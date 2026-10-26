@@ -1136,15 +1136,21 @@ class BotSession:
         text = extract_message_text(msg).strip()
         has_voice = is_voice_message(msg)
         voice_text = extract_voice_transcript(msg).strip() if has_voice else ""
+        # 每条入站消息都记一行：谁（from_user_id）、什么形态、多长、正文前 30 字。
+        # 生产路径以前只有语音分支记，文本消息只在 api DEBUG 行里露个头 —— 而
+        # 那行被 _redact_text 截到 500 字符，正文正好落在截断之外，等于没记。
+        # 遗留的 bot.py 一直有这行（生产不走那条路），这里补齐。
+        from bot import log_msg
+        log_msg.info(
+            "recv msg from=%s type=%s len=%d preview=%r",
+            from_id[-12:] if from_id else "-",
+            ("voice_transcript" if voice_text
+             else "voice_without_transcript" if has_voice
+             else "text"),
+            len(text),
+            (text or "")[:30],
+        )
         if has_voice:
-            from bot import log_msg
-            log_msg.info(
-                "recv msg from=%s type=%s len=%d preview=%r",
-                from_id[-8:] if from_id else "-",
-                "voice_transcript" if voice_text else "voice_without_transcript",
-                len(text),
-                text[:30],
-            )
             # A voice message gets either the LLM answer or the actionable
             # missing-transcript feedback.  It must not be prefixed with the
             # long first-contact welcome message.
@@ -1230,6 +1236,13 @@ class BotSession:
             except Exception as exc:  # noqa: BLE001
                 xreply = f"❌ 发布链路出错：{type(exc).__name__}: {exc}"
             if xreply is not None:
+                # 发稿归属全靠 from_user_id（桥的 --user 参数 = 这个值），
+                # 所以这里把**完整** uid 记下来 —— 管理员要照着它填 .env 的
+                # XIAOLVSHU_USER_<uid净化>_ 三元组。
+                log_msg.info(
+                    "xiaolvshu user=%s cmd=%r reply_len=%d",
+                    from_id, text[:60], len(xreply or ""),
+                )
                 await self._send_reliable(
                     msg, from_id, context, xreply, "xiaolvshu"
                 )
