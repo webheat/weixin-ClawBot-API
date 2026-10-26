@@ -229,6 +229,21 @@ def _envelope_error(data: dict) -> Optional[str]:
     return f"ima api error: code={code} message={msg}"
 
 
+# ima 的永久性错误码：重试不会变好，必须立刻放弃去 fallback。
+# 220004 = knowledge_base_id 失效或格式不对；220001 = appKey 无效。
+_IMA_PERMANENT_CODES = {220001, 220002, 220004}
+
+
+def _is_permanent_ima_error(data: dict) -> bool:
+    """判断这个信封错误是不是「重试也没用」的那类。"""
+    code = data.get("code") or data.get("errcode") or data.get("ret") or 0
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return False
+    return code in _IMA_PERMANENT_CODES
+
+
 def _unwrap_envelope(data: dict) -> dict:
     """Tencent ima wraps successful payloads in ``{"code": 0, "data": {...}}``.
 
@@ -416,6 +431,14 @@ class ImaClient:
                 log_ima.error("ima POST %s attempt=%d envelope err=%s",
                               endpoint, attempt_idx + 1, err)
                 last_exc = ImaError(err)
+                # 永久性错误重试没有意义 —— 越等越久，用户那边早就放弃了。
+                # 220004 = knowledge_base_id 失效（个人库调 search_knowledge
+                # 必回），220001 = appKey 无效。原先这两种也走满 6 次重试，
+                # 白等 63 秒才 fallback —— 表现就是「bot 不理人」。
+                if _is_permanent_ima_error(data):
+                    log_ima.warning(
+                        "ima POST %s permanent error, skip retries: %s", endpoint, err)
+                    raise last_exc
                 continue
             log_ima.debug("ima POST %s attempt=%d ok elapsed_ms=%.0f",
                           endpoint, attempt_idx + 1, elapsed_ms)

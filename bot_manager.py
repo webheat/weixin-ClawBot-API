@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from typing import Any, Callable, Optional
 
@@ -11,6 +12,8 @@ import aiohttp
 
 from bot_session import BotSession
 from utils.logging_setup import USER_LOG_CONTEXT
+
+log = logging.getLogger("clawbot.bot_manager")
 
 
 class BotManager:
@@ -51,12 +54,21 @@ class BotManager:
                 async def managed_event(event: str, emitted_session: BotSession,
                                         payload: dict[str, Any]) -> None:
                     if event == "task_failed":
+                        # 必须记日志：否则后台任务一死，会话被 evict，
+                        # 症状只是「bot 不理人了」，看不出真正原因。
+                        log.warning("session task failed sid=%s task=%s err=%s",
+                                    key, payload.get("task"), payload.get("error"))
                         task = asyncio.create_task(
                             self._evict_failed(key, emitted_session),
                             name=f"evict-failed-{key}",
                         )
                         self._maintenance.add(task)
                         task.add_done_callback(self._maintenance_done)
+                    if event == "logged_in":
+                        # 同一微信账号只留一个会话。扫码会拿到新 token，旧会话
+                        # 若还在轮询，两个 bot 抢同一个账号的消息流 —— 用户看到
+                        # 的就是「有时候没人回」。
+                        await self._evict_same_account(key, emitted_session)
                     if external_on_event is not None:
                         result = external_on_event(event, emitted_session, payload)
                         if inspect.isawaitable(result):
@@ -169,3 +181,19 @@ class BotManager:
         session = self.get(session_id)
         if session is not None:
             session.last_used_at = time.time()
+
+    async def _evict_same_account(self, keep_key: str, keep_session: Any) -> None:
+        """踢掉与 ``keep_session`` 同一个微信账号的其它会话。
+
+        判据是 ``ilink_user_id``（微信账号稳定 ID），不是 session_id ——
+        重新扫码会得到新的 session_id，但账号还是同一个。
+        """
+        uid = str(getattr(keep_session, "ilink_user_id", "") or "")
+        if not uid:
+            return
+        for other_key, other in list(self.sessions.items()):
+            if other_key == keep_key:
+                continue
+            if str(getattr(other, "ilink_user_id", "") or "") != uid:
+                continue
+            await self.stop(other_key)

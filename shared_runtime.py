@@ -223,6 +223,45 @@ async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
+async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfig",
+                                      session_config: Mapping[str, Any]) -> list[str]:
+    """启动时把「有 token 的会话」重新拉起来 —— 重启不掉线。
+
+    会话默认只活在内存里：进程一重启，浏览器手里的 cookie 就指不到任何会话，
+    页面报「无法连接」，用户只能重新扫码。可 `weixin_state_<sid>.json` 里明明
+    存着 ``bot_token``，而 ``BotSession.start()`` 见到 token 会跳过扫码直接
+    续用（bot_session.py:866-870）。所以这里扫一遍 state 目录，把还带着
+    token 的会话重新建起来。
+
+    token 过期（服务端 -14）时，会话自己走重连流程，页面出二维码 —— 那种情况
+    仍然要人扫一次，但那是服务端真的收回了授权，不是本地重启。
+    """
+    restored: list[str] = []
+    state_dir = Path(runtime.state_dir)
+    if not state_dir.is_dir():
+        return restored
+    for path in sorted(state_dir.glob("weixin_state_*.json")):
+        session_id = path.name[len("weixin_state_"):-len(".json")]
+        if not session_id:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not str(data.get("bot_token") or "").strip():
+            continue  # 没登录过 / 已清 token
+        try:
+            await manager.create_background(session_id, config=dict(session_config))
+        except Exception as exc:  # noqa: BLE001 —— 一个会话起不来不能拖垮整个进程
+            log.warning("session restore failed sid=%s err=%s", session_id, exc)
+            continue
+        restored.append(session_id)
+    if restored:
+        log.info("restored %d persisted session(s): %s",
+                 len(restored), ", ".join(restored))
+    return restored
+
+
 async def run_shared(
     config: SharedRuntimeConfig | Mapping[str, Any] | None = None,
     *,
@@ -290,17 +329,29 @@ async def run_shared(
             "rate_window": runtime.rate_window,
             "cookie_secure": runtime.cookie_secure,
             "trust_proxy": runtime.trust_proxy,
+            # cookie→会话绑定落盘：进程重启后浏览器还能接回原来的会话
+            "browser_store_path": str(Path(runtime.state_dir) / "browser_sessions.json"),
             "session_config": {
                 **copy.deepcopy(default_cfg),
                 "state_dir": str(runtime.state_dir),
             },
         }
         app = build_web_app(manager, prefix=runtime.prefix, config=web_config)
+        session_config = web_config["session_config"]
+    else:
+        # 外部注入的 app（测试用）：不猜它的 state_dir，直接跳过会话恢复
+        session_config = None
     runner = web.AppRunner(app)
     try:
         await runner.setup()
         site = web.TCPSite(runner, runtime.host, runtime.port)
         await site.start()
+        # 重启后把还带着 token 的会话续上，别让用户重新扫码
+        if session_config:
+            try:
+                await _restore_persisted_sessions(manager, runtime, session_config)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("session restore pass failed: %s", exc)
         await (stop_event or asyncio.Event()).wait()
     finally:
         stop_all = getattr(manager, "stop_all", None)

@@ -115,8 +115,31 @@ python bot.py
 | `/help` 或 `/指令` | 查看指令列表 |
 | `/time` | 查询当前连接状态 |
 | `/重新连接` | 请求立即重连，随后回复 `Y` 或 `N` |
+| `/发贴图号 关键词` | 出图并推进贴图号（newspic）草稿箱 |
+| `/发公众号 关键词` | 排版并推进图文（news）草稿箱 |
+| `/发列表` / `/发状态` | 看自己能发什么 / 最近发过什么 |
+| `/选 N` / `/重发 关键词` | 多命中时选一篇 / 同一篇重推 |
 
 文字和 iLink 提供的语音转写内容会走同一条命令/AI 路由。图片、文件等暂不支持的媒体会被忽略；语音没有转写文本时会提示用户重试或使用微信“转文字”，不会发送无效的能力说明。
+
+### 发稿桥（多用户隔离）
+
+`/发*` 指令由 `utils/xiaolvshu.py` 认领，转交给
+`/opt/obsidian-xiaolvshu/scripts/xiaolvshu_bridge.py`（子进程，stdout 一行 JSON）。
+
+隔离键是**发消息的人**（`from_user_id`），不是登录的 bot 账号：
+
+| 东西 | 位置 |
+|---|---|
+| vault | `/opt/clawbot-xiaolvshu/users/<slug>/vault` |
+| 输出 / 台账 | `<home>/out/` / `<home>/ledger.json` |
+| 公众号凭据 | `/etc/clawbot/xiaolvshu/<slug>.env`（600） |
+
+桥那边拒绝跨 vault 的笔记路径（`cross_vault`）。发布只进**草稿箱**，
+不群发 —— 人工在后台核对后再发表。
+
+配置在 `.env`：`XIAOLVSHU_BRIDGE` / `XIAOLVSHU_PYTHON` / `XIAOLVSHU_TIMEOUT`
+/ `XIAOLVSHU_STORE` / `XIAOLVSHU_CREDS_DIR`。
 
 ## 自动重连
 

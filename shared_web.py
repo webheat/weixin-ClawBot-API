@@ -27,6 +27,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from html import escape
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from aiohttp import web
@@ -59,10 +60,16 @@ class BrowserSessions:
     portable between independent bot processes.  Deployments with multiple
     web workers should route all requests to the shared process or provide a
     store with the same interface backed by a protected server-side database.
+
+    ``path`` 可选：给了就把绑定和 resume token 落盘。**这不是**为了让 cookie
+    跨进程流通（cookie 本身仍是进程内的能力），而是为了**重启不掉线** ——
+    进程重启后浏览器还拿着旧 cookie，若绑定不落盘，`resolve()` 直接
+    `session_not_found`，用户就得重新扫码。落盘后重启能接上原来的会话。
     """
 
     def __init__(self, ttl: float = DEFAULT_SESSION_TTL,
-                 resume_ttl: float = DEFAULT_RESUME_TTL):
+                 resume_ttl: float = DEFAULT_RESUME_TTL,
+                 path: Optional[str] = None):
         self.ttl = max(0.01, float(ttl))
         self.resume_ttl = max(self.ttl, float(resume_ttl))
         self._bindings: dict[str, BrowserBinding] = {}
@@ -71,6 +78,76 @@ class BrowserSessions:
         # valid only while the background session still exists.
         self._resume_tokens: dict[str, tuple[str, float]] = {}
         self._lock = asyncio.Lock()
+        self._path = Path(path) if path else None
+        self._last_saved = 0.0
+        self._load()
+
+    # ── 落盘 ──────────────────────────────────────────────────────────────
+    def _load(self) -> None:
+        if not self._path or not self._path.exists():
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        now = time.time()
+        for sid, b in (data.get("bindings") or {}).items():
+            try:
+                self._bindings[str(sid)] = BrowserBinding(
+                    session_id=str(b["session_id"]),
+                    created_at=float(b.get("created_at", now)),
+                    last_used_at=float(b.get("last_used_at", now)),
+                    transient=bool(b.get("transient", True)),
+                    csrf_token=str(b.get("csrf_token", "")),
+                    last_switch_at=float(b.get("last_switch_at", 0.0)),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        for token, rec in (data.get("resume_tokens") or {}).items():
+            try:
+                self._resume_tokens[str(token)] = (str(rec[0]), float(rec[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        log.info("browser sessions restored from %s bindings=%d resume=%d",
+                 self._path, len(self._bindings), len(self._resume_tokens))
+
+    def _save(self) -> None:
+        if not self._path:
+            return
+        data = {
+            "bindings": {
+                sid: {
+                    "session_id": b.session_id,
+                    "created_at": b.created_at,
+                    "last_used_at": b.last_used_at,
+                    "transient": b.transient,
+                    "csrf_token": b.csrf_token,
+                    "last_switch_at": b.last_switch_at,
+                }
+                for sid, b in self._bindings.items()
+            },
+            "resume_tokens": {
+                token: [sid, expires_at]
+                for token, (sid, expires_at) in self._resume_tokens.items()
+            },
+        }
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(self._path)
+            self._last_saved = time.time()
+        except OSError as exc:
+            log.warning("browser session persist failed path=%s err=%s",
+                        self._path, exc)
+
+    def _maybe_save(self, force: bool = False) -> None:
+        """节流落盘：resolve() 每个请求都会调，不能每次都写文件。"""
+        if not self._path:
+            return
+        now = time.time()
+        if force or now - self._last_saved >= 60:
+            self._save()
 
     async def bind(self, session_id: str, *, transient: bool = True) -> str:
         now = time.time()
@@ -79,6 +156,7 @@ class BrowserSessions:
             self._bindings[sid] = BrowserBinding(
                 session_id, now, now, transient, csrf_token=secrets.token_urlsafe(32)
             )
+            self._save()
         return sid
 
     async def resolve(self, sid: Optional[str]) -> Optional[BrowserBinding]:
@@ -93,18 +171,22 @@ class BrowserSessions:
                 # Keep it until expire() can return the user id for cleanup.
                 return None
             binding.last_used_at = now
+            self._maybe_save()
             return binding
 
     async def remove(self, sid: Optional[str]) -> Optional[BrowserBinding]:
         if not sid:
             return None
         async with self._lock:
-            return self._bindings.pop(sid, None)
+            binding = self._bindings.pop(sid, None)
+            self._save()
+            return binding
 
     async def issue_resume(self, session_id: str) -> str:
         token = secrets.token_urlsafe(32)
         async with self._lock:
             self._resume_tokens[token] = (str(session_id), time.time() + self.resume_ttl)
+            self._save()
         return token
 
     async def resolve_resume(self, token: Optional[str]) -> Optional[str]:
@@ -117,6 +199,7 @@ class BrowserSessions:
             session_id, expires_at = record
             if time.time() >= expires_at:
                 self._resume_tokens.pop(token, None)
+                self._save()
                 return None
             return session_id
 
@@ -126,6 +209,7 @@ class BrowserSessions:
             for token, record in list(self._resume_tokens.items()):
                 if record[0] == key:
                     self._resume_tokens.pop(token, None)
+            self._save()
 
     async def snapshot(self) -> list[tuple[str, BrowserBinding]]:
         async with self._lock:
@@ -509,6 +593,7 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
     store = sessions or BrowserSessions(
         cfg.get("session_ttl", DEFAULT_SESSION_TTL),
         cfg.get("resume_ttl", DEFAULT_RESUME_TTL),
+        path=cfg.get("browser_store_path") or None,
     )
     limiter = SlidingRateLimiter(cfg.get("rate_limit", DEFAULT_RATE_LIMIT),
                                  cfg.get("rate_window", DEFAULT_RATE_WINDOW),

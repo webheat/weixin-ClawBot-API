@@ -995,6 +995,26 @@ class BotSession:
                 "reconnect-prompt",
             )
             return
+        # 发布类消息（贴图号 / 图文 → 公众号草稿箱）走 xiaolvshu 桥。
+        #
+        # 桥那边按 from_id 隔离：每个人的 vault、输出目录、公众号凭据都是自己的。
+        # 语音转写走的是同一条路径 —— 说完「发贴图号 沉香」和打字没区别。
+        #
+        # 认领失败（不是发布意图）返回 None，照常落回 AI 对话。
+        try:
+            from utils.xiaolvshu import handle as xiaolvshu_handle
+        except Exception:  # noqa: BLE001 —— 桥模块坏了不能拖垮聊天
+            xiaolvshu_handle = None
+        if xiaolvshu_handle is not None:
+            try:
+                xreply = await xiaolvshu_handle(text, from_id)
+            except Exception as exc:  # noqa: BLE001
+                xreply = f"❌ 发布链路出错：{type(exc).__name__}: {exc}"
+            if xreply is not None:
+                await self._send_reliable(
+                    msg, from_id, context, xreply, "xiaolvshu"
+                )
+                return
         ticket = await get_typing_ticket_safe(self.http, from_id, context,
                                               self.typing_ticket_cache,
                                               self._token_ref, self._base_url_ref)
