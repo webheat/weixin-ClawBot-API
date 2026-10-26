@@ -1769,3 +1769,124 @@ async def test_parked_session_starts_message_loop_after_scan(
     assert token == "fresh-token", "扫码确认后必须换上新凭据"
     assert awaiting is False
     assert status == "logged_in"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26：账号连续性 —— 新会话继承「待重新扫码」的旧状态
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_new_session_adopts_pending_account_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """新会话扫码登录到某账号 → 继承那个账号待重新扫码的旧状态。
+
+    场景：账号 A 的会话因 token 过期掉线（state 里 reauth_required=True），
+    用户重新扫码时用的是**新会话**（老会话那张二维码没人看得见）。新会话
+    是空的 —— 不继承的话账号的 contexts / 游标就丢了，用户觉得「机器人
+    失忆了」。
+    """
+    uid = "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat"
+    old_state = tmp_path / "weixin_state_old.json"
+    old_state.write_text(json.dumps({
+        "bot_token": "",
+        "ilink_user_id": uid,
+        "reauth_required": True,
+        "contexts": {"peer@im.wechat": "ctx-token"},
+        "get_updates_buf": "cursor-old",
+        "last_contact": {"from_id": "peer@im.wechat", "context_token": "ctx-token"},
+    }), encoding="utf-8")
+
+    sess = _make_session(monkeypatch, "new",
+                         state_file=tmp_path / "weixin_state_new.json")
+    sess.ilink_user_id = uid
+
+    import bot as protocol
+
+    async def noop_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(protocol, "notify_lifecycle", noop_notify)
+
+    try:
+        await sess._apply_login({
+            "bot_token": "new-token",
+            "baseurl": "https://new.invalid",
+            "ilink_bot_id": "new-bot-id",
+            "ilink_user_id": uid,
+        })
+        contexts = dict(sess.contexts)
+        cursor = sess.runtime_state.get("get_updates_buf")
+        welcomed = set(sess.welcomed_users)
+    finally:
+        await sess.stop()
+
+    assert contexts == {"peer@im.wechat": "ctx-token"}, "账号的聊天对端状态要接过来"
+    assert cursor == "cursor-old", "游标要接过来（从断点续，不然漏消息）"
+    assert "peer@im.wechat" in welcomed, "接过来的人不该再收一次欢迎语"
+
+    # 源文件不再标「待重新扫码」→ 下次重启不复活它（省掉白烧的二维码窗口）
+    persisted = json.loads(old_state.read_text(encoding="utf-8"))
+    assert persisted["reauth_required"] is False
+    assert persisted["contexts"] == {"peer@im.wechat": "ctx-token"}, (
+        "源文件的账号状态不能被清掉 —— 那是唯一的副本"
+    )
+
+
+@pytest.mark.asyncio
+async def test_adoption_skipped_when_session_already_has_cursor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """会话自己已经有游标（老会话原地重连）→ 不继承，别把游标倒回去。"""
+    uid = "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat"
+    old_state = tmp_path / "weixin_state_old.json"
+    old_state.write_text(json.dumps({
+        "bot_token": "", "ilink_user_id": uid, "reauth_required": True,
+        "contexts": {"peer@im.wechat": "ctx-token"},
+        "get_updates_buf": "cursor-old",
+    }), encoding="utf-8")
+
+    sess = _make_session(monkeypatch, "self",
+                         state_file=tmp_path / "weixin_state_self.json")
+    sess.ilink_user_id = uid
+    sess.runtime_state["get_updates_buf"] = "cursor-mine"
+
+    try:
+        await sess._adopt_pending_account_state()
+        cursor = sess.runtime_state.get("get_updates_buf")
+        contexts = dict(sess.contexts)
+    finally:
+        await sess.stop()
+
+    assert cursor == "cursor-mine", "不能把别人的旧游标倒回来"
+    assert contexts == {}, "有游标的会话不继承上下文"
+
+
+@pytest.mark.asyncio
+async def test_adoption_ignores_other_accounts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """别人的待重新扫码状态不能被继承。"""
+    other = tmp_path / "weixin_state_other.json"
+    other.write_text(json.dumps({
+        "bot_token": "", "ilink_user_id": "someone-else@im.wechat",
+        "reauth_required": True,
+        "contexts": {"peer@im.wechat": "ctx"},
+        "get_updates_buf": "cursor-other",
+    }), encoding="utf-8")
+
+    sess = _make_session(monkeypatch, "mine",
+                         state_file=tmp_path / "weixin_state_mine.json")
+    sess.ilink_user_id = "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat"
+
+    try:
+        await sess._adopt_pending_account_state()
+        contexts = dict(sess.contexts)
+        cursor = sess.runtime_state.get("get_updates_buf")
+    finally:
+        await sess.stop()
+
+    assert contexts == {}
+    assert cursor == ""
+    assert json.loads(other.read_text(encoding="utf-8"))["reauth_required"] is True

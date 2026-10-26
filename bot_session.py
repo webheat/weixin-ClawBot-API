@@ -355,6 +355,104 @@ class BotSession:
                     "apply_login binding lookup skipped err=%s", exc
                 )
         await self._emit("logged_in", account_changed=account_changed)
+        # 同账号「待重新扫码」的旧会话留下的状态 → 继承过来（账号连续性）。
+        # 放在 emit 之后：emit 会让 BotManager 把同账号的旧会话驱逐掉
+        # （_evict_same_account），旧会话 stop() 时会把自己的 state 写回去，
+        # 继承必须读那一份最新的。
+        await self._adopt_pending_account_state()
+
+    async def _adopt_pending_account_state(self) -> None:
+        """同账号「待重新扫码」的旧会话留下的状态 —— 继承过来。
+
+        场景（2026-10-26 事故链）：账号 A 的会话因为 iLink token 服务端过期
+        掉线，state 文件里留下 ``reauth_required=True``。用户重新扫码时用的
+        可能是**新会话**（浏览器绑定早过期了，老会话那张二维码没人看得见）。
+        新会话是空的 —— 账号的 contexts / 游标就丢了，用户觉得「机器人失忆了」。
+
+        继承这些：
+
+        - ``contexts`` —— 每个聊天对端的状态（顺带 ``welcomed_users``，别再
+          重复发欢迎语）
+        - ``get_updates_buf`` —— **已提交**的游标，从断点续；没提交的那批
+          服务端会重新推（`_drain_batch` 只在全部成功后才推进游标），所以
+          ``pending_messages`` 不用继承（旧的 context_token 早就过期了）
+        - ``last_contact`` —— 最近一次是谁在说话
+
+        继承完把源文件标记成「不再待扫码」→ 下次重启不会再复活它（省掉
+        每次重启都白烧一轮二维码）。
+        """
+        from utils.logging_setup import get_logger
+        log_state = get_logger("state")
+        uid = str(self.ilink_user_id or "").strip()
+        if not uid:
+            return
+        if str(self.runtime_state.get("get_updates_buf") or "").strip():
+            return  # 自己已经有游标了 → 不是新会话，别动
+        state_dir = self.state_file.parent
+        best: Optional[tuple[float, Path, dict]] = None
+        try:
+            candidates = sorted(state_dir.glob("weixin_state_*.json"))
+        except OSError:
+            return
+        for path in candidates:
+            if path == self.state_file:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if str(data.get("ilink_user_id") or "").strip() != uid:
+                continue
+            if not data.get("reauth_required"):
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            if best is None or mtime > best[0]:
+                best = (mtime, path, data)
+        if best is None:
+            return
+        _mtime, path, data = best
+        contexts = data.get("contexts")
+        adopted_contexts = 0
+        if not self.contexts and isinstance(contexts, dict) and contexts:
+            self.contexts = {str(k): str(v) for k, v in contexts.items()}
+            self.welcomed_users = set(self.contexts)
+            adopted_contexts = len(self.contexts)
+        cursor = str(data.get("get_updates_buf") or "").strip()
+        if cursor:
+            self.runtime_state["get_updates_buf"] = cursor
+        contact = data.get("last_contact")
+        if isinstance(contact, dict) and contact.get("from_id"):
+            self.last_contact = {
+                "from_id": contact.get("from_id"),
+                "context_token": contact.get("context_token"),
+            }
+        self.runtime_state["contexts"] = dict(self.contexts)
+        self.runtime_state["last_contact"] = dict(self.last_contact)
+        self.save_state()
+        # 源文件标记成「不再待扫码」→ 下次重启不复活它
+        try:
+            data["reauth_required"] = False
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            try:
+                tmp.chmod(0o600)
+            except OSError:
+                pass
+            tmp.replace(path)
+        except OSError as exc:
+            log_state.warning("adopt clear reauth flag failed path=%s err=%s",
+                              path, exc)
+        log_state.info(
+            "adopted pending account state uid=%s from=%s contexts=%d cursor_len=%d",
+            uid[-12:], path.name[len("weixin_state_"):-len(".json")],
+            adopted_contexts, len(cursor),
+        )
 
     async def _login(self, *, reconnect: bool = False) -> dict[str, Any]:
         from bot import login_with_qrcode

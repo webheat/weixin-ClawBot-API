@@ -604,6 +604,9 @@ def build_web_app(manager: Any, *, prefix: str = DEFAULT_PREFIX,
     pending_creates = 0
     pending_sessions: dict[str, asyncio.Task] = {}
     app = web.Application(middlewares=[_web_request_log_middleware])
+    # 把 store 挂到 app 上：恢复路径要靠它判断「这个会话有没有浏览器能到达」
+    # —— 没人能到达的会话复活了也没人看得见它那张二维码（2026-10-26 事故）。
+    app["browser_store"] = store
     app["manager"] = manager
     app["browser_sessions"] = store
 

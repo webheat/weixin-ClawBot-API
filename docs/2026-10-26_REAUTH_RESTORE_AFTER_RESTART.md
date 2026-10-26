@@ -211,3 +211,95 @@ park 不需要引入新机制，只是把初始登录的失败从「致命」降
   session_id 走 —— 会话被替换时把 token 重新指向同账号的新会话。
   本次事故里 `browser_sessions.json` 就只剩 1 条 binding / 1 条 resume，
   `yg` 那条早就没了。
+
+---
+
+## 8. 补充修复（2026-10-26 20:14）：「没人看得见的二维码」+ 账号连续性
+
+### 8.1 现象
+
+§7 修完「会话不再被打死」之后，2026-10-26 16:39 又出了一次同样的症状
+（用户侧「暂时无法连接openclaw」）。查下来是：
+
+```
+16:30:16  会话 PMUDZjjw 扫码成功 → 登录为 yg（同账号的旧会话被驱逐）
+16:38:50  有人在页面点了「切换账号」→ 发了张新二维码
+16:39:05  那张码被【另一个微信号】扫了 → 会话原子换成 E_0o
+          ⇒ 从这一刻起 yg 这个 bot 账号没有任何会话
+```
+
+于是 yg 账号每次重启都会被「恢复路径」复活 + 发一张二维码 —— **但没有任何
+浏览器绑定 / resume token 指向那个会话**（绑定 TTL 8h，早过期了），**那张码
+没人看得见**。恢复路径白烧一轮 8 分钟的二维码窗口，然后 park 住等人看不见。
+
+**结论：不是代码坏了，是「账号掉线」和「会话能被别人找到」这两件事被混在
+一起了。** 恢复路径要复活的是「账号」，而它复活的却是「一个没人找得到的
+会话」。
+
+### 8.2 修法一：不复活没人能到达的会话
+
+`shared_runtime._restore_persisted_sessions()` 现在多带一个 `store` 参数
+（`shared_web.build_web_app` 把 `BrowserSessions` 挂在 `app["browser_store"]`
+上）。带 token 的会话**一律复活**（它自己能收消息，跟浏览器在不在无关）；
+只标了 `reauth_required` 的会话，要先问一句「有没有浏览器能到达它」：
+
+- 有绑定 → 复活（页面能看见那张二维码 —— §4 的修复原样保留）；
+- 只有 resume token 也算（30 天 cookie，用户回来能自动接回）；
+- 都没有 → **不复活**，但 **state 文件留着**（见下一节）。
+
+### 8.3 修法二：账号连续性（新会话继承旧状态）
+
+不复活 ≠ 丢账号。旧会话的 state 文件里还留着账号的 `contexts` / 游标 /
+`last_contact`。用户重新扫码时用的往往是**新会话**（老会话没人看得见），
+新会话是空的 —— 不继承的话用户会觉得「机器人失忆了」。
+
+`BotSession._adopt_pending_account_state()`（在 `_apply_login` 里、发出
+`logged_in` 事件**之后**调用 —— 事件会让 `BotManager._evict_same_account`
+把同账号的旧会话驱逐掉，旧会话 `stop()` 时会把自己的 state 写回去，继承
+必须读那一份最新的）继承：
+
+| 继承 | 不继承 | 原因 |
+|---|---|---|
+| `contexts`（每个聊天对端的状态）| `pending_messages` | 旧的 `context_token` 早过期了；而且没提交的那批服务端会重新推（`_drain_batch` 只在全部成功后推进游标）|
+| `get_updates_buf`（**已提交**的游标）| | 从断点续，否则漏消息 |
+| `last_contact` | | 最近一次是谁在说话 |
+
+继承完把源文件的 `reauth_required` 改回 False → **下次重启不会再复活它**
+（白烧的二维码窗口到此为止）。
+
+守卫：
+
+- 会话自己已经有游标 → 不继承（那是老会话原地重连，不能把游标倒回去）；
+- 只继承**同账号**的待重新扫码状态（别人的不碰）；
+- 一个账号有多个待扫码文件时取**最近更新**的那个。
+
+### 8.4 现在的恢复路径
+
+```
+token 会话          → 一律复活（它自己能收消息）
+reauth 会话
+  ├ 浏览器能到达    → 复活 + 出码（用户在页面上直接扫）
+  └ 没人能到达      → 不复活；state 留着，等用户重新扫码时由新会话继承
+```
+
+### 8.5 测试
+
+- `tests/test_shared_runtime.py`：`test_restore_skips_unreachable_reauth_session`
+  / `..._revives_reauth_session_when_browser_can_reach`
+  / `..._revives_reauth_session_with_resume_token_only`
+  / `..._keeps_token_sessions_even_when_unreachable`
+- `tests/test_bot_session_contract.py`：`test_new_session_adopts_pending_account_state`
+  / `test_adoption_skipped_when_session_already_has_cursor`
+  / `test_adoption_ignores_other_accounts`
+
+（65 pytest + 8 unittest 全过）
+
+### 8.6 用户侧怎么办
+
+掉线的账号仍然要人扫一次码（协议限制，§5）：
+
+1. 打开 `https://bx.mengxa.com/clawbot/`；
+2. 点「扫码登录」（或已有会话就点「切换用户」）；
+3. 用掉线的那个微信号扫码。
+
+扫完之后**账号的上下文会接回来**（§8.3 的继承），不会「失忆」。

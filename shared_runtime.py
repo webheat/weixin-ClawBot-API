@@ -229,8 +229,40 @@ async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
+async def _browser_can_reach(store: Any, session_id: str) -> bool:
+    """有没有浏览器能到达这个会话（绑定或 resume token 指向它）。
+
+    - ``store`` 为 None（测试里注入了自己的 app）→ 返回 True，保持老行为；
+    - 有绑定 → 用户打开页面就能看到它那张二维码 → 复活有意义；
+    - 只有 resume token 也算（30 天 cookie，用户回来能自动接回）；
+    - 都没有 → 复活了也没人看得见那张码 —— 不如留着 state 文件，等用户
+      重新扫码时由新会话继承账号状态（账号连续性）。
+    """
+    if store is None:
+        return True
+    snapshot = getattr(store, "snapshot", None)
+    if callable(snapshot):
+        try:
+            for _sid, binding in await _maybe_await(snapshot()):
+                if str(getattr(binding, "session_id", "")) == str(session_id):
+                    return True
+        except Exception:  # noqa: BLE001 —— store 的实现细节不该拖垮恢复
+            return True
+    resolver = getattr(store, "resolve_resume", None)
+    if callable(resolver):
+        for token in list(getattr(store, "_resume_tokens", {}) or {}):
+            try:
+                found = await _maybe_await(resolver(token))
+            except Exception:  # noqa: BLE001
+                continue
+            if found and str(found) == str(session_id):
+                return True
+    return False
+
+
 async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfig",
-                                      session_config: Mapping[str, Any]) -> list[str]:
+                                      session_config: Mapping[str, Any],
+                                      store: Any = None) -> list[str]:
     """启动时把「还有凭据的会话」重新拉起来 —— 重启不掉线。
 
     会话默认只活在内存里：进程一重启，浏览器手里的 cookie 就指不到任何会话，
@@ -298,6 +330,19 @@ async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfi
         if not has_token and uid and uid in claimed:
             log.info("restore skipped duplicate account sid=%s owner=%s",
                      session_id, uid[-12:])
+            continue
+        if not has_token and not await _browser_can_reach(store, session_id):
+            # 没人能看见它那张二维码 —— 复活了也没用（浏览器绑定/resume
+            # token 都不指向它）。2026-10-26 的 yg 账号就是这样：每次重启都
+            # 复活 + 白烧一轮 8 分钟的二维码窗口，然后 park 住等人看不见。
+            # state 文件**留着** —— 用户重新扫码时，新会话会从它继承账号的
+            # contexts / 游标（BotSession._adopt_pending_account_state），
+            # 账号连续性不断。
+            log.info(
+                "restore skipped unreachable reauth session sid=%s owner=%s "
+                "(state kept for account-continuity adoption)",
+                session_id, uid[-12:] or "-",
+            )
             continue
         try:
             await manager.create_background(session_id, config=dict(session_config))
@@ -408,7 +453,10 @@ async def run_shared(
         # 重启后把还带着 token 的会话续上，别让用户重新扫码
         if session_config:
             try:
-                await _restore_persisted_sessions(manager, runtime, session_config)
+                await _restore_persisted_sessions(
+                    manager, runtime, session_config,
+                    store=app.get("browser_store"),
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("session restore pass failed: %s", exc)
         await (stop_event or asyncio.Event()).wait()

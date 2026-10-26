@@ -231,3 +231,116 @@ async def test_restore_duplicate_claim_only_after_success(tmp_path: Path):
 
     assert manager.started == ["zombie"]
     assert restored == ["zombie"]
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26：复活一个「没人看得见二维码」的会话毫无意义
+# ---------------------------------------------------------------------------
+
+
+class _FakeStore:
+    """最小 BrowserSessions 替身：绑定 + resume token。"""
+
+    def __init__(self, bindings: dict[str, str], resume: dict[str, str]):
+        self._bindings = {k: type("B", (), {"session_id": v})()
+                          for k, v in bindings.items()}
+        self._resume_tokens = {k: (v, 0.0) for k, v in resume.items()}
+
+    async def snapshot(self):
+        return list(self._bindings.items())
+
+    async def resolve_resume(self, token):
+        rec = self._resume_tokens.get(token)
+        return rec[0] if rec else None
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_unreachable_reauth_session(tmp_path: Path):
+    """没有浏览器能到达的 reauth 会话不复活（但 state 文件留着）。
+
+    复活它 = 白烧一轮 8 分钟的二维码窗口 + 一个没人看得见的二维码。
+    state 文件留着，用户重新扫码时新会话会继承它的账号状态。
+    """
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    path = _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    store = _FakeStore(bindings={"b1": "someone-else"}, resume={})
+    restored = await _restore_persisted_sessions(manager, runtime, {}, store=store)
+
+    assert manager.started == []
+    assert restored == []
+    assert path.exists(), "state 文件必须留着（账号连续性要靠它）"
+
+
+@pytest.mark.asyncio
+async def test_restore_revives_reauth_session_when_browser_can_reach(tmp_path: Path):
+    """浏览器还绑着这个会话 → 复活（页面能看见那张二维码，10-26 的修复不变）。"""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    store = _FakeStore(bindings={"b1": "alice"}, resume={})
+    restored = await _restore_persisted_sessions(manager, runtime, {}, store=store)
+
+    assert manager.started == ["alice"]
+    assert restored == ["alice"]
+
+
+@pytest.mark.asyncio
+async def test_restore_revives_reauth_session_with_resume_token_only(tmp_path: Path):
+    """只有 resume token（30 天 cookie）也算能到达。"""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    store = _FakeStore(bindings={}, resume={"tok": "alice"})
+    restored = await _restore_persisted_sessions(manager, runtime, {}, store=store)
+
+    assert manager.started == ["alice"]
+    assert restored == ["alice"]
+
+
+@pytest.mark.asyncio
+async def test_restore_keeps_token_sessions_even_when_unreachable(tmp_path: Path):
+    """带 token 的会话一律复活 —— 浏览器在不在都跟它有关（它自己能收消息）。"""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "alice", {
+        "bot_token": "live-token",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    store = _FakeStore(bindings={}, resume={})
+    restored = await _restore_persisted_sessions(manager, runtime, {}, store=store)
+
+    assert manager.started == ["alice"]
+    assert restored == ["alice"]
