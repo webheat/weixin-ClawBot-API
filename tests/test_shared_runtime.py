@@ -344,3 +344,95 @@ async def test_restore_keeps_token_sessions_even_when_unreachable(tmp_path: Path
 
     assert manager.started == ["alice"]
     assert restored == ["alice"]
+
+
+@pytest.mark.asyncio
+async def test_restore_dedups_two_live_sessions_of_the_same_account(tmp_path: Path):
+    """同一个微信账号**不能**复活两个带 token 的会话。
+
+    回归于 2026-10-27：恢复路径的去重只拦「无 token」的重复账号
+    （``if not has_token and uid and uid in claimed``）—— 两个都带 token 的
+    同账号会话**两个都会被复活**，于是两个 bot 同时长轮询同一个账号，
+    消息被两边随机抢走 → 用户看到「有时候没人回」。
+
+    隔离的基准是**账号**（ilink_user_id），不是 session_id。
+    """
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    _write_state(state_dir, "live-a", {"bot_token": "token-a", "ilink_user_id": uid})
+    _write_state(state_dir, "live-b", {"bot_token": "token-b", "ilink_user_id": uid})
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert len(manager.started) == 1, (
+        f"同一账号复活了 {len(manager.started)} 个会话：{manager.started} —— "
+        "两个 bot 会抢同一个账号的消息流"
+    )
+    assert len(restored) == 1
+
+
+@pytest.mark.asyncio
+async def test_restore_keeps_different_accounts_concurrently(tmp_path: Path):
+    """不同账号必须能同时复活 —— 账号隔离不能变成「只留一个」。"""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "acct-a", {
+        "bot_token": "token-a", "ilink_user_id": "acct-a@im.wechat"})
+    _write_state(state_dir, "acct-b", {
+        "bot_token": "token-b", "ilink_user_id": "acct-b@im.wechat"})
+    _write_state(state_dir, "acct-c", {
+        "bot_token": "token-c", "ilink_user_id": "acct-c@im.wechat"})
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert sorted(manager.started) == ["acct-a", "acct-b", "acct-c"], (
+        f"不同账号没被同时复活：{manager.started}"
+    )
+    assert len(restored) == 3
+
+
+@pytest.mark.asyncio
+async def test_restore_prefers_the_most_recently_logged_in_session(tmp_path: Path):
+    """同一账号有两个 state 文件时，活过来的应该是**最后登录**的那个。
+
+    判据用 ``login_time`` 而不是文件 mtime：state 文件的 mtime 会被
+    ``save_state()`` 刷新 —— 包括**被驱逐的**旧会话（``stop()`` 里也会
+    ``save_state()``），所以 mtime 靠不住。``login_time`` 只在真正登录成功
+    时更新，才代表「这个会话是最后接管这个账号的」。
+
+    否则「哪个会话活着」取决于 session_id 的字典序或 mtime，而不是用户最后
+    用的那个 —— 表现为用户明明刚用过，重新扫码后却像换了个人（上下文/游标
+    对不上）。
+    """
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    now = time.time()
+    # aaa-old 在字典序和 mtime 上都"更新"，但 login_time 更旧 ——
+    # 模拟「旧会话刚被驱逐、stop() 刷新了它的 state 文件」
+    old = _write_state(state_dir, "aaa-old", {
+        "bot_token": "t-old", "ilink_user_id": uid, "login_time": now - 3600})
+    _write_state(state_dir, "zzz-new", {
+        "bot_token": "t-new", "ilink_user_id": uid, "login_time": now})
+    # 让 old 的 mtime 更新（被驱逐的会话 stop() 会重写文件）
+    import os
+    os.utime(old, (now, now))
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == ["zzz-new"], (
+        f"复活的是 {manager.started}，应该是最后登录的 zzz-new"
+    )

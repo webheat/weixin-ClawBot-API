@@ -312,23 +312,44 @@ async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfi
             age = max(0.0, now - path.stat().st_mtime)
         except OSError:
             age = 0.0
+        # 「最近登录的」而不是「最近被写的」。state 文件的 mtime 会被
+        # save_state() 刷新 —— 包括**被驱逐的**旧会话（stop() 里也会
+        # save_state()），所以 mtime 靠不住。login_time 只在真正登录成功
+        # 时更新，才代表「这个会话是最后接管这个账号的」。
+        try:
+            login_time = float(data.get("login_time") or 0.0)
+        except (TypeError, ValueError):
+            login_time = 0.0
         if has_token:
-            live.append((session_id, data, age))
+            live.append((session_id, data, age, login_time))
         elif age <= window:
-            reauth.append((session_id, data, age))
+            reauth.append((session_id, data, age, login_time))
         else:
             log.info("restore skipped stale reauth session sid=%s age_h=%.1f",
                      session_id, age / 3600.0)
-    # 一个微信账号只留一个会话：带 token 的优先，同类则最近更新的优先。
+    # 一个微信账号只留一个会话：带 token 的优先，同类则**最近登录的**优先。
     # 否则复活的旧会话一旦被扫描，会把同账号的健康会话踢掉
     # （bot_manager._evict_same_account）。只有**恢复成功**的会话才占用账号 ——
     # 否则健康会话起不来时，它的备用也一起被跳过，账号就彻底没人管了。
-    ordered = live + sorted(reauth, key=lambda item: item[2])
+    ordered = (
+        sorted(live, key=lambda item: -item[3])
+        + sorted(reauth, key=lambda item: -item[3])
+    )
     claimed: set[str] = set()
-    for session_id, data, _age in ordered:
+    for session_id, data, _age, _login_time in ordered:
         uid = str(data.get("ilink_user_id") or "")
         has_token = bool(str(data.get("bot_token") or "").strip())
-        if not has_token and uid and uid in claimed:
+        # 一个微信账号只留一个会话 —— 判据是**账号**（ilink_user_id），
+        # 不是 session_id。重新扫码会得到新的 session_id，但账号还是同一个。
+        #
+        # 两个会话同时长轮询同一个账号 → 消息被两边随机抢走 → 用户看到
+        # 「有时候没人回」。BotManager._evict_same_account 会在**登录时**
+        # 踢掉同账号的旧会话，但那是「谁后登录谁赢」的竞态；这里在**恢复**
+        # 阶段就只复活一个，从根上避免两个 bot 抢一个账号。
+        #
+        # 带 token 的优先（ordered 里 live 在前），同类则最近更新的优先。
+        # 账号未知（ilink_user_id 为空）时无法按账号去重，跳过该判断。
+        if uid and uid in claimed:
             log.info("restore skipped duplicate account sid=%s owner=%s",
                      session_id, uid[-12:])
             continue
@@ -350,6 +371,8 @@ async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfi
         except Exception as exc:  # noqa: BLE001 —— 一个会话起不来不能拖垮整个进程
             log.warning("session restore failed sid=%s err=%s", session_id, exc)
             continue
+        # 只有**恢复成功**的会话才占用账号 —— 否则健康会话起不来时，
+        # 它的备用也一起被跳过，账号就彻底没人管了。
         if uid:
             claimed.add(uid)
         restored.append(session_id)

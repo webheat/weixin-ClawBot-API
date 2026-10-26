@@ -185,3 +185,67 @@ async def test_stop_is_idempotent(manager: Any) -> None:
     assert "alice" not in getattr(manager, "sessions", {})
     # stop_all after individual stop must remain harmless.
     await _cleanup(manager)
+
+
+@pytest.mark.asyncio
+async def test_same_account_second_session_evicts_the_first(manager: Any) -> None:
+    """同一个微信账号再次登录 → 旧会话必须被踢掉。
+
+    判据是**账号**（ilink_user_id），不是 session_id —— 重新扫码会得到新的
+    session_id，但账号还是同一个。
+
+    两个会话同时长轮询同一个账号 → 消息被两边随机抢走 → 用户看到
+    「有时候没人回」。
+    """
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+
+    class AccountSession(ControlledSession):
+        def __init__(self, session_id, session, config, **kwargs):
+            super().__init__(session_id, session, config, **kwargs)
+            self.ilink_user_id = ""
+
+        async def _login_as(self, account: str) -> None:
+            self.ilink_user_id = account
+            await self.on_event("logged_in", self, {"account_changed": True})
+
+    mgr = manager
+    mgr._factory = AccountSession
+
+    first = await mgr.get_or_create("sess-1")
+    await first._login_as(uid)
+    second = await mgr.get_or_create("sess-2")
+    await second._login_as(uid)
+
+    assert ControlledSession.stops["sess-1"] >= 1, (
+        "同账号的旧会话没有被踢掉 —— 两个 bot 会抢同一个账号的消息流"
+    )
+    assert "sess-1" not in mgr.sessions
+    assert "sess-2" in mgr.sessions
+
+
+@pytest.mark.asyncio
+async def test_different_accounts_do_not_evict_each_other(manager: Any) -> None:
+    """不同账号必须能同时活跃 —— 账号隔离不能变成「只留一个」。"""
+    uid_a = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    uid_b = "o9cq80wkCIvkvrkAjjOqAhvYE_0o@im.wechat"
+
+    class AccountSession(ControlledSession):
+        def __init__(self, session_id, session, config, **kwargs):
+            super().__init__(session_id, session, config, **kwargs)
+            self.ilink_user_id = ""
+
+        async def _login_as(self, account: str) -> None:
+            self.ilink_user_id = account
+            await self.on_event("logged_in", self, {"account_changed": True})
+
+    mgr = manager
+    mgr._factory = AccountSession
+
+    a = await mgr.get_or_create("sess-a")
+    await a._login_as(uid_a)
+    b = await mgr.get_or_create("sess-b")
+    await b._login_as(uid_b)
+
+    assert ControlledSession.stops["sess-a"] == 0, "不同账号不该互相踢"
+    assert "sess-a" in mgr.sessions
+    assert "sess-b" in mgr.sessions
