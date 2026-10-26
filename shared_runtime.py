@@ -23,6 +23,7 @@ import re
 import signal
 import time
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -479,6 +480,35 @@ def _install_stop_signals(loop: asyncio.AbstractEventLoop, event: asyncio.Event)
             continue
 
 
+def _configure_default_executor() -> None:
+    """给默认线程池一个够用的容量。
+
+    默认池是 ``min(32, cpu+4)`` 个线程。本机 2 核 → **只有 6 个**，而池子里
+    挤着所有阻塞调用：
+
+      - AI 调用（``bot_session._handle_message``）—— DusAPI 30s 超时 × 5 次重试
+        + 62s 退避，最坏占住一个线程 **200 秒以上**
+      - 语义检索首次加载 fastembed 模型（~11s）+ 嵌入 150 篇基座
+      - IMA KB 列表拉取
+
+    6 个线程意味着：一个用户遇到 AI 超时重试，其他用户的回答就在排队 ——
+    症状是「bot 不理人」，跟 bot 本身没关系。发稿桥已经挪到自己的池子
+    （``utils/xiaolvshu.py``，一次最多 240 秒），这里把默认池放大。
+
+    这些调用都是 I/O 等待，线程数可以远大于核数。默认按核数 × 4 起，
+    下限 8；可用 ``CLAWBOT_WORKER_THREADS`` 覆盖。
+    """
+    cpu = os.cpu_count() or 2
+    workers = _env_int("CLAWBOT_WORKER_THREADS", max(8, cpu * 4), minimum=2)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(
+            ThreadPoolExecutor(max_workers=workers, thread_name_prefix="clawbot-io")
+        )
+    except Exception as exc:  # noqa: BLE001 —— 池子配置失败不该挡住启动
+        log.warning("default executor setup failed workers=%s err=%s", workers, exc)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """CLI entry point for the one-process runtime."""
 
@@ -516,6 +546,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     async def runner() -> None:
         event = asyncio.Event()
         _install_stop_signals(asyncio.get_running_loop(), event)
+        _configure_default_executor()
         await run_shared(runtime, stop_event=event)
 
     try:

@@ -233,3 +233,54 @@ class SharedWebTests(AioHTTPTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClientKeyTests(unittest.TestCase):
+    """``_client_key`` 必须取到**真实**客户端 IP，且不能被伪造。"""
+
+    def _request(self, headers, remote="127.0.0.1"):
+        return FakeRequest(headers, remote)
+
+    def test_untrusted_proxy_falls_back_to_remote(self):
+        from shared_web import _client_key
+
+        req = self._request({"X-Real-IP": "9.9.9.9", "X-Forwarded-For": "8.8.8.8"})
+        self.assertEqual(_client_key(req, trust_proxy=False), "127.0.0.1")
+
+    def test_trusted_proxy_prefers_nginx_overwritten_x_real_ip(self):
+        from shared_web import _client_key
+
+        req = self._request({"X-Real-IP": "203.0.113.7"}, remote="127.0.0.1")
+        self.assertEqual(_client_key(req, trust_proxy=True), "203.0.113.7")
+
+    def test_trusted_proxy_takes_the_last_forwarded_for_not_the_first(self):
+        """nginx 用 ``$proxy_add_x_forwarded_for`` —— 客户端伪造值在**前面**。
+
+        取第一个元素会拿到伪造值 → 限流可被绕过、日志可被污染。
+        真实对端是最后一段。
+        """
+        from shared_web import _client_key
+
+        req = self._request({"X-Forwarded-For": "9.9.9.9, 203.0.113.7"},
+                            remote="127.0.0.1")
+        self.assertEqual(
+            _client_key(req, trust_proxy=True), "203.0.113.7",
+            "取了 XFF 的第一个元素 —— 那是客户端可伪造的值",
+        )
+
+    def test_trusted_proxy_ignores_client_supplied_x_real_ip_when_absent(self):
+        """nginx 覆盖 X-Real-IP；客户端自带的 XFF 伪造值不能被采信。"""
+        from shared_web import _client_key
+
+        req = self._request({"X-Forwarded-For": "9.9.9.9, 203.0.113.7"},
+                            remote="127.0.0.1")
+        key = _client_key(req, trust_proxy=True)
+        self.assertNotEqual(key, "9.9.9.9")
+
+
+class FakeRequest:
+    """最小 request 替身：只提供 _client_key 用到的属性。"""
+
+    def __init__(self, headers, remote):
+        self.headers = headers
+        self.remote = remote

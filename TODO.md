@@ -2,6 +2,13 @@
 
 ## P0 — 最关键
 
+- [ ] **IMA 默认知识库 ID 已失效** ⭐ — 2026-10-27 发现。`.env` 的 `IMA_ILINK_DEFAULT_KB=-jDsbK-UEdF5xYyP7kZaoWbMrTyDUDuMNuvOt3oorvI=` 在生产上持续报 `code=220004 invalid or outdated knowledge_base_id`，**每一次 IMA 检索都失败**（2026-10-26 11:55 的日志可见）。
+  - 后果：IMA 4 档路由**永远降级**——`ima` 档失效 → 退到 `local` / `semantic` / `llm-only`。功能不挂，但知识库检索能力实质上没开。
+  - 注意：这个 KB id 格式（`-jDsbK-...`）与 `utils/list_ima_kb.py` 列出的 `ima_kb_XXXX` **不是同一套 id**。`list_ima_kb.py` 列出 19 个库，但没有一个对应 `-jDsbK-...`。
+  - 修复：用 `utils/list_ima_kb.py --pick <名称>` 找出目标库，把新的 id 写进 `.env` 的 `IMA_ILINK_DEFAULT_KB`（或改走 per-user binding，见 `docs/IMA_PER_USER_BINDING.md`）。
+  - **注意**：改完 `.env` 必须重启服务 —— systemd 的 `EnvironmentFile` 只在进程启动时读一次（详见 `deploy/README.md` 的「部署记录」小节）。
+  - 待确认：目标库是哪个？`.env` 里旧 id 已完全查不到名字，得由用户指定。
+
 - [ ] **per-user 对话历史** ⭐ — Bot 当前无跨消息记忆，每次只看到当前一条消息。用户问"我刚才说了什么"或"继续上次"都答不上来。
   - 存储：`runtime_state["contexts"][from_id]["history"]` 持久化到 `weixin_state.json`，重启不丢
   - 形态：`[{"role": "user"|"assistant", "content": "...", "ts": float}, ...]`
@@ -12,6 +19,33 @@
   - 风险：context 膨胀 → token 成本涨；需要设上限 + 监控
 
 ## P1 — 多用户共享（场景 A）下的体验改进
+
+> 2026-10-27 隔离审计的完整结论见 [`docs/2026-10-27_MULTI_ACCOUNT_AUDIT.md`](2026-10-27_MULTI_ACCOUNT_AUDIT.md)。
+> 本轮已修 3 个（KB 绑定失效 / 限流全站一桶 / 线程池互堵），下面是其余未修项。
+
+- [ ] **语义库 `db_path` 会退化成共享文件**（审计 A2）— `bot.py:2519` 的 `db_path = str(Path(extra)/...) if extra else None`，`extra` 为空（`CLAWBOT_USER_KB_DIR` 未配或 scope 为空）时 `db_path=None` → `utils/semantic_kb.py:110` 回落到 `docs/.semantic_kb.sqlite3`，**所有账号共用同一个 SQLite 文件**。
+  - 后果：不同账号的语义库混在一起；每实例一把 `threading.Lock` → 两个 session 并发 rebuild 会同时写同一文件 → SQLITE_BUSY / 索引互相覆盖。
+  - 当前不触发（`CLAWBOT_USER_KB_DIR=docs/kb-users` 已配）。属于**配置退化时的隐患**。
+  - 修法：`scope` 为空时也强制落到账号自己的目录，或显式禁用语义兜底而不是回落共享。
+
+- [ ] **`LocalKBIndex` 的 `extra_dirs` 永久缓存**（审计 A3）— `bot.py:2474` 用 `_local_kb_attempted` + `_local_kb_scope` 缓存，scope 不变就永远返回第一次建的索引；而 `LocalKBIndex.__init__` 只在构造时扫一次 `extra_dirs`（且要求 `is_dir()`）。
+  - 后果：私有目录在索引已建之后才出现时，**该账号的私有笔记永远进不了 BM25 索引**（要等 scope 变化或重启进程）。
+  - 修法：加 mtime 检查重建，或每次 chat 前校验私有目录是否存在。
+
+- [ ] **私有 KB 目录没有任何人自动创建**（审计 A4）— `docs/kb-users/<key>/` 现在只有 `README.md`。`LocalKBIndex` 不建目录，只有 `SemanticKBIndex._init_db()` 的 `mkdir(parents=True)` 副作用会建一个**只有 `.semantic_kb.sqlite3` 的空壳**。
+  - 对比：发贴图号的 vault 有 `ensure_user` 自动开通（`xiaolvshu_bridge.ensure_user`），**知识库私有目录缺一个对应的自动化**。
+  - 修法：仿照 `ensure_user` 加一个 `ensure_kb_scope(scope)`。
+
+- [ ] **连接池无 per-account 配额**（审计 A7）— `shared_runtime.py:405` 的 `TCPConnector(limit=300, limit_per_host=0)`。`limit_per_host=0` = 对 ilinkai.weixin.qq.com 不限连接数 → 单个账号理论上能占满 300 条。
+  - 而每个活跃会话都有一条**常驻长轮询连接**（35s 超时循环）→ N 个会话 = N 条常驻连接，N 接近 300 时新会话全排队。
+  - 修法：给 `limit_per_host` 一个上限，或加 per-account 配额。
+
+- [ ] **`_kb_scope` 净化非单射**（审计 A10）— `bot_session.py:1200` 用 `re.sub(r"[^A-Za-z0-9]+", "_", ilink_user_id)`，而 `ilink_user_id` 前缀是 base64url，含 `-` 和 `_`，**两者都映射成 `_`** → `xxx-a` 与 `xxx_a` 会落到同一私有目录。
+  - 发稿桥那边有 `provision_conflict` 防护，**KB scope 这边没有**。
+  - 修法：净化时保留 `-`（或用 hash 后缀），或加冲突检测。
+
+- [ ] **`CLAWBOT_STATE_DIR` 未设**（审计 A11）— `utils/ima_bindings.py:43` 的 `DEFAULT_STATE_DIR = Path(os.environ.get("CLAWBOT_STATE_DIR", "."))` → `ima_bindings.json` 落在 CWD（`/opt/weixin-ClawBot-API/`），与 `weixin_state_*.json` 同目录（一致），但与 CLAUDE.md 声称的 `CLAWBOT_STATE_DIR/ima_bindings.json` 不符。
+  - 修法：在 `.env` 里显式设 `CLAWBOT_STATE_DIR`，或改文档。
 
 - [ ] **`last_contact` 单发 → broadcast 给所有活跃用户**（`docs/multi-user.md` #2）
   - 当前 `bot.py:1264` `last_contact` 只跟踪最近一个；`reconnect_timer_task:868` 重连警告只发给一人，其他用户不知情
