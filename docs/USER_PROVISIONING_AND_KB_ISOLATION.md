@@ -148,8 +148,17 @@ python3 scripts/xiaolvshu_user.py check      # 多公众号并存自检
   所以「批量给所有配置的用户预建 vault」做不到 —— 现在是**懒开通**（对方第一次
   发指令时才建）。要预建就用 `xiaolvshu-user init <uid>`。
 - **每个账号一个公众号** 是当前设计（草稿箱互不串）。共用一个号的方案没做。
-- **per-user IMA 云端知识库绑定在共享运行时里没接线**（`bot_session` 调
-  `ai.chat(text)` 没传 `kb_id`，`/bindkb` 命令也不在共享路径里）—— 这是
-  可选项，按需再补。
+- ~~**per-user IMA 云端知识库绑定在共享运行时里没接线**~~ ——
+  **已于 2026-10-27 修复**（`fix/multi-account-isolation`）。原先
+  `bot_session._ai_chat_kwargs()` 只传 `kb_scope` 从不传 `kb_id`，而
+  `_AIWithIma.chat` 里 `kb_id = kwargs.pop("kb_id", None)`，`None` →
+  回落到 `IMA_ILINK_DEFAULT_KB` —— **所有账号共用同一个云端知识库**，
+  web UI 写的绑定是死的。现在 `_ai_chat_kwargs_async()` 按 `ilink_user_id`
+  查 `ima_bindings.json` 把 `kb_id` 传下去；查不到就不传（仍走默认，行为不变）。
+  `/bindkb` 命令**仍不在共享路径里** —— 绑定入口目前只有 web UI
+  （`/clawbot/ima/bind`）和 `utils/ima_bindings.py` CLI。
 - 桥的 README（`/opt/obsidian-xiaolvshu/README.md`）还没写这一节 —— 那个文件
   里有别的任务的在改内容，没敢一起提交。
+
+详见 [`docs/2026-10-27_MULTI_ACCOUNT_AUDIT.md`](2026-10-27_MULTI_ACCOUNT_AUDIT.md)。
+
