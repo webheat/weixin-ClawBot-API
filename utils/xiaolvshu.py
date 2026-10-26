@@ -15,10 +15,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 BRIDGE = os.environ.get(
@@ -26,6 +28,13 @@ BRIDGE = os.environ.get(
 )
 PYTHON = os.environ.get("XIAOLVSHU_PYTHON", "/usr/bin/python3")
 TIMEOUT = float(os.environ.get("XIAOLVSHU_TIMEOUT", "240"))
+# 桥有自己的线程池（见 call_bridge 的注释）：一次调用可能占住一个线程
+# 240 秒，不能跟 AI 调用抢同一个池子。
+# 池大小 = 允许同时进行的发稿数；再多就该排队而不是无限占线程。
+BRIDGE_WORKERS = max(1, int(os.environ.get("XIAOLVSHU_WORKERS", "2")))
+_BRIDGE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=BRIDGE_WORKERS, thread_name_prefix="clawbot-bridge"
+)
 # 钉住桥的版本（git commit sha 或 tag）。桥在另一个仓库、另一台机器上也可能
 # 被改 —— 这个 pin 让「A 用的是哪版桥」变成可查的事实，而不是靠记忆。
 # 生产上装的桥的 HEAD 跟 pin 对不上时，_check_bridge_version() 会记一条告警。
@@ -193,7 +202,24 @@ def _run_bridge(args: list[str], uid: str) -> dict:
 
 
 async def call_bridge(args: list[str], uid: str) -> dict:
-    return await asyncio.to_thread(_run_bridge, args, uid)
+    """调桥。
+
+    **用独立的 executor，不跟 AI 调用共用默认线程池**。
+
+    桥是子进程，一次最多跑 ``XIAOLVSHU_TIMEOUT``（默认 240 秒：出图 + 上传 +
+    调公众号接口）。而默认 executor 只有 ``min(32, cpu+4)`` 个线程（本机 2 核
+    → 6 个），AI 调用也在同一个池子里。一条发稿请求占住一个线程 4 分钟，
+    就把其他用户的 AI 回答堵在后面 —— 表现就是「bot 不理人」，但其实
+    跟 bot 本身没关系。
+
+    独立池还带来另一个好处：桥的慢（甚至卡死）不会影响 AI 路径，
+    反过来 AI 慢也不会让发稿请求排在它后面。
+    """
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(
+        _BRIDGE_EXECUTOR, lambda: ctx.run(_run_bridge, args, uid)
+    )
 
 
 # ── 回复文本 ────────────────────────────────────────────────────────────────

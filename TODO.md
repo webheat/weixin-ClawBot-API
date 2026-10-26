@@ -2,6 +2,13 @@
 
 ## P0 — 最关键
 
+- [ ] **IMA 默认知识库 ID 已失效** ⭐ — 2026-10-27 发现。`.env` 的 `IMA_ILINK_DEFAULT_KB=-jDsbK-UEdF5xYyP7kZaoWbMrTyDUDuMNuvOt3oorvI=` 在生产上持续报 `code=220004 invalid or outdated knowledge_base_id`，**每一次 IMA 检索都失败**（2026-10-26 11:55 的日志可见）。
+  - 后果：IMA 4 档路由**永远降级**——`ima` 档失效 → 退到 `local` / `semantic` / `llm-only`。功能不挂，但知识库检索能力实质上没开。
+  - 注意：这个 KB id 格式（`-jDsbK-...`）与 `utils/list_ima_kb.py` 列出的 `ima_kb_XXXX` **不是同一套 id**。`list_ima_kb.py` 列出 19 个库，但没有一个对应 `-jDsbK-...`。
+  - 修复：用 `utils/list_ima_kb.py --pick <名称>` 找出目标库，把新的 id 写进 `.env` 的 `IMA_ILINK_DEFAULT_KB`（或改走 per-user binding，见 `docs/IMA_PER_USER_BINDING.md`）。
+  - **注意**：改完 `.env` 必须重启服务 —— systemd 的 `EnvironmentFile` 只在进程启动时读一次（详见 `deploy/README.md` 的「部署记录」小节）。
+  - 待确认：目标库是哪个？`.env` 里旧 id 已完全查不到名字，得由用户指定。
+
 - [ ] **per-user 对话历史** ⭐ — Bot 当前无跨消息记忆，每次只看到当前一条消息。用户问"我刚才说了什么"或"继续上次"都答不上来。
   - 存储：`runtime_state["contexts"][from_id]["history"]` 持久化到 `weixin_state.json`，重启不丢
   - 形态：`[{"role": "user"|"assistant", "content": "...", "ts": float}, ...]`

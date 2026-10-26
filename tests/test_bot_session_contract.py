@@ -1986,3 +1986,159 @@ async def test_ai_call_logs_keep_the_user_dimension(
         "预期 'session-user-xyz'。executor 线程不继承 contextvars，"
         "需要用 asyncio.to_thread（或 copy_context().run）来保留维度。"
     )
+
+
+@pytest.mark.asyncio
+async def test_per_user_ima_kb_binding_reaches_the_ai_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """per-user 的 IMA 云端 KB 绑定必须真的传到 ``ai.chat(kb_id=...)``。
+
+    回归于 2026-10-27：``_ai_chat_kwargs`` 只传 ``kb_scope``，从不传 ``kb_id``。
+    而 ``_AIWithIma.chat`` 里是 ``kb_id = kwargs.pop("kb_id", None)``，
+    ``None`` → 回落到 ``ImaConfig.default_knowledge_base_id`` ——
+    **所有账号共用同一个云端知识库**，web UI 写的绑定是死的。
+
+    隔离键是 ``ilink_user_id``（bot 账号，微信账号级稳定）。
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    _install_reply_spy(monkeypatch, sess)
+    sess.ilink_user_id = "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat"
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingAI:
+        """记录 AI 调用收到的 kwargs。"""
+
+        def chat(self, text: str, **kwargs: Any) -> str:
+            captured.update(kwargs)
+            return "AI reply"
+
+    sess.ai = _CapturingAI()
+
+    # 造一个绑定：这个账号绑了 kb-OWNER
+    import utils.ima_bindings as bindings_mod
+
+    binding_file = tmp_path / "ima_bindings.json"
+    binding_file.write_text(json.dumps({
+        "version": 1,
+        "bindings": {
+            "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat": {
+                "kb_id": "kb-OWNER",
+                "kb_name": "owner 专属库",
+                "kb_type": 1000,
+                "bound_at": "2026-10-27 00:00:00",
+            },
+        },
+    }), encoding="utf-8")
+
+    real_get = bindings_mod.get_default_bindings
+
+    async def _patched_get_default_bindings():
+        store = bindings_mod.IMABindings(binding_file)
+        return store
+
+    monkeypatch.setattr(bindings_mod, "get_default_bindings", _patched_get_default_bindings)
+    monkeypatch.setattr(
+        "utils.ima_bindings.get_default_bindings", _patched_get_default_bindings,
+        raising=False,
+    )
+
+    try:
+        msg = message("查一下我的知识库")
+        msg["message_id"] = "kb-binding-1"
+        await sess.handle_message(msg)
+    finally:
+        await sess.stop()
+
+    assert captured.get("kb_id") == "kb-OWNER", (
+        "per-user 的 IMA KB 绑定没有传到 ai.chat —— "
+        f"实际 kwargs={captured}。不传 kb_id 的话所有账号都共用 "
+        "IMA_ILINK_DEFAULT_KB，per-user 隔离形同虚设。"
+    )
+
+
+def test_bridge_uses_its_own_executor_not_the_shared_default() -> None:
+    """发稿桥必须用自己的线程池，不能跟 AI 调用抢默认池。
+
+    回归于 2026-10-27：桥一次最多跑 ``XIAOLVSHU_TIMEOUT``（默认 240 秒），
+    跟 AI 调用共用默认 executor（2 核机器上只有 6 个线程）。一条发稿请求
+    占住一个线程 4 分钟，其他用户的 AI 回答就排在后面 —— 症状是「bot 不理人」，
+    跟 bot 本身无关。AI 调用最坏也要占住线程 200 秒（30s 超时 × 5 次重试）。
+    """
+    from utils.xiaolvshu import _BRIDGE_EXECUTOR, BRIDGE_WORKERS
+
+    assert _BRIDGE_EXECUTOR is not None
+    assert _BRIDGE_EXECUTOR._max_workers == BRIDGE_WORKERS
+    assert BRIDGE_WORKERS >= 1
+    # 名字必须和默认池区分得开，便于在日志/线程转储里分辨
+    names = {t.name for t in _BRIDGE_EXECUTOR._threads}
+    assert all(n.startswith("clawbot-bridge") for n in names), (
+        f"桥池的线程名不对：{names}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_slow_bridge_does_not_starve_ai_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """桥卡住时，AI 调用必须照常返回。"""
+    import time
+
+    from utils import xiaolvshu as xsv
+
+    # 让桥「卡住」2 秒
+    monkeypatch.setattr(xsv, "_run_bridge", lambda *a, **k: time.sleep(2) or {"ok": True})
+
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    _install_reply_spy(monkeypatch, sess)
+
+    class _FastAI:
+        def chat(self, text: str, **_: Any) -> str:
+            return "AI reply"
+
+    sess.ai = _FastAI()
+
+    async def _call_ai() -> float:
+        t0 = time.perf_counter()
+        msg = message("你好")
+        msg["message_id"] = "starve-1"
+        await sess.handle_message(msg)
+        return time.perf_counter() - t0
+
+
+    class _FastAI:
+        def chat(self, text: str, **_: Any) -> str:
+            return "AI reply"
+
+    sess.ai = _FastAI()
+
+    async def _call_ai() -> float:
+        t0 = time.perf_counter()
+        msg = message("你好")
+        msg["message_id"] = "starve-1"
+        await sess.handle_message(msg)
+        return time.perf_counter() - t0
+
+    try:
+        # 把**默认池**占满 —— 修复前桥跑在默认池里，占满 = AI 无处可去。
+        loop = asyncio.get_running_loop()
+        default_pool = getattr(loop, "_default_executor", None)
+        n_saturate = getattr(default_pool, "_max_workers", 6) or 6
+        bridge_tasks = [
+            asyncio.create_task(xsv.call_bridge(["status"], f"u{i}"))
+            for i in range(n_saturate)
+        ]
+        await asyncio.sleep(0.1)  # 让它们进到 executor 里
+
+        elapsed = await _call_ai()
+        assert elapsed < 1.5, (
+            f"AI 调用被桥拖慢到 {elapsed:.1f}s —— 桥和 AI 共用了线程池。"
+            "桥一次能占住线程 240 秒，AI 只有 200 秒左右，"
+            "用户会看到「bot 不理人」。"
+        )
+
+        for task in bridge_tasks:
+            task.cancel()
+    finally:
+        await sess.stop()
