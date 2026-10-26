@@ -19,12 +19,64 @@ import json
 import os
 import re
 import subprocess
+from pathlib import Path
 
 BRIDGE = os.environ.get(
     "XIAOLVSHU_BRIDGE", "/opt/obsidian-xiaolvshu/scripts/xiaolvshu_bridge.py"
 )
 PYTHON = os.environ.get("XIAOLVSHU_PYTHON", "/usr/bin/python3")
 TIMEOUT = float(os.environ.get("XIAOLVSHU_TIMEOUT", "240"))
+# 钉住桥的版本（git commit sha 或 tag）。桥在另一个仓库、另一台机器上也可能
+# 被改 —— 这个 pin 让「A 用的是哪版桥」变成可查的事实，而不是靠记忆。
+# 生产上装的桥的 HEAD 跟 pin 对不上时，_check_bridge_version() 会记一条告警。
+BRIDGE_REF = os.environ.get("XIAOLVSHU_BRIDGE_REF", "").strip()
+
+_version_checked = False
+
+
+def _check_bridge_version() -> None:
+    """生产上跑的桥，是不是 .env 里钉的那一版？（只查一次）"""
+    global _version_checked
+    if _version_checked:
+        return
+    _version_checked = True
+    if not BRIDGE_REF:
+        return
+    repo = Path(BRIDGE).resolve().parent.parent
+    if not (repo / ".git").exists():
+        return  # 不是 git 部署的（拷贝过去的），没法比
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return
+    if not head:
+        return
+    # 工作区有未提交改动 → 装的就不是 HEAD 那版（HEAD 比不出来）
+    try:
+        dirty = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        dirty = ""
+    if dirty:
+        from utils.logging_setup import get_logger
+        get_logger("message").warning(
+            "xiaolvshu bridge has uncommitted changes repo=%s "
+            "（装到生产的不是 pin 那版 —— 先提交再部署）",
+            str(repo),
+        )
+    if head.startswith(BRIDGE_REF) or BRIDGE_REF.startswith(head[:7]):
+        return
+    from utils.logging_setup import get_logger
+    get_logger("message").warning(
+        "xiaolvshu bridge version drift: pinned=%s installed=%s repo=%s "
+        "（.env 的 XIAOLVSHU_BRIDGE_REF 与生产上的桥不一致）",
+        BRIDGE_REF[:12], head[:12], str(repo),
+    )
 
 # ── 斜杠命令 ────────────────────────────────────────────────────────────────
 # /发贴图号 沉香   /发公众号 沉香   /发列表   /发状态   /选 2   /重发 沉香
@@ -117,6 +169,7 @@ def detect_intent(text: str):
 # ── 调桥 ────────────────────────────────────────────────────────────────────
 
 def _run_bridge(args: list[str], uid: str) -> dict:
+    _check_bridge_version()
     cmd = [PYTHON, BRIDGE, "--user", uid, *args]
     try:
         proc = subprocess.run(

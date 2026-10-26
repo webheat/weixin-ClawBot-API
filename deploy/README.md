@@ -112,3 +112,57 @@ git checkout ac2bdd6 -- bot.py  # 旧单租户版
 
 **注意**：回滚后所有 session 全部需要重新扫码（iLink 端 session 已在
 service 切换时失效）。
+
+---
+
+## 两个仓库：桥（提供者）先发，ClawBot（消费者）后发
+
+发稿桥在**另一个仓库**：`/opt/obsidian-xiaolvshu`（origin =
+`/opt/git/obsidian-xiaolvshu.git`，本地裸库；GitHub 仓库待建）。两边靠
+「子进程 + stdout 最后一行 JSON」耦合 —— 桥改了 JSON 形状而 ClawBot 没跟上，
+用户的「发贴图号」就会静默变成「❌ 发布链路出错」。
+
+### 契约由谁保证
+
+`tests/test_xiaolvshu_bridge_contract.py`（**在消费者这边**）跑桥的无副作用
+命令（`info` / `search` / `status`），断言：
+
+- 子命令还在（search / publish / select / status）；
+- 每个命令该带的 key 还在（`info`→uid/slug/vault、`search`→`results`、
+  `status`→`entries`）；
+- 消费者认识的 7 个错误码桥还产出（need_select / duplicate / not_found /
+  no_creds / cross_vault / no_pending / bad_index）；
+- 每个错误码分支需要的字段桥还带（need_select→candidates、no_creds→hint…）；
+- 契约测试自己**不碰生产目录**（STORE / CREDS_DIR 指向临时目录）。
+
+桥那边自己的 CI 只能测它自己 —— **只有消费者这边能测出契约是否还成立**。
+
+### 版本钉住
+
+`.env` 里的 `XIAOLVSHU_BRIDGE_REF=<sha 或 tag>` 记录「ClawBot 期望的桥是
+哪一版」。生产上装的桥跟它对不上时，`utils/xiaolvshu.py` 会在
+`clawbot.message` 日志里记一条版本漂移告警；桥的工作区有未提交改动也会告警
+（装到生产的不是 pin 那版）。
+
+### 部署
+
+```bash
+./deploy/deploy.sh                # 按 .env 里的 pin 部署（桥 → 契约测试 → A → 重启）
+./deploy/deploy.sh --bridge-only  # 只发桥
+./deploy/deploy.sh --app-only     # 只发 A
+./deploy/deploy.sh --no-restart   # 不重启
+```
+
+脚本干的事：
+
+1. 桥：`git fetch` + `git checkout $XIAOLVSHU_BRIDGE_REF`（有未提交改动会告警）
+2. 跑契约测试 —— 不绿就别往下走
+3. ClawBot：`git pull --ff-only`
+4. `systemctl restart clawbot-shared.service`
+
+### 发布顺序与回滚
+
+- **顺序**：桥先发（保持向后兼容：新桥还得认旧的 JSON 形状），A 后发
+  （升 pin）。
+- **回滚**：A 可以单独回滚到上一版，只要桥保持向后兼容；桥回滚则要同时把
+  A 的 pin 降回去。
