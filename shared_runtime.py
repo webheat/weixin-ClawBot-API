@@ -288,13 +288,10 @@ async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfi
                      session_id, age / 3600.0)
     # 一个微信账号只留一个会话：带 token 的优先，同类则最近更新的优先。
     # 否则复活的旧会话一旦被扫描，会把同账号的健康会话踢掉
-    # （bot_manager._evict_same_account）。
-    claimed: set[str] = set()
-    for session_id, data, _age in live:
-        uid = str(data.get("ilink_user_id") or "")
-        if uid:
-            claimed.add(uid)
+    # （bot_manager._evict_same_account）。只有**恢复成功**的会话才占用账号 ——
+    # 否则健康会话起不来时，它的备用也一起被跳过，账号就彻底没人管了。
     ordered = live + sorted(reauth, key=lambda item: item[2])
+    claimed: set[str] = set()
     for session_id, data, _age in ordered:
         uid = str(data.get("ilink_user_id") or "")
         has_token = bool(str(data.get("bot_token") or "").strip())
@@ -302,13 +299,13 @@ async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfi
             log.info("restore skipped duplicate account sid=%s owner=%s",
                      session_id, uid[-12:])
             continue
-        if uid:
-            claimed.add(uid)
         try:
             await manager.create_background(session_id, config=dict(session_config))
         except Exception as exc:  # noqa: BLE001 —— 一个会话起不来不能拖垮整个进程
             log.warning("session restore failed sid=%s err=%s", session_id, exc)
             continue
+        if uid:
+            claimed.add(uid)
         restored.append(session_id)
         if not has_token:
             pending_reauth.append(session_id)

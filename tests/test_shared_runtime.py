@@ -202,3 +202,32 @@ async def test_restore_skips_duplicate_account(tmp_path: Path):
 
     assert manager.started == ["live"]
     assert restored == ["live"]
+
+
+@pytest.mark.asyncio
+async def test_restore_duplicate_claim_only_after_success(tmp_path: Path):
+    """A live session that fails to start must not block its re-auth twin."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    _write_state(state_dir, "live", {"bot_token": "live-token", "ilink_user_id": uid})
+    _write_state(state_dir, "zombie", {
+        "bot_token": "",
+        "ilink_user_id": uid,
+        "reauth_required": True,
+    })
+
+    class FlakyManager(FakeManager):
+        async def create_background(self, session_id, config, **kwargs):
+            if session_id == "live":
+                raise RuntimeError("boom")
+            await super().create_background(session_id, config, **kwargs)
+
+    manager = FlakyManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == ["zombie"]
+    assert restored == ["zombie"]
