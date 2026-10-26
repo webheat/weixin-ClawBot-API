@@ -176,9 +176,24 @@ service 切换时失效）。
 |---|---|---|---|
 | 2026-10-26 20:42:42 | `ce8ce14` | `1840340` | 诊断埋点上线（`fix/wechat-connection-diagnostics-20261026`） |
 | 2026-10-27 06:17:44 | `b36d4b0` | `1840340` | `--app-only` 重启，让进程拾取 `.env` 里更新的 pin |
+| 2026-10-27 06:22:45 | `4e897ce` | `1840340` | `--app-only` 重启（部署审计补录） |
+| 2026-10-27 06:30:48 | `fc5d35b` | `1840340` | `--app-only`（`reply_sent` 埋点下沉到 `_send_reliable`） |
+| 2026-10-27 06:48:28 | `e1d1400` | `1840340` | `--app-only`（多账户隔离修复：KB 绑定 / 限流 / 线程池互堵） |
+| 2026-10-27 07:12:14 | `3b33424` | `1840340` | `--app-only`（发稿闭环流程日志：flow id 贯穿全链路） |
 
 ⚠️ **改完 `.env` 必须重启服务**。systemd 的 `EnvironmentFile` 只在进程启动时读一次，
 之后改 `.env` 不会进已运行进程的 env。`utils/xiaolvshu.py` 的 `_check_bridge_version()`
 读的是 `os.environ`，所以 pin 改了不重启 → 拿旧 pin 比对 → 误报 version drift。
 
 `--no-restart` 只改代码不重启 —— 那时 `.env` 的改动同样不会生效。
+
+### 发稿闭环的流程日志（`3b33424` 起）
+
+部署后日志里会多一个 `clawbot.publish` logger，每条带 `flow=<8位hex>`：
+
+```bash
+grep -E "flow=[0-9a-f]{8}" /opt/weixin-ClawBot-API/logs/clawbot_shared.log
+```
+
+一次发稿的完整链路（认领 → 调桥 → 桥的结果 → 回信）都在同一个 flow 下。
+阶段表和排查对照见 [`docs/PUBLISH_FLOW_LOGGING.md`](../docs/PUBLISH_FLOW_LOGGING.md)。
