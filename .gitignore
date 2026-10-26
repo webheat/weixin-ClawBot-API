@@ -15,6 +15,10 @@ weixin_state_*.json
 ima_bindings.json
 ima_bindings_*.json
 
+# 浏览器会话绑定（含 csrf_token / resume_token —— 等同账号访问凭据）
+browser_sessions.json
+browser_sessions_*.json
+
 # Runtime state files (含真实 openid / bot 启动信息)，不入库
 var/
 !var/.gitkeep

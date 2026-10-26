@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import signal
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -164,6 +165,10 @@ class SharedRuntimeConfig:
     prefix: str = DEFAULT_PREFIX
     session_ttl: float = 8 * 3600
     session_limit: int = 100
+    # 多久之内还在等扫码的会话，在重启后会被复活（见
+    # _restore_persisted_sessions）。默认 24h：足够覆盖一次发版重启，
+    # 又不会把早就没人管的僵尸账号一直拉起来。
+    reauth_restore_window: float = 24 * 3600
     rate_limit: int = 5
     rate_window: float = 60.0
     cookie_secure: bool | None = None
@@ -198,6 +203,7 @@ class SharedRuntimeConfig:
             host=str(value("CLAWBOT_WEB_HOST", DEFAULT_HOST)), port=port, prefix=prefix,
             session_ttl=ttl,
             session_limit=integer("CLAWBOT_MAX_SESSIONS", 100, 1),
+            reauth_restore_window=decimal("CLAWBOT_REAUTH_RESTORE_WINDOW", 24 * 3600, 0.0),
             rate_limit=integer("CLAWBOT_WEB_RATE_LIMIT", 5, 1),
             rate_window=rate_window,
             cookie_secure=(
@@ -225,7 +231,7 @@ async def _maybe_await(value: Any) -> Any:
 
 async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfig",
                                       session_config: Mapping[str, Any]) -> list[str]:
-    """启动时把「有 token 的会话」重新拉起来 —— 重启不掉线。
+    """启动时把「还有凭据的会话」重新拉起来 —— 重启不掉线。
 
     会话默认只活在内存里：进程一重启，浏览器手里的 cookie 就指不到任何会话，
     页面报「无法连接」，用户只能重新扫码。可 `weixin_state_<sid>.json` 里明明
@@ -235,11 +241,26 @@ async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfi
 
     token 过期（服务端 -14）时，会话自己走重连流程，页面出二维码 —— 那种情况
     仍然要人扫一次，但那是服务端真的收回了授权，不是本地重启。
+
+    **待重新认证的会话也要复活**（2026-10-26 事故）：token 被清空的那一刻
+    会话就把 ``reauth_required=True`` 写进 state 文件。如果进程在二维码窗口
+    内被重启（发版），旧逻辑会因为「token 为空」直接跳过这个会话 —— 账号
+    就此永久掉线，浏览器里的 resume cookie 也指向一个不存在的会话。
+    现在这类会话会被重新拉起：``BotSession.start()`` 看到空 token 会出新的
+    二维码，浏览器拿着 30 天的 resume cookie 回来就能续上。
     """
     restored: list[str] = []
+    pending_reauth: list[str] = []
     state_dir = Path(runtime.state_dir)
     if not state_dir.is_dir():
         return restored
+    window = max(0.0, float(getattr(runtime, "reauth_restore_window", 24 * 3600)))
+    now = time.time()
+    # 第一类：还带 token 的会话（保持原行为，一个都不少）。
+    # 第二类：没有 token 但标了 reauth_required 的会话 —— 只复活最近更新过的，
+    # 否则每次重启都会把一堆早就没人管的僵尸账号拉起来。
+    live: list[tuple[str, dict, float]] = []
+    reauth: list[tuple[str, dict, float]] = []
     for path in sorted(state_dir.glob("weixin_state_*.json")):
         session_id = path.name[len("weixin_state_"):-len(".json")]
         if not session_id:
@@ -248,17 +269,58 @@ async def _restore_persisted_sessions(manager: Any, runtime: "SharedRuntimeConfi
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if not str(data.get("bot_token") or "").strip():
-            continue  # 没登录过 / 已清 token
+        if not isinstance(data, dict):
+            continue
+        has_token = bool(str(data.get("bot_token") or "").strip())
+        needs_reauth = bool(data.get("reauth_required"))
+        if not has_token and not needs_reauth:
+            continue  # 没登录过 / 与本账号无关
+        try:
+            age = max(0.0, now - path.stat().st_mtime)
+        except OSError:
+            age = 0.0
+        if has_token:
+            live.append((session_id, data, age))
+        elif age <= window:
+            reauth.append((session_id, data, age))
+        else:
+            log.info("restore skipped stale reauth session sid=%s age_h=%.1f",
+                     session_id, age / 3600.0)
+    # 一个微信账号只留一个会话：带 token 的优先，同类则最近更新的优先。
+    # 否则复活的旧会话一旦被扫描，会把同账号的健康会话踢掉
+    # （bot_manager._evict_same_account）。
+    claimed: set[str] = set()
+    for session_id, data, _age in live:
+        uid = str(data.get("ilink_user_id") or "")
+        if uid:
+            claimed.add(uid)
+    ordered = live + sorted(reauth, key=lambda item: item[2])
+    for session_id, data, _age in ordered:
+        uid = str(data.get("ilink_user_id") or "")
+        has_token = bool(str(data.get("bot_token") or "").strip())
+        if not has_token and uid and uid in claimed:
+            log.info("restore skipped duplicate account sid=%s owner=%s",
+                     session_id, uid[-12:])
+            continue
+        if uid:
+            claimed.add(uid)
         try:
             await manager.create_background(session_id, config=dict(session_config))
         except Exception as exc:  # noqa: BLE001 —— 一个会话起不来不能拖垮整个进程
             log.warning("session restore failed sid=%s err=%s", session_id, exc)
             continue
         restored.append(session_id)
+        if not has_token:
+            pending_reauth.append(session_id)
     if restored:
         log.info("restored %d persisted session(s): %s",
                  len(restored), ", ".join(restored))
+    if pending_reauth:
+        log.warning(
+            "restored %d session(s) waiting for a QR re-scan (no token): %s — "
+            "该账号需要用户重新扫码才能恢复",
+            len(pending_reauth), ", ".join(pending_reauth),
+        )
     return restored
 
 

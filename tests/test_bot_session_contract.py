@@ -1543,3 +1543,110 @@ async def test_switch_during_initial_login_falls_back_when_qr_not_scanned(
         "an unscanned switch QR must fall back to the initial QR login"
     )
     assert calls.count("poll-switch") == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26 事故：重启打断二维码窗口 → 账号永久掉线
+# 见 docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reconnect_persists_reauth_required(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Clearing the token must persist "this account needs a fresh QR scan".
+
+    Regression test for the 2026-10-26 outage: the iLink token expired
+    (-14) at 11:44:25, the service was restarted 85 seconds later while the
+    QR window was still open, and the state file was left with
+    ``bot_token=""`` — so every later restore skipped the session and the
+    WeChat account stayed offline until the user re-scanned from scratch.
+    """
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "old-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+
+    observed: dict[str, Any] = {}
+
+    async def fake_login(*, reconnect: bool = False) -> dict[str, Any]:
+        observed["persisted"] = json.loads(
+            sess.state_file.read_text(encoding="utf-8")
+        )
+        return {
+            "bot_token": "fresh-token",
+            "baseurl": "https://new.invalid",
+            "ilink_bot_id": "bot-id",
+        }
+
+    async def noop_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(sess, "_login", fake_login)
+    import bot as protocol
+    monkeypatch.setattr(protocol, "notify_lifecycle", noop_notify)
+
+    await sess._reconnect()
+
+    # The QR window is open right now: the persisted state must already say
+    # "this account needs a new scan", not just "the token is empty".
+    assert observed["persisted"]["bot_token"] == ""
+    assert observed["persisted"]["reauth_required"] is True
+    # A successful re-auth clears the flag again.
+    assert sess._reauthentication_required is False
+    persisted = json.loads(sess.state_file.read_text(encoding="utf-8"))
+    assert persisted["reauth_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_reconnect_failure_keeps_reauth_required(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A failed QR attempt must leave the "needs re-scan" flag on disk."""
+    sess = _make_session(monkeypatch, "alice", state_file=tmp_path / "alice.json")
+    sess.bot_token = "old-token"
+    sess.baseurl = "https://old.invalid"
+    sess._token_ref[0] = sess.bot_token
+    sess._base_url_ref[0] = sess.baseurl
+    sess.runtime_state["bot_token"] = sess.bot_token
+
+    async def failing_login(*, reconnect: bool = False) -> dict[str, Any]:
+        raise RuntimeError("二维码多次失效或登录失败，请稍后重试。")
+
+    async def noop_notify(*_: Any, **__: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(sess, "_login", failing_login)
+    import bot as protocol
+    monkeypatch.setattr(protocol, "notify_lifecycle", noop_notify)
+
+    with pytest.raises(RuntimeError):
+        await sess._reconnect()
+
+    persisted = json.loads(sess.state_file.read_text(encoding="utf-8"))
+    assert persisted["reauth_required"] is True
+    assert sess.has_authenticated_connection is True
+
+
+def test_restored_session_keeps_reauth_required(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A session restored after a restart still knows it needs a scan."""
+    state_file = tmp_path / "alice.json"
+    state_file.write_text(json.dumps({
+        "bot_token": "",
+        "baseurl": "https://old.invalid",
+        "ilink_bot_id": "bot-id",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    }), encoding="utf-8")
+
+    sess = _make_session(monkeypatch, "alice", state_file=state_file)
+
+    assert sess._reauthentication_required is True
+    # Such a session must survive browser-binding expiry: it still owns an
+    # account, it just needs a new credential.
+    assert sess.has_authenticated_connection is True

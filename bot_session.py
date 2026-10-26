@@ -139,7 +139,13 @@ class BotSession:
         # replaced.  _reconnect() intentionally clears bot_token before QR
         # login, so the token alone cannot describe this transitional state.
         self._reauthenticating = False
-        self._reauthentication_required = False
+        # "This session used to be authenticated and now needs a fresh QR".
+        # Persisted in the state file so a restart during the QR window can
+        # resurrect the session instead of dropping the account for good.
+        # See docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md.
+        self._reauthentication_required = bool(
+            self.runtime_state.get("reauth_required")
+        )
         self._initializing = False
         self._started = False
         self._stopped = False
@@ -258,6 +264,7 @@ class BotSession:
                 "contexts": dict(self.contexts),
                 "last_contact": dict(self.last_contact),
                 "login_time": self.login_time,
+                "reauth_required": bool(self._reauthentication_required),
             })
             temp = self.state_file.with_name(self.state_file.name + ".tmp")
             with temp.open("w", encoding="utf-8") as handle:
@@ -312,6 +319,8 @@ class BotSession:
         self.login_time = time.time()
         self.qr_state.status = "logged_in"
         self.qr_state.logged_in_at = self.login_time
+        # A fresh credential means the account no longer waits for a scan.
+        self._reauthentication_required = False
         self.save_state()
         if changed and old_token:
             await notify_lifecycle(self.http, "ilink/bot/msg/notifystop", old_token, old_base)
@@ -370,6 +379,12 @@ class BotSession:
                 current or self._reauthentication_required
             )
             self._reauthenticating = had_authenticated_connection
+            # From this moment on the session owns no usable credential: it
+            # needs a fresh QR scan.  Persist that fact *before* the QR
+            # window opens, so a restart (a deploy!) during the window
+            # resurrects the session instead of dropping the account for
+            # good.  See docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md.
+            self._reauthentication_required = had_authenticated_connection
             self.bot_token = ""
             self._token_ref[0] = ""
             self.runtime_state["bot_token"] = ""

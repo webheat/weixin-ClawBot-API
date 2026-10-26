@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -105,3 +106,99 @@ def test_load_default_config_is_deep_copied_per_call(tmp_path: Path):
     first["providers"]["dusapi"]["model"] = "mutated"
     second = load_default_config(config_dir=tmp_path)
     assert second["providers"]["dusapi"]["model"] == "base"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26 事故：待重新扫码的会话必须跨重启存活
+# 见 docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md
+# ---------------------------------------------------------------------------
+
+
+def _write_state(state_dir: Path, session_id: str, payload: dict) -> Path:
+    path = state_dir / f"weixin_state_{session_id}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+@pytest.mark.asyncio
+async def test_restore_resurrects_session_awaiting_qr(tmp_path: Path):
+    """A session that lost its token but still waits for a scan is revived."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == ["alice"]
+    assert restored == ["alice"]
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_session_that_never_logged_in(tmp_path: Path):
+    """A session without a token and without the re-auth flag stays dead."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "guest", {"bot_token": ""})
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == []
+    assert restored == []
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_stale_reauth_session(tmp_path: Path):
+    """Nobody scanned for days: the zombie must not come back every boot."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    path = _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+    stale = time.time() - 48 * 3600
+    os.utime(path, (stale, stale))
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir, reauth_restore_window=24 * 3600)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == []
+    assert restored == []
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_duplicate_account(tmp_path: Path):
+    """One WeChat account must not end up with two live sessions."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    _write_state(state_dir, "live", {"bot_token": "live-token", "ilink_user_id": uid})
+    _write_state(state_dir, "zombie", {
+        "bot_token": "",
+        "ilink_user_id": uid,
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == ["live"]
+    assert restored == ["live"]
