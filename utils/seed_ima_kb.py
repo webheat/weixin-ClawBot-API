@@ -100,7 +100,7 @@ QA_TEMPLATES: list[tuple[str, str, str, list[str]]] = [
     ("QR 登录",
      "clawbot 支持网页扫码登录吗？",
      "支持。qr_web.py 起一个 127.0.0.1:18300 的 aiohttp，"
-     "nginx ^~ /clawbot/ 反代出去；多用户由 qr_portal.py 在 :18300 单入口分发。",
+     "nginx ^~ /clawbot/ 反代出去；多用户由 shared_web.py 在 :18300 单入口分发。",
      ["qr_web", "18300"]),
     ("QR 登录",
      "扫码后为什么还要输 verify_code？",

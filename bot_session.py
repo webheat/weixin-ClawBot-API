@@ -1,0 +1,1710 @@
+"""Per-account runtime for the shared-process ClawBot.
+
+This module deliberately keeps the protocol helpers in :mod:`bot`.  The old
+CLI remains usable, while a manager can host many isolated sessions in one
+event loop.  A session owns *all* mutable account state; only the aiohttp
+connection pool is shared.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import inspect
+import json
+import os
+import re
+import threading
+import time
+from functools import partial
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
+
+import aiohttp
+
+from qr_web import QrFlowState, make_web_on_qrcode
+
+
+# Lazy compatibility hooks.  Keeping these at module scope also gives an
+# embedding web app a narrow seam for metrics/tests without importing bot.py
+# (which has a legacy CLI bootstrap at module scope).
+async def send_msg_safe(*args: Any, **kwargs: Any) -> Any:
+    from bot import send_msg_safe as impl
+    return await impl(*args, **kwargs)
+
+
+async def send_typing_safe(*args: Any, **kwargs: Any) -> Any:
+    from bot import send_typing_safe as impl
+    return await impl(*args, **kwargs)
+
+
+async def get_typing_ticket_safe(*args: Any, **kwargs: Any) -> Any:
+    from bot import get_typing_ticket_safe as impl
+    return await impl(*args, **kwargs)
+
+
+def _safe_name(value: str) -> str:
+    raw = str(value or "")
+    if raw and re.fullmatch(r"[A-Za-z0-9_.-]+", raw):
+        return raw
+    slug = re.sub(r"[^A-Za-z0-9_.-]", "_", raw).strip("._-") or "user"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{slug[:48]}_{digest}"
+
+
+def _empty_state() -> dict[str, Any]:
+    return {
+        "bot_token": "",
+        "baseurl": "",
+        "ilink_bot_id": "",
+        "ilink_user_id": "",
+        "get_updates_buf": "",
+        "contexts": {},
+        "last_contact": {"from_id": "", "context_token": ""},
+        # A returned cursor is not committed until the whole batch is handled.
+        # Keeping the batch makes a process crash recoverable instead of lossy.
+        "pending_messages": [],
+        "processed_message_ids": [],
+    }
+
+
+class BotSession:
+    """One WeChat account and its complete lifecycle.
+
+    ``start`` is safe to run concurrently for different instances.  It never
+    holds a manager lock while waiting for QR confirmation or network I/O.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        http: aiohttp.ClientSession,
+        config: dict[str, Any] | None = None,
+        *,
+        state_file: str | os.PathLike[str] | None = None,
+        ai_client: Any = None,
+        on_event: Optional[Callable[[str, "BotSession", dict[str, Any]], Awaitable[None] | None]] = None,
+        on_qrcode: Optional[Callable[[str], Awaitable[None] | None]] = None,
+    ) -> None:
+        self.session_id = str(session_id)
+        self.http = http
+        self.config = copy.deepcopy(config or {})
+        state_root = Path(str(self.config.get("state_dir") or "."))
+        # State files pre-2026-09-16 used the ``weixin_state_eph_<hex>`` pattern
+        # with the opaque session id minted by shared_web.  After the rename
+        # the new code path uses ``weixin_state_<token_urlsafe>`` without the
+        # ``eph_`` prefix.  Existing on-disk files are intentionally left
+        # untouched — they belong to sessions that no longer run and the
+        # next GC sweep (or ``weixin_state_*.json`` TTL) reaps them.
+        self.state_file = Path(state_file) if state_file is not None else (
+            state_root / f"weixin_state_{_safe_name(self.session_id)}.json"
+        )
+        self._state_lock = threading.Lock()
+        self._on_event = on_event
+
+        self.runtime_state = self._load_state()
+        self.bot_token = str(self.runtime_state.get("bot_token") or "").strip()
+        self.baseurl = str(self.runtime_state.get("baseurl") or self._base_url).strip()
+        self.ilink_bot_id = str(self.runtime_state.get("ilink_bot_id") or "")
+        self.ilink_user_id = str(self.runtime_state.get("ilink_user_id") or "")
+        self.contexts: dict[str, str] = dict(self.runtime_state.get("contexts") or {})
+        contact = self.runtime_state.get("last_contact") or {}
+        self.last_contact = {
+            "from_id": contact.get("from_id") or None,
+            "context_token": contact.get("context_token") or None,
+        }
+        self.welcomed_users = set(self.contexts)
+        self.typing_ticket_cache: dict[str, str] = {}
+        self.manual_reconnect_pending: dict[str, bool] = {}
+
+        self.qr_state = QrFlowState()
+        self.web_on_qrcode = on_qrcode or make_web_on_qrcode(self.qr_state, http)
+        self.login_time = float(self.runtime_state.get("login_time") or time.time())
+        self.last_used_at = time.time()
+
+        self._token_ref = [self.bot_token]
+        self._base_url_ref = [self.baseurl]
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._relogin_task: asyncio.Task | None = None
+        self._relogin_event = asyncio.Event()
+        self._initial_cancel = asyncio.Event()
+        self._ready_event = asyncio.Event()
+        self._relogin_lock = asyncio.Lock()
+        self._pending_relogin: asyncio.Future | None = None
+        self._reconnect_lock = asyncio.Lock()
+        # Serializes _drain_batch vs _reconnect so the token-clear in
+        # _reconnect() cannot race with an in-flight AI / send reply.
+        # See docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5.2.
+        self._drain_lock = asyncio.Lock()
+        # Keep an authenticated session alive while its credential is being
+        # replaced.  _reconnect() intentionally clears bot_token before QR
+        # login, so the token alone cannot describe this transitional state.
+        self._reauthenticating = False
+        # "This session used to be authenticated and now needs a fresh QR".
+        # Persisted in the state file so a restart during the QR window can
+        # resurrect the session instead of dropping the account for good.
+        # See docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md.
+        self._reauthentication_required = bool(
+            self.runtime_state.get("reauth_required")
+        )
+        # True while the session is parked waiting for a human to scan a QR.
+        # The session stays alive (no token, no message loop) instead of being
+        # torn down, so the account can be recovered at any time.
+        # See docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md.
+        self._awaiting_scan = False
+        self._initializing = False
+        self._started = False
+        self._stopped = False
+        self._stop_lock = asyncio.Lock()
+        self._fatal = asyncio.Event()
+        # Decoupled QR switch state (user-driven only; "web switch" / "manual").
+        # The current bot_token stays alive while a switch QR is outstanding;
+        # only an actual scan triggers an atomic swap.  See
+        # docs/2026-09-16_DECOUPLED_QR_SWITCH.md §3 for the design rationale.
+        self._pending_qr_token: Optional[str] = None
+        self._pending_qr_started_at: float = 0.0
+        self._pending_qr_task: Optional[asyncio.Task] = None
+        # Outcome of the last decoupled QR switch.  ``_pending_qr_task`` is
+        # cleared as soon as the task finishes, so a caller that arrives
+        # *after* the switch completed (e.g. BotSession.start() waking up
+        # late) still needs to know whether a scan happened.
+        self._pending_qr_result: dict[str, Any] = {}
+
+        self.ai = ai_client if ai_client is not None else self._make_ai(self.config)
+
+    @property
+    def _base_url(self) -> str:
+        return str(self.config.get("ilink_base_url") or "https://ilinkai.weixin.qq.com")
+
+    @property
+    def has_authenticated_connection(self) -> bool:
+        """Whether this session owns a token that can be kept alive.
+
+        The browser login page is only a control plane.  Once iLink has
+        returned a bot token, the connection is owned by the background
+        session and must outlive an idle browser tab.
+        """
+        return bool(
+            str(self._token_ref[0] or self.bot_token or "").strip()
+            or self._reauthenticating
+            or self._reauthentication_required
+        )
+
+    @staticmethod
+    def _make_ai(config: dict[str, Any]) -> Any:
+        """Build one private AI/IMA stack without reading global credentials."""
+        try:
+            from bot import _AIWithIma, create_ai_client
+            cfg = dict(config)
+            if "api_key" not in cfg:
+                provider = cfg.get("provider", "dusapi")
+                cfg.update(dict((cfg.get("providers") or {}).get(provider) or {}))
+                cfg["provider"] = provider
+            base = create_ai_client(cfg)
+            ima_env = dict(config.get("ima_env") or {})
+            if not ima_env:
+                return base
+            from ima import ImaClient, ImaConfig
+
+            def integer(name: str, default: int) -> int:
+                try:
+                    return int(ima_env.get(name, default))
+                except (TypeError, ValueError):
+                    return default
+
+            def decimal(name: str, default: float) -> float:
+                try:
+                    return float(ima_env.get(name, default))
+                except (TypeError, ValueError):
+                    return default
+
+            enabled = lambda name: str(ima_env.get(name, "")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+            search_limit = max(1, integer("IMA_ILINK_SEARCH_LIMIT", 5))
+            ima_config = ImaConfig(
+                base_url=str(ima_env.get("IMA_ILINK_BASE_URL") or "https://ima.qq.com").rstrip("/"),
+                client_id=str(ima_env.get("IMA_ILINK_CLIENT_ID") or ""),
+                api_key=str(ima_env.get("IMA_ILINK_API_KEY") or ""),
+                default_knowledge_base_id=str(ima_env.get("IMA_ILINK_DEFAULT_KB") or ""),
+                timeout=max(0.1, decimal("IMA_ILINK_TIMEOUT", 15.0)),
+                search_limit=search_limit,
+                rerank_enabled=enabled("IMA_ILINK_RERANK"),
+                rerank_top_k=max(1, min(integer("IMA_ILINK_RERANK_TOP_K", 3), search_limit)),
+                fetch_body=enabled("IMA_ILINK_FETCH_BODY"),
+                keyword_extract=enabled("IMA_ILINK_KEYWORD_EXTRACT"),
+            )
+            return _AIWithIma(
+                base, ImaClient(ima_config), environ=dict(config.get("runtime_env") or {})
+            )
+        except Exception:
+            # A session can still login and receive commands when AI is not
+            # configured; handle_message returns a useful degraded response.
+            return None
+
+    def _load_state(self) -> dict[str, Any]:
+        state = _empty_state()
+        try:
+            raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                state.update(raw)
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            pass
+        if not isinstance(state.get("contexts"), dict):
+            state["contexts"] = {}
+        if not isinstance(state.get("pending_messages"), list):
+            state["pending_messages"] = []
+        if not isinstance(state.get("processed_message_ids"), list):
+            state["processed_message_ids"] = []
+        return state
+
+    def save_state(self) -> None:
+        with self._state_lock:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            state = dict(self.runtime_state)
+            state.update({
+                "bot_token": self.bot_token,
+                "baseurl": self.baseurl,
+                "ilink_bot_id": self.ilink_bot_id,
+                "ilink_user_id": self.ilink_user_id,
+                "contexts": dict(self.contexts),
+                "last_contact": dict(self.last_contact),
+                "login_time": self.login_time,
+                "reauth_required": bool(self._reauthentication_required),
+            })
+            temp = self.state_file.with_name(self.state_file.name + ".tmp")
+            with temp.open("w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                temp.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temp, self.state_file)
+            self.runtime_state = state
+
+    async def _emit(self, event: str, **payload: Any) -> None:
+        if self._on_event is None:
+            return
+        result = self._on_event(event, self, payload)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def _on_qr(self, content: str) -> None:
+        result = self.web_on_qrcode(content)
+        if asyncio.iscoroutine(result):
+            await result
+        await self._emit("qrcode", content=content)
+
+    async def _apply_login(self, result: dict[str, Any], *, initial: bool = False) -> None:
+        from bot import notify_lifecycle
+
+        new_token = str(result.get("bot_token") or "").strip()
+        if not new_token:
+            raise RuntimeError("登录响应缺少 bot_token")
+        old_token, old_base, old_id = self.bot_token, self.baseurl, self.ilink_bot_id
+        new_base = str(result.get("baseurl") or old_base or self._base_url)
+        new_id = str(result.get("ilink_bot_id") or old_id)
+        account_changed = bool(new_id and old_id and new_id != old_id)
+        if account_changed:
+            self.contexts.clear()
+            self.welcomed_users.clear()
+            self.typing_ticket_cache.clear()
+            self.manual_reconnect_pending.clear()
+            self.last_contact = {"from_id": None, "context_token": None}
+            self.runtime_state["get_updates_buf"] = ""
+            self.runtime_state["pending_messages"] = []
+            self.runtime_state["pending_cursor"] = ""
+            self.runtime_state["processed_message_ids"] = []
+        changed = account_changed or old_token != new_token or old_base != new_base
+        self.bot_token, self.baseurl = new_token, new_base
+        self.ilink_bot_id = new_id
+        self.ilink_user_id = str(result.get("ilink_user_id") or self.ilink_user_id)
+        self._token_ref[0], self._base_url_ref[0] = self.bot_token, self.baseurl
+        self.login_time = time.time()
+        self.qr_state.status = "logged_in"
+        self.qr_state.logged_in_at = self.login_time
+        # A fresh credential means the account no longer waits for a scan.
+        self._reauthentication_required = False
+        self._awaiting_scan = False
+        self.save_state()
+        if changed and old_token:
+            await notify_lifecycle(self.http, "ilink/bot/msg/notifystop", old_token, old_base)
+        if changed or initial:
+            self.typing_ticket_cache.clear()
+            notify_ok = await notify_lifecycle(self.http, "ilink/bot/msg/notifystart", self.bot_token, self.baseurl)
+            from utils.logging_setup import get_logger
+            get_logger("diagnostics").log(20 if notify_ok else 40, "diag stage=notifystart session=%s ok=%s", self.session_id, notify_ok)
+        # Per-user IMA KB 绑定（docs/IMA_PER_USER_BINDING.md §3）：运行时**不**
+        # 写 ima_bindings.json —— 绑定只能由用户在 web UI 或 /bindkb 命令主动
+        # 设置。这里只读一次、记一行日志，便于排查"这个 owner 当前 KB 是什么"。
+        if self.ilink_user_id:
+            try:
+                from utils.ima_bindings import get_default_bindings as _get_bindings
+                from utils.logging_setup import get_logger as _get_logger
+                bindings = await _get_bindings()
+                existing = bindings.lookup(self.ilink_user_id)
+                _get_logger("ima_bindings").info(
+                    "apply_login user=%s kb=%s",
+                    self.ilink_user_id[-12:],
+                    (existing.get("kb_id") if existing else None) or "-",
+                )
+            except Exception as exc:  # 持久化层异常不影响登录流程
+                from utils.logging_setup import get_logger as _get_logger
+                _get_logger("ima_bindings").debug(
+                    "apply_login binding lookup skipped err=%s", exc
+                )
+        await self._emit("logged_in", account_changed=account_changed)
+        # 同账号「待重新扫码」的旧会话留下的状态 → 继承过来（账号连续性）。
+        # 放在 emit 之后：emit 会让 BotManager 把同账号的旧会话驱逐掉
+        # （_evict_same_account），旧会话 stop() 时会把自己的 state 写回去，
+        # 继承必须读那一份最新的。
+        await self._adopt_pending_account_state()
+
+    async def _adopt_pending_account_state(self) -> None:
+        """同账号「待重新扫码」的旧会话留下的状态 —— 继承过来。
+
+        场景（2026-10-26 事故链）：账号 A 的会话因为 iLink token 服务端过期
+        掉线，state 文件里留下 ``reauth_required=True``。用户重新扫码时用的
+        可能是**新会话**（浏览器绑定早过期了，老会话那张二维码没人看得见）。
+        新会话是空的 —— 账号的 contexts / 游标就丢了，用户觉得「机器人失忆了」。
+
+        继承这些：
+
+        - ``contexts`` —— 每个聊天对端的状态（顺带 ``welcomed_users``，别再
+          重复发欢迎语）
+        - ``get_updates_buf`` —— **已提交**的游标，从断点续；没提交的那批
+          服务端会重新推（`_drain_batch` 只在全部成功后才推进游标），所以
+          ``pending_messages`` 不用继承（旧的 context_token 早就过期了）
+        - ``last_contact`` —— 最近一次是谁在说话
+
+        继承完把源文件标记成「不再待扫码」→ 下次重启不会再复活它（省掉
+        每次重启都白烧一轮二维码）。
+        """
+        from utils.logging_setup import get_logger
+        log_state = get_logger("state")
+        uid = str(self.ilink_user_id or "").strip()
+        if not uid:
+            return
+        if str(self.runtime_state.get("get_updates_buf") or "").strip():
+            return  # 自己已经有游标了 → 不是新会话，别动
+        state_dir = self.state_file.parent
+        best: Optional[tuple[float, Path, dict]] = None
+        try:
+            candidates = sorted(state_dir.glob("weixin_state_*.json"))
+        except OSError:
+            return
+        for path in candidates:
+            if path == self.state_file:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if str(data.get("ilink_user_id") or "").strip() != uid:
+                continue
+            if not data.get("reauth_required"):
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            if best is None or mtime > best[0]:
+                best = (mtime, path, data)
+        if best is None:
+            return
+        _mtime, path, data = best
+        contexts = data.get("contexts")
+        adopted_contexts = 0
+        if not self.contexts and isinstance(contexts, dict) and contexts:
+            self.contexts = {str(k): str(v) for k, v in contexts.items()}
+            self.welcomed_users = set(self.contexts)
+            adopted_contexts = len(self.contexts)
+        cursor = str(data.get("get_updates_buf") or "").strip()
+        if cursor:
+            self.runtime_state["get_updates_buf"] = cursor
+        contact = data.get("last_contact")
+        if isinstance(contact, dict) and contact.get("from_id"):
+            self.last_contact = {
+                "from_id": contact.get("from_id"),
+                "context_token": contact.get("context_token"),
+            }
+        self.runtime_state["contexts"] = dict(self.contexts)
+        self.runtime_state["last_contact"] = dict(self.last_contact)
+        self.save_state()
+        # 源文件标记成「不再待扫码」→ 下次重启不复活它
+        try:
+            data["reauth_required"] = False
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            try:
+                tmp.chmod(0o600)
+            except OSError:
+                pass
+            tmp.replace(path)
+        except OSError as exc:
+            log_state.warning("adopt clear reauth flag failed path=%s err=%s",
+                              path, exc)
+        log_state.info(
+            "adopted pending account state uid=%s from=%s contexts=%d cursor_len=%d",
+            uid[-12:], path.name[len("weixin_state_"):-len(".json")],
+            adopted_contexts, len(cursor),
+        )
+
+    async def _login(self, *, reconnect: bool = False) -> dict[str, Any]:
+        from bot import login_with_qrcode
+        local = [self.bot_token] if self.bot_token else []
+        return await login_with_qrcode(
+            self.http, local, existing_state=self.runtime_state,
+            on_qrcode=self._on_qr, web_state=self.qr_state,
+            cancel_event=self._initial_cancel if not reconnect else None,
+            save_qr_artifact=False,
+        )
+
+    async def _reconnect(self) -> dict[str, Any]:
+        from bot import notify_lifecycle
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        # Hold _drain_lock for the entire reconnect: any in-flight _drain_batch
+        # finishes before we clear bot_token; any new _drain_batch that arrives
+        # during QR login waits for us. See
+        # docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5.2.
+        async with self._reconnect_lock, self._drain_lock:
+            self.qr_state.is_regenerating = True
+            self.qr_state.status = "qr_pending"
+            # Never pass a stale token back through local_token_list.  When
+            # iLink returns binded_redirect, login_with_qrcode may otherwise
+            # treat that token as reusable and complete a "relogin" with the
+            # same invalid credential forever.
+            current = self.bot_token
+            current_base = self.baseurl
+            had_authenticated_connection = bool(
+                current or self._reauthentication_required
+            )
+            self._reauthenticating = had_authenticated_connection
+            # From this moment on the session owns no usable credential: it
+            # needs a fresh QR scan.  Persist that fact *before* the QR
+            # window opens, so a restart (a deploy!) during the window
+            # resurrects the session instead of dropping the account for
+            # good.  See docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md.
+            self._reauthentication_required = had_authenticated_connection
+            self.bot_token = ""
+            self._token_ref[0] = ""
+            self.runtime_state["bot_token"] = ""
+            self.save_state()
+            log_reconnect.info(
+                "reconnect clear_token had_authenticated=%s previous_len=%d",
+                had_authenticated_connection, len(current),
+            )
+            # Capture the rollback decision eagerly: a previous token is only
+            # safe to restore when this was a real reauthentication (not a
+            # first-time login) AND the failure is not the binded_redirect
+            # kind that 78e1dfd fixed — restoring there would re-arm the
+            # "already_connected" reuse loop in login_with_qrcode.
+            restore_token = had_authenticated_connection and current
+            try:
+                log_reconnect.info("reconnect login_attempt")
+                result = await self._login(reconnect=True)
+                if result.get("already_connected"):
+                    # Without a local token, binded_redirect is not a valid
+                    # login result.  login_with_qrcode normally regenerates
+                    # the QR; keep this guard for custom/test login hooks.
+                    raise RuntimeError("iLink 返回 binded_redirect，但没有可复用的本地 token")
+                if current:
+                    await notify_lifecycle(self.http, "ilink/bot/msg/notifystop",
+                                           current, current_base)
+                await self._apply_login(result)
+                self._reauthenticating = False
+                self._reauthentication_required = False
+                log_reconnect.info(
+                    "reconnect login_succeeded bot_id=%s",
+                    result.get("ilink_bot_id", "-"),
+                )
+                return result
+            except Exception as exc:
+                # Roll back the previously-cleared token so a transient QR
+                # failure (timeout / MAX_QR_REFRESH_COUNT / network) does
+                # not leave the session in a "half-dead" state where the QR
+                # UI says error but /api/* still returns 401. Skipped for
+                # the binded_redirect guard above (78e1dfd invariant) and
+                # for first-time logins where no prior token exists.
+                if restore_token and "binded_redirect" not in str(exc):
+                    log_reconnect.warning(
+                        "reconnect failed; restoring previous bot_token err=%s",
+                        exc,
+                    )
+                    self.bot_token = current
+                    self._token_ref[0] = current
+                    self.runtime_state["bot_token"] = current
+                    self.save_state()
+                else:
+                    log_reconnect.info(
+                        "reconnect rollback skipped reason=%s exc=%s",
+                        "no_prior_token" if not restore_token else "binded_redirect_guard",
+                        exc,
+                    )
+                # A failed QR attempt must remain recoverable from the web
+                # control plane.  Do not let browser-binding expiry reap a
+                # previously authenticated session while it has no token.
+                if had_authenticated_connection:
+                    self._reauthentication_required = True
+                self.qr_state.status = "error"
+                self.qr_state.last_error = str(exc)
+                await self._emit("relogin_failed", error=str(exc))
+                raise
+            finally:
+                self._reauthenticating = False
+                self.qr_state.is_regenerating = False
+
+    async def request_relogin(self, reason: str = "manual") -> dict[str, Any]:
+        # Always trace *who* asked for a relogin and *which* iLink owner it
+        # targets.  The opaque session token (``session_id``) is logged as-is;
+        # ``ilink_user_id`` is the WeChat-account-stable owner identity and is
+        # truncated to its last 12 chars to keep logs short without leaking
+        # the full sensitive value.  ``bot_id`` rotates per QR so it is safe.
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        owner = (self.ilink_user_id or "")[-12:]
+        log_reconnect.info(
+            "relogin_requested session=%s reason=%s bot_id=%s owner=%s "
+            "stopped=%s authenticating=%s",
+            self.session_id, reason, self.ilink_bot_id or "-",
+            owner or "-", self._stopped, self._reauthenticating,
+        )
+        if self._stopped:
+            raise RuntimeError("session stopped")
+        # User-driven reasons take the decoupled path: the QR is just a display
+        # artifact and the existing bot_token (and the long-poll connection it
+        # backs) stays alive throughout the QR wait.  Only an actual scan on
+        # the new QR triggers an atomic swap.  See
+        # docs/2026-09-16_DECOUPLED_QR_SWITCH.md §3 for the design rationale
+        # and why this must NOT share the listener / _reconnect path used by
+        # server-driven reasons.
+        if reason in {"web switch", "manual"}:
+            return await self._request_qr_switch(reason)
+        async with self._relogin_lock:
+            future = self._pending_relogin
+            if future is None or future.done():
+                future = asyncio.get_running_loop().create_future()
+                self._pending_relogin = future
+            self._initial_cancel.set()
+            self._relogin_event.set()
+        await self._emit("relogin_requested", reason=reason)
+        log_reconnect.debug("request_relogin awaiting reason=%s", reason)
+        try:
+            return await future
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Server-driven relogin failures (stale-token, session-expiry) get
+            # best-effort background retries with conservative backoff (1m / 5m
+            # / 15m). User-driven relogins (web-switch, manual /重新连接) are NOT
+            # retried — we must respect explicit user cancellation. Protocol
+            # §2.7.3 says Tencent bans accounts that retry too fast; the 60s
+            # floor keeps us well clear of that penalty window while still
+            # giving the user one natural "phone at side" cycle to scan QR.
+            if reason in {"stale-token", "session-expiry"} and not self._stopped:
+                from utils.logging_setup import get_logger
+                get_logger("reconnect").info(
+                    "scheduling background relogin retries reason=%s err=%s",
+                    reason, exc,
+                )
+                asyncio.create_task(
+                    self._scheduled_retry_relogin(reason),
+                    name=f"relogin-retry-{self.session_id}",
+                )
+            raise
+
+    async def _request_qr_switch(self, reason: str) -> dict[str, Any]:
+        """User-driven relogin entry point — decoupled from bot_token.
+
+        Mirrors OAuth / open-platform behaviour: a QR is just a display
+        artifact with its own TTL.  The current bot_token and the long-poll
+        connection it backs stay alive throughout the QR wait.  An atomic
+        swap only happens when (and if) the user actually scans the new QR
+        (see :py:meth:`_await_qr_confirmation_and_swap`).
+
+        Returns immediately with a status dict so the caller (the web
+        ``/clawbot/switch`` handler or the ``/重新连接`` command path) does
+        not block on QR confirmation.  The actual confirmation runs in a
+        detached task (``self._pending_qr_task``).
+
+        This method MUST NOT touch ``_relogin_event`` — doing so would race
+        the listener-driven clearing path that ``_reconnect`` implements and
+        re-introduce the binded_redirect / -14 / re-arming bugs that 78e1dfd
+        fixed.
+        """
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        # If a switch is already in flight, ignore the duplicate — the user
+        # already has a QR (or the previous one is about to be applied).  This
+        # also prevents spam-click storms from creating zombie switch tasks.
+        if (self._pending_qr_task is not None
+                and not self._pending_qr_task.done()):
+            log_reconnect.info(
+                "qr_switch debounced reason=%s; pending_qr already in flight",
+                reason,
+            )
+            return {"status": "qr_switch_pending", "reason": reason}
+        # Cancel any previous task defensively (e.g. failed run that never
+        # reached the finally block).
+        if self._pending_qr_task is not None and not self._pending_qr_task.done():
+            self._pending_qr_task.cancel()
+            try:
+                await asyncio.gather(self._pending_qr_task, return_exceptions=True)
+            except Exception:
+                pass
+        qrcode = await self._initiate_qr_switch()
+        self._pending_qr_token = qrcode
+        self._pending_qr_started_at = time.time()
+        self._pending_qr_result = {}
+        self._pending_qr_task = asyncio.create_task(
+            self._run_qr_switch(qrcode),
+            name=f"qr-switch-{self.session_id}",
+        )
+        # An initial QR login may still be in flight (the user pressed
+        # "切换账号" before scanning the very first QR).  It MUST be
+        # cancelled *now* — once the switch task exists, so that
+        # BotSession.start() can find it via ``_pending_qr_task``.
+        #
+        # Without this, the initial flow keeps polling its own QR in
+        # parallel; once its MAX_QR_REFRESH_COUNT is exhausted,
+        # login_with_qrcode raises out of start() → session.stop → the
+        # token that the confirmed switch had already applied is thrown
+        # away and the iLink side is told to stop (notifystop).  That is
+        # exactly how the 2026-10-25 incident killed both sessions.
+        if self._initializing:
+            self._initial_cancel.set()
+        await self._emit("qr_switch_started", reason=reason, qrcode=qrcode)
+        return {"status": "qr_pending", "reason": reason, "qrcode": qrcode}
+
+    async def _initiate_qr_switch(self) -> str:
+        """Fetch a fresh switch QR and push it to the web UI.
+
+        Does NOT touch ``bot_token``, ``_token_ref`` or the persisted state.
+        The current connection keeps running on the existing token until
+        (and unless) the user actually scans the new QR.
+
+        Returns the raw ``qrcode`` string that ``wait_login_confirmation``
+        will poll.  ``qr_state.status`` is left as ``"qr_pending"`` and the
+        web UI gets a freshly rendered PNG via the existing ``_on_qr``
+        callback — the user sees the standard "请用微信扫描" prompt.
+        """
+        from bot import _redact_text, fetch_login_qrcode
+        from utils.logging_setup import get_logger
+        log_qr = get_logger("qr")
+        log_reconnect = get_logger("reconnect")
+        log_reconnect.info(
+            "qr_switch initiate (preserving current token bot_id=%s)",
+            (self.ilink_bot_id or "-"),
+        )
+        # Mark regenerating so the UI shows "正在生成新二维码..." rather than
+        # the now-stale previous QR (mirrors the existing _reconnect flow).
+        self.qr_state.is_regenerating = True
+        self.qr_state.status = "qr_pending"
+        try:
+            # Intentionally pass no local_token_list: iLink's binded_redirect
+            # defence (78e1dfd) only fires when a known token is sent.  In the
+            # decoupled path the existing token is still valid and must NOT
+            # be short-circuited away by a same-device already_connected
+            # response — the user explicitly asked for a fresh QR.
+            data = await fetch_login_qrcode(self.http)
+        except Exception as exc:
+            self.qr_state.is_regenerating = False
+            self.qr_state.status = "error"
+            self.qr_state.last_error = str(exc)
+            log_qr.warning("qr_switch fetch failed err=%s", _redact_text(exc))
+            raise
+        qrcode = str(data.get("qrcode") or "").strip()
+        if not qrcode:
+            self.qr_state.is_regenerating = False
+            self.qr_state.status = "error"
+            self.qr_state.last_error = "二维码响应缺少 qrcode"
+            log_qr.warning("qr_switch fetch failed reason=missing_qrcode")
+            raise RuntimeError("二维码响应缺少 qrcode")
+        qr_content = str(data.get("qrcode_img_content") or qrcode)
+        log_qr.info(
+            "qr_switch fetched qr_len=%d img_content_present=%s",
+            len(qrcode), bool(data.get("qrcode_img_content")),
+        )
+        # _on_qr routes through web_on_qrcode which calls set_qr_png — that
+        # in turn clears is_regenerating and bumps qr_seq, exactly the same
+        # path as a normal /relink QR.  The UI therefore sees a seamless
+        # "new QR ready" transition.
+        await self._on_qr(qr_content)
+        return qrcode
+
+    async def _await_qr_confirmation_and_swap(
+        self, qrcode: str, deadline_s: int
+    ) -> dict[str, Any]:
+        """Poll the switch QR; on confirm, atomic swap; on expire, no-op.
+
+        The QR is purely a display artifact until the user scans it.  This
+        method never clears ``bot_token``; if the QR expires or iLink sends
+        any non-confirm status (already_connected / expired / timeout /
+        scanned-but-redirect), the existing token keeps running.
+
+        On confirm, the swap is performed under ``_reconnect_lock`` AND
+        ``_drain_lock`` so it cannot race with an in-flight ``_drain_batch``
+        reading ``_token_ref[0]`` (the invariant from
+        ``docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5.2``).
+        """
+        from bot import _redact_text, wait_login_confirmation
+        from utils.logging_setup import get_logger
+        log_qr = get_logger("qr")
+        log_reconnect = get_logger("reconnect")
+        try:
+            # allow_already_connected=False: the device IS still authenticated
+            # via the existing token, but the user explicitly asked for a
+            # switch — do not silently no-op by reusing the old credentials.
+            # A binded_redirect / already_connected result will fall through
+            # to the "no-op, preserve token" branch below.
+            result = await wait_login_confirmation(
+                self.http, qrcode,
+                timeout_seconds=deadline_s,
+                allow_already_connected=False,
+                web_state=self.qr_state,
+                cancel_event=None,
+            )
+        except asyncio.CancelledError:
+            log_reconnect.info("qr_switch poll cancelled")
+            raise
+        except Exception as exc:
+            log_reconnect.warning("qr_switch poll failed err=%s", _redact_text(exc))
+            return {"cancelled": True, "error": str(exc)}
+        if not result.get("bot_token"):
+            # Expired / timeout / cancelled / binded_redirect — current
+            # token stays alive.  This is the whole point of the decoupled
+            # path: NOT scanning the QR must not affect the connection.
+            log_reconnect.info(
+                "qr_switch expired (no-op, current token preserved) status=%s",
+                "expired" if result.get("expired")
+                else "timeout" if result.get("timeout")
+                else "already_connected" if result.get("already_connected")
+                else "no-confirm",
+            )
+            return result
+        new_credentials = result
+        bot_id_short = str(new_credentials.get("ilink_bot_id", ""))[:8] or "-"
+        log_reconnect.info(
+            "qr_switch confirmed bot_id=%s; awaiting atomic swap",
+            bot_id_short,
+        )
+        # Atomic swap — same lock discipline as _reconnect so the swap cannot
+        # race an in-flight AI / send reply that is mid-_drain_batch.
+        async with self._reconnect_lock, self._drain_lock:
+            await self._apply_login(new_credentials)
+            # A session that was parked (no token when the switch started) has
+            # no long-poll yet — start it now that we finally hold credentials.
+            self._ensure_message_loop()
+        log_reconnect.info(
+            "qr_switch confirmed and applied bot_id=%s",
+            bot_id_short,
+        )
+        return new_credentials
+
+    async def _run_qr_switch(self, qrcode: str) -> dict[str, Any]:
+        """Background task: poll the switch QR and apply on confirm.
+
+        Returns the new credentials when the QR was confirmed and applied
+        (the caller — :py:meth:`start` — uses this to learn that the
+        session ended up authenticated), or ``{}`` when the QR expired /
+        was not scanned / the poll failed.  Not retried on failure —
+        user-driven relogin respects explicit user cancellation, mirroring
+        the ``request_relogin("web switch")`` /
+        # ``request_relogin("manual")`` no-retry invariant from
+        ``docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md §5``.
+        """
+        from bot import RECONNECT_CONFIG
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        deadline_s = int(RECONNECT_CONFIG.get("qrcode_scan_timeout", 480))
+        try:
+            result = await self._await_qr_confirmation_and_swap(qrcode, deadline_s)
+            self._pending_qr_result = result or {}
+            return result or {}
+        except asyncio.CancelledError:
+            log_reconnect.info("qr_switch cancelled reason=task_cancelled")
+            raise
+        except Exception as exc:
+            log_reconnect.warning("qr_switch background failed err=%s", exc)
+            return {}
+        finally:
+            # Clear pending state.  The current QR (if not confirmed) is dead
+            # anyway; if the UI is still showing it, downgrade to error so
+            # the user can press 切换 again.  On the confirm path,
+            # _apply_login already set qr_state.status="logged_in" so this
+            # check is a no-op.
+            if self._pending_qr_token == qrcode:
+                self._pending_qr_token = None
+                self._pending_qr_started_at = 0.0
+            if self.qr_state.status == "qr_pending":
+                self.qr_state.status = "error"
+                self.qr_state.last_error = "二维码未扫描或已过期"
+            self.qr_state.is_regenerating = False
+            self._pending_qr_task = None
+
+    async def _await_qr_switch_result(self) -> dict[str, Any]:
+        """Wait for the in-flight decoupled QR switch to settle.
+
+        Used by :py:meth:`start` when the initial QR login was cancelled
+        by a user-driven switch.  The switch task applies the credentials
+        itself (see :py:meth:`_await_qr_confirmation_and_swap`), so this
+        helper only has to hand the outcome back:
+
+        - ``{"bot_token": ...}`` — the user scanned, the new credentials
+          are already applied;
+        - ``{}`` — the QR expired / was never scanned / the poll failed,
+          i.e. the session still has no usable credentials.
+
+        Never raises for a business failure (an expired QR is a normal
+        outcome, not an error) — only ``asyncio.CancelledError``.
+        """
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        while True:
+            task = self._pending_qr_task
+            if task is None:
+                # The switch already finished (its task is cleared in the
+                # ``finally`` block) — fall back to the recorded outcome.
+                log_reconnect.info(
+                    "qr_switch result already settled confirmed=%s",
+                    bool(self._pending_qr_result.get("bot_token")),
+                )
+                return dict(self._pending_qr_result or {})
+            try:
+                result = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # The switch task itself was cancelled (a newer switch
+                # superseded it) → follow the new one.  A cancellation of
+                # *this* coroutine leaves the inner task alive, so
+                # ``task.cancelled()`` is False and we re-raise.
+                if (task.cancelled()
+                        and self._pending_qr_task is not None
+                        and self._pending_qr_task is not task):
+                    continue
+                raise
+            except Exception as exc:
+                log_reconnect.warning("qr_switch failed err=%s", exc)
+                return {}
+            return result or {}
+
+    async def _relogin_listener(self) -> None:
+        while True:
+            await self._relogin_event.wait()
+            self._relogin_event.clear()
+            if self._initializing:
+                await self._ready_event.wait()
+            async with self._relogin_lock:
+                future = self._pending_relogin
+            if future is None or future.done():
+                continue
+            try:
+                result = await self._reconnect()
+                if not future.done():
+                    future.set_result(result)
+            except asyncio.CancelledError:
+                if not future.done():
+                    future.cancel()
+                raise
+            except Exception as exc:
+                if not future.done():
+                    future.set_exception(exc)
+            finally:
+                async with self._relogin_lock:
+                    if self._pending_relogin is future:
+                        self._pending_relogin = None
+                self._initial_cancel.clear()
+
+    async def _scheduled_retry_relogin(self, reason: str) -> None:
+        """Best-effort background retry after a failed request_relogin.
+
+        Server-driven reasons (``stale-token`` / ``session-expiry``) are
+        retried with conservative backoff (60s / 300s / 900s, total ~21 min).
+        User-driven reasons (``web-switch`` / ``manual``) must NOT reach this
+        method — the caller in :py:meth:`request_relogin` only schedules the
+        retry for the safe reason set. The schedule respects protocol
+        §2.7.3 (Tencent bans accounts that retry too fast).
+
+        The retry calls :py:meth:`_reconnect` directly, NOT through
+        :py:meth:`request_relogin`, so it does not touch
+        ``self._pending_relogin`` and cannot race with a new
+        listener-driven relogin. ``_reconnect_lock`` serializes concurrent
+        retries with normal relogin traffic, so multiple retry tasks
+        piling up after repeated -14 events simply queue.
+        """
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        delays = (60, 300, 900)
+        for delay in delays:
+            if self._stopped:
+                return
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            if self._stopped:
+                return
+            log_reconnect.info(
+                "scheduled_retry_relogin attempt reason=%s delay_s=%d",
+                reason, delay,
+            )
+            try:
+                result = await self._reconnect()
+                log_reconnect.info(
+                    "scheduled_retry_relogin succeeded reason=%s bot_id=%s",
+                    reason, (result.get("ilink_bot_id") or "-"),
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_reconnect.warning(
+                    "scheduled_retry_relogin failed reason=%s delay_s=%d err=%s",
+                    reason, delay, exc,
+                )
+        log_reconnect.error(
+            "scheduled_retry_relogin exhausted reason=%s total_attempts=%d",
+            reason, len(delays),
+        )
+
+    async def start(self) -> "BotSession":
+        if self._started:
+            return self
+        if self._stopped:
+            raise RuntimeError("session stopped")
+        # Listener is intentionally created before QR login so /relink can
+        # cancel and take over an initial QR flow.
+        self._relogin_task = asyncio.create_task(self._relogin_listener(), name=f"relogin-{self.session_id}")
+        self._initializing = True
+        already_applied = False
+        parked = False
+        try:
+            if self.bot_token:
+                result = {"bot_token": self.bot_token, "baseurl": self.baseurl,
+                          "ilink_bot_id": self.ilink_bot_id, "ilink_user_id": self.ilink_user_id}
+            else:
+                try:
+                    # Cancel the in-flight 35s QR status request immediately
+                    # when /relink asks the listener to take over.
+                    login_task = asyncio.create_task(self._login(), name=f"initial-login-{self.session_id}")
+                    cancel_task = asyncio.create_task(self._initial_cancel.wait(),
+                                                      name=f"cancel-login-{self.session_id}")
+                    done, _ = await asyncio.wait((login_task, cancel_task),
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                    if cancel_task in done and not login_task.done():
+                        login_task.cancel()
+                    result = await login_task
+                except asyncio.CancelledError:
+                    # Only the explicit relogin signal may interrupt initial QR.
+                    if not self._initial_cancel.is_set():
+                        raise
+                    self._initializing = False
+                    self._ready_event.set()
+                    async with self._relogin_lock:
+                        pending = self._pending_relogin
+                    if pending is not None:
+                        result = await asyncio.shield(pending)
+                        already_applied = True
+                    else:
+                        # Decoupled QR-switch path ("web switch" / "manual"):
+                        # the switch task owns the login now.  It applies the
+                        # new credentials itself, so we only wait for its
+                        # outcome.  If the user never scanned, the switch
+                        # expires without credentials — fall back to a fresh
+                        # initial QR login instead of leaving the session
+                        # dead (the pre-fix behaviour killed the session
+                        # here, taking the applied token down with it).
+                        result = await self._await_qr_switch_result()
+                        if result.get("bot_token"):
+                            already_applied = True
+                        else:
+                            from utils.logging_setup import get_logger
+                            get_logger("reconnect").info(
+                                "qr_switch expired without confirmation; "
+                                "falling back to initial login",
+                            )
+                            self._initial_cancel.clear()
+                            result = await self._login()
+                            already_applied = False
+                except RuntimeError as exc:
+                    # 2026-10-26：二维码窗口内没人扫码，**不能因此打死账号**。
+                    # login_with_qrcode 在 MAX_QR_REFRESH_COUNT(3) 次刷新后抛
+                    # RuntimeError；以前这个异常一路冒到 BotManager._bootstrap
+                    # → session.stop() → 账号从此没有会话（state 文件还在，
+                    # 但必须重新扫码才能回来，而且没人看得到那张二维码）。
+                    # 现在把会话 park 住：页面随时可以点「切换用户」重新拉
+                    # 二维码（解耦路径不碰 token，扫码确认后才原子换凭据）。
+                    parked = await self._park_awaiting_scan(exc)
+                    if not parked:
+                        raise
+                    result = {}
+                finally:
+                    if "cancel_task" in locals() and not cancel_task.done():
+                        cancel_task.cancel()
+                    if "cancel_task" in locals():
+                        await asyncio.gather(cancel_task, return_exceptions=True)
+                    if "login_task" in locals() and not login_task.done():
+                        login_task.cancel()
+                        await asyncio.gather(login_task, return_exceptions=True)
+        finally:
+            self._initializing = False
+            self._ready_event.set()
+        if parked:
+            # No credentials yet → no long-poll can run.  The session stays
+            # alive so the browser can re-arm the QR at any time; the message
+            # loop is started by _ensure_message_loop() once a scan lands.
+            self._started = True
+            await self._emit("started")
+            return self
+        if not already_applied:
+            await self._apply_login(result, initial=True)
+        self._started = True
+        self._ensure_message_loop()
+        await self._emit("started")
+        return self
+
+    def _ensure_message_loop(self) -> None:
+        """（重新）拉起 getupdates 长轮询。
+
+        长轮询是 iLink 连接的保活手段，没有 token 时它跑不起来，所以只在拿到
+        凭据之后启动。幂等：已经在跑就直接返回 —— 这样「扫码确认后补启动」
+        和「start() 正常启动」可以共用同一个入口。
+        """
+        task = self._tasks.get("message")
+        if task is not None and not task.done():
+            return
+        self._tasks["message"] = self._supervised("message", self._message_loop())
+        from utils.logging_setup import get_logger
+        get_logger("diagnostics").info("diag stage=message_worker_created session=%s", self.session_id)
+        # getupdates is the protocol keepalive.  A local wall-clock timer
+        # must not force a user to scan a new QR while the token is valid.
+        from bot import RECONNECT_CONFIG
+        if RECONNECT_CONFIG.get("proactive_relogin", False) and "timer" not in self._tasks:
+            self._tasks["timer"] = self._supervised("timer", self._timer_loop())
+
+    async def _park_awaiting_scan(self, reason: object) -> bool:
+        """二维码窗口内没人扫码 → 把会话停在「等待扫码」，而不是打死账号。
+
+        背景（2026-10-26 事故链的最后一环）::
+
+            iLink token 服务端过期(-14) → 清 token → 进二维码窗口
+              → 窗口内没人扫码 → login_with_qrcode 抛 MAX_QR_REFRESH_EXCEEDED
+              → start() 抛错 → BotManager._bootstrap 把会话从内存摘掉
+              → 账号从此没有会话（state 文件还在，但没人看得到那张二维码）
+
+        park 之后会话留在 manager 里：
+
+        - 页面随时可以点「切换用户」重新拉二维码（``request_relogin
+          ("web switch")`` 走解耦路径：不碰 token，扫码确认后才原子换凭据）；
+        - 扫码确认后 ``_await_qr_confirmation_and_swap`` 调用
+          ``_ensure_message_loop()`` 把长轮询拉起来；
+        - ``reauth_required=True`` 继续落盘 → 重启后仍会被复活。
+
+        返回 True 表示已经 park 住（调用方不要再往上抛）。
+        """
+        from bot import _redact_text
+        from utils.logging_setup import get_logger
+        log_reconnect = get_logger("reconnect")
+        self._awaiting_scan = True
+        self._reauthentication_required = True
+        self.qr_state.status = "awaiting_scan"
+        self.qr_state.last_error = "二维码未扫描或已过期，请点击下方按钮重新生成"
+        self.qr_state.is_regenerating = False
+        try:
+            self.save_state()
+        except Exception as exc:  # 落盘失败不应该把会话打死
+            log_reconnect.warning("parked session state save failed err=%s",
+                                  _redact_text(exc))
+        log_reconnect.info(
+            "session parked awaiting scan sid=%s owner=%s reason=%s",
+            self.session_id,
+            (self.ilink_user_id or "-")[-12:],
+            _redact_text(reason),
+        )
+        return True
+
+    def _supervised(self, name: str, awaitable: Awaitable[Any]) -> asyncio.Task:
+        async def runner() -> None:
+            try:
+                await awaitable
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                from utils.logging_setup import get_logger
+                get_logger("diagnostics").exception("diag stage=worker_failed session=%s task=%s error_type=%s", self.session_id, name, type(exc).__name__)
+                self._fatal.set()
+                await self._emit("task_failed", task=name, error=str(exc))
+                raise
+        task = asyncio.create_task(runner(), name=f"{name}-{self.session_id}")
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        return task
+
+    async def _send_reliable(self, msg: dict[str, Any], to_id: str,
+                             context_token: str, text: str, kind: str,
+                             flow: str = "") -> None:
+        """Send a transactional reply with a replay-stable client id."""
+        from bot import (
+            API_TIMEOUT,
+            ILinkAPIError,
+            _redact_text,
+            api_post,
+            base_info,
+            ensure_business_success,
+        )
+        from utils.logging_setup import get_logger
+
+        identity = self.ilink_bot_id or self.session_id
+        client_id = "openclaw-weixin:" + hashlib.sha256(
+            f"{identity}:{self._message_id(msg)}:{kind}".encode("utf-8")
+        ).hexdigest()[:32]
+        try:
+            result = await api_post(
+                self.http,
+                "ilink/bot/sendmessage",
+                {
+                    "msg": {
+                        "from_user_id": "",
+                        "to_user_id": to_id,
+                        "client_id": client_id,
+                        "message_type": 2,
+                        "message_state": 2,
+                        "context_token": context_token,
+                        "item_list": [{"type": 1, "text_item": {"text": text}}],
+                    },
+                    "base_info": base_info(),
+                },
+                self._token_ref[0],
+                self._base_url_ref[0] or None,
+                timeout=API_TIMEOUT,
+            )
+        except ILinkAPIError as exc:
+            get_logger("message").warning(
+                "send_reliable failed path=sendmessage kind=%s flow=%s err=%s",
+                kind, flow or "-", _redact_text(str(exc)),
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 网络异常不是 ILinkAPIError
+            get_logger("message").warning(
+                "send_reliable failed path=sendmessage kind=%s flow=%s err=%s",
+                kind, flow or "-", _redact_text(f"{type(exc).__name__}: {exc}"),
+            )
+            raise
+        try:
+            ensure_business_success(result, "sendmessage")
+        except ILinkAPIError as exc:
+            # HTTP 200 但业务失败（ret/errcode != 0）—— 跟传输失败一样要记，
+            # 否则「没发出去」这件事在日志里完全没有痕迹。
+            get_logger("message").warning(
+                "send_reliable failed path=sendmessage kind=%s flow=%s err=%s",
+                kind, flow or "-", _redact_text(str(exc)),
+            )
+            raise
+        # 埋点放在这里而不是各个调用点 —— _send_reliable 是所有「可靠回复」的
+        # 唯一出口（命令分支、AI 分支、语音提示、重连确认…）。只挂在 AI 分支
+        # 的话，命令类回复发出去了却看不到 reply_sent，排查时会误判成「没回复」。
+        get_logger("diagnostics").info(
+            "diag stage=reply_sent session=%s kind=%s from_suffix=%s flow=%s",
+            self.session_id, kind, to_id[-6:], flow or "-",
+        )
+
+    def _kb_scope(self) -> str:
+        """该账号的知识库隔离键。
+
+        用 ``ilink_user_id``（bot 账号，微信账号级稳定）而不是
+        ``ilink_bot_id``（每次扫码轮换）。净化成 ``[A-Za-z0-9_]`` 当目录名。
+        """
+        uid = str(self.ilink_user_id or "").strip()
+        if not uid:
+            return ""
+        return re.sub(r"[^A-Za-z0-9]+", "_", uid).strip("_")
+
+    def _ai_chat_kwargs(self) -> dict[str, Any]:
+        """传给 ``ai.chat`` 的额外参数。
+
+        ``kb_scope`` 只有 ``_AIWithIma`` 那层认（它的 ``chat`` 收 **kwargs）；
+        没配 IMA 时是裸 provider（``chat(message, model=..., ...)``），
+        硬塞会 TypeError —— 所以先看一眼签名。
+        """
+        chat = getattr(self.ai, "chat", None)
+        if chat is None:
+            return {}
+        try:
+            params = inspect.signature(chat).parameters
+        except (TypeError, ValueError):
+            return {}
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return {"kb_scope": self._kb_scope()}
+        return {}
+
+    async def _ai_chat_kwargs_async(self) -> dict[str, Any]:
+        """``_ai_chat_kwargs`` + per-user 的 IMA 云端 KB 绑定（``kb_id``）。
+
+        ``_AIWithIma.chat`` 认 ``kb_id`` kwarg（``bot.py`` 里
+        ``kb_id = kwargs.pop("kb_id", None)``），为 ``None`` 时回落到
+        ``ImaConfig.default_knowledge_base_id`` —— 也就是**所有账号共用同一个
+        云端知识库**。per-user 绑定（``ima_bindings.json``，按
+        ``ilink_user_id`` 查）必须在这里传下去，否则绑了也不生效：
+        web UI 写的绑定是死的。
+
+        ⚠️ 查绑定是 async（``get_default_bindings``）且会读文件，所以这个
+        方法必须是 async —— 调用点在 ``_handle_message`` 里，AI 调用本身
+        仍然在 ``asyncio.to_thread`` 里跑（保持不阻塞 event loop）。
+        """
+        kwargs = self._ai_chat_kwargs()
+        if not kwargs:
+            # 不是 _AIWithIma（裸 provider）→ 没有 kb_id 概念
+            return kwargs
+        owner_id = str(self.ilink_user_id or "").strip()
+        if not owner_id:
+            return kwargs
+        from utils.logging_setup import get_logger
+        try:
+            from utils.ima_bindings import get_default_bindings as _get_bindings
+            bindings = await _get_bindings()
+            kb_id = bindings.lookup_kb_id(owner_id)
+        except Exception as exc:  # 持久化层异常不能让回复失败
+            get_logger("ima_bindings").warning(
+                "ai kb binding lookup failed user=%s err=%s", owner_id[-12:], exc
+            )
+            return kwargs
+        if kb_id:
+            kwargs["kb_id"] = kb_id
+            get_logger("ima_bindings").info(
+                "ai kb route user=%s kb=%s", owner_id[-12:], kb_id
+            )
+        return kwargs
+
+    async def _handle_message(self, msg: dict[str, Any]) -> None:
+        from bot import (
+            COMMANDS_MSG,
+            INTRO_DETAIL_MSG,
+            VOICE_TRANSCRIPT_UNAVAILABLE_MSG,
+            extract_message_text,
+            extract_voice_transcript,
+            is_voice_message,
+        )
+        if not isinstance(msg, dict) or msg.get("message_type") != 1:
+            return
+        from_id = str(msg.get("from_user_id") or "")
+        context = str(msg.get("context_token") or "")
+        if not from_id or not context:
+            return
+        from utils.logging_setup import get_logger
+        flow = self._flow_id(msg)
+        get_logger("diagnostics").info(
+            "diag stage=inbound session=%s flow=%s from_suffix=%s",
+            self.session_id, flow, from_id[-6:],
+        )
+        # iLink's voice_item.text is its server-side ASR result.  Once it is
+        # present, this deliberately follows the exact same command/LLM path
+        # as ordinary text; no voice capability explanation is sent.
+        text = extract_message_text(msg).strip()
+        has_voice = is_voice_message(msg)
+        voice_text = extract_voice_transcript(msg).strip() if has_voice else ""
+        # 每条入站消息都记一行：谁（from_user_id）、什么形态、多长、正文前 30 字。
+        # 生产路径以前只有语音分支记，文本消息只在 api DEBUG 行里露个头 —— 而
+        # 那行被 _redact_text 截到 500 字符，正文正好落在截断之外，等于没记。
+        # 遗留的 bot.py 一直有这行（生产不走那条路），这里补齐。
+        from bot import log_msg
+        log_msg.info(
+            "recv msg from=%s type=%s len=%d preview=%r",
+            from_id[-12:] if from_id else "-",
+            ("voice_transcript" if voice_text
+             else "voice_without_transcript" if has_voice
+             else "text"),
+            len(text),
+            (text or "")[:30],
+        )
+        if has_voice:
+            # A voice message gets either the LLM answer or the actionable
+            # missing-transcript feedback.  It must not be prefixed with the
+            # long first-contact welcome message.
+            self.welcomed_users.add(from_id)
+        self.last_contact = {"from_id": from_id, "context_token": context}
+        self.contexts[from_id] = context
+        self.runtime_state["last_contact"] = dict(self.last_contact)
+        self.runtime_state["contexts"] = dict(self.contexts)
+        self.save_state()
+        normalized = text.upper()
+        if self.manual_reconnect_pending.get(from_id) and normalized in ("Y", "N"):
+            self.manual_reconnect_pending.pop(from_id, None)
+            await self._send_reliable(
+                msg, from_id, context,
+                "好的，正在重新连接..." if normalized == "Y" else "已取消重新连接",
+                "reconnect-confirm", flow=flow,
+            )
+            if normalized == "Y":
+                await self.request_relogin("manual")
+            return
+        if has_voice and not voice_text:
+            await self._send_reliable(
+                msg, from_id, context,
+                VOICE_TRANSCRIPT_UNAVAILABLE_MSG,
+                "voice-transcript-missing", flow=flow,
+            )
+            return
+
+        if not text:
+            return
+
+        # Welcome is additive: the first user message must still reach the AI.
+        if from_id not in self.welcomed_users:
+            self.welcomed_users.add(from_id)
+            await send_msg_safe(self.http, from_id, context, INTRO_DETAIL_MSG,
+                                self._token_ref, self._base_url_ref)
+        if normalized == "/HELP" or text == "/指令":
+            await self._send_reliable(
+                msg, from_id, context, COMMANDS_MSG, "help", flow=flow
+            )
+            return
+        if normalized == "/TIME":
+            from bot import RECONNECT_CONFIG
+            if RECONNECT_CONFIG.get("proactive_relogin", False):
+                remaining = max(
+                    0.0,
+                    self.login_time
+                    + float(RECONNECT_CONFIG.get("session_duration", 86400))
+                    - time.time(),
+                )
+                hours = int(remaining // 3600)
+                minutes = int((remaining % 3600) // 60)
+                seconds = int((remaining % 60))
+                display = (
+                    f"{hours} 小时 {minutes} 分钟"
+                    if hours else f"{minutes} 分钟 {seconds} 秒"
+                )
+                text_reply = f"当前连接剩余时间：{display}"
+            else:
+                text_reply = "当前连接由后台持续维护，服务端 token 失效时会自动恢复。"
+            await self._send_reliable(
+                msg, from_id, context, text_reply, "time", flow=flow
+            )
+            return
+        if text == "/重新连接":
+            self.manual_reconnect_pending[from_id] = True
+            await self._send_reliable(
+                msg, from_id, context, "确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消",
+                "reconnect-prompt", flow=flow,
+            )
+            return
+        # 发布类消息（贴图号 / 图文 → 公众号草稿箱）走 xiaolvshu 桥。
+        #
+        # 桥那边按 from_id 隔离：每个人的 vault、输出目录、公众号凭据都是自己的。
+        # 语音转写走的是同一条路径 —— 说完「发贴图号 沉香」和打字没区别。
+        #
+        # 认领失败（不是发布意图）返回 None，照常落回 AI 对话。
+        try:
+            from utils.xiaolvshu import handle as xiaolvshu_handle
+        except Exception as exc:  # noqa: BLE001 —— 桥模块坏了不能拖垮聊天
+            from utils.logging_setup import get_logger
+            get_logger("publish").error(
+                "flow=%s stage=publish_unavailable err=%s", flow, exc,
+            )
+            xiaolvshu_handle = None
+        if xiaolvshu_handle is not None:
+            try:
+                xreply = await xiaolvshu_handle(text, from_id, flow=flow)
+            except Exception as exc:  # noqa: BLE001
+                from utils.logging_setup import get_logger
+                get_logger("publish").exception(
+                    "flow=%s stage=publish_exception err=%s", flow, exc,
+                )
+                xreply = f"❌ 发布链路出错：{type(exc).__name__}: {exc}"
+            if xreply is not None:
+                # 发稿归属全靠 from_user_id（桥的 --user 参数 = 这个值），
+                # 所以这里把**完整** uid 记下来 —— 管理员要照着它填 .env 的
+                # XIAOLVSHU_USER_<uid净化>_ 三元组。
+                log_msg.info(
+                    "xiaolvshu user=%s cmd=%r reply_len=%d",
+                    from_id, text[:60], len(xreply or ""),
+                )
+                await self._send_reliable(
+                    msg, from_id, context, xreply, "xiaolvshu", flow=flow
+                )
+                from utils.logging_setup import get_logger
+                get_logger("publish").info(
+                    "flow=%s stage=reply_sent kind=xiaolvshu reply_len=%d",
+                    flow, len(xreply or ""),
+                )
+                return
+        ticket = await get_typing_ticket_safe(self.http, from_id, context,
+                                              self.typing_ticket_cache,
+                                              self._token_ref, self._base_url_ref)
+        typing = False
+        try:
+            typing = await send_typing_safe(self.http, from_id, ticket, 1,
+                                            self._token_ref, self._base_url_ref)
+            if self.ai is None:
+                reply = "AI 服务尚未配置，请联系管理员。"
+            else:
+                from utils.logging_setup import get_logger
+                get_logger("diagnostics").info("diag stage=ai_begin session=%s", self.session_id)
+                # per-user 的 IMA 云端 KB 绑定要在这里查出来传下去 ——
+                # 不传 kb_id 的话所有账号都回落到全局 IMA_ILINK_DEFAULT_KB，
+                # per-user 绑定（web UI 写的）就形同虚设。
+                chat_kwargs = await self._ai_chat_kwargs_async()
+                # asyncio.to_thread 而不是 loop.run_in_executor：后者提交到
+                # executor 线程，而 executor 线程**不继承 contextvars** ——
+                # USER_LOG_CONTEXT 在线程里读出来是 "-"，
+                # 于是 clawbot.ai / clawbot.ima / clawbot.semantic 的日志
+                # 全部丢掉了 user= 维度。多用户共享进程里就无法判断
+                # 某次 AI/IMA 调用属于哪个账号。to_thread 会复制当前 context。
+                reply = await asyncio.to_thread(
+                    partial(self.ai.chat, text, **chat_kwargs)
+                )
+                get_logger("diagnostics").info("diag stage=ai_complete session=%s", self.session_id)
+            reply = str(reply or "抱歉，我暂时没有生成有效回复。").strip()
+            # AI replies are part of the reliable message transaction.  Unlike
+            # optional welcome/typing messages, delivery failure must raise so
+            # the inbound cursor is not committed and the batch can replay.
+            # （reply_sent 埋点在 _send_reliable 内部统一打，这里不再重复。）
+            await self._send_reliable(
+                msg, from_id, context, reply, "ai-reply", flow=flow
+            )
+        finally:
+            if typing:
+                await send_typing_safe(self.http, from_id, ticket, 2,
+                                       self._token_ref, self._base_url_ref)
+
+    @staticmethod
+    def _message_id(msg: dict[str, Any]) -> str:
+        for key in ("msg_id", "message_id", "client_id"):
+            if msg.get(key):
+                return str(msg[key])
+        return hashlib.sha256(json.dumps(msg, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def _flow_id(self, msg: dict[str, Any]) -> str:
+        """一次「用户发消息 → clawbot 处理 → 回信息」的关联 id。
+
+        发稿闭环横跨三层（微信入站 → utils/xiaolvshu 调桥 → 回信），
+        每层各记各的日志 —— 没有这个 id 就只能靠时间戳猜哪条是哪条。
+        同一 id 出现在每一条相关日志的 ``flow=`` 字段里，
+        ``grep flow=<id>`` 就能捞出这一次的完整链路。
+        """
+        digest = hashlib.sha256(
+            f"{self.session_id}:{self._message_id(msg)}".encode("utf-8")
+        ).hexdigest()[:8]
+        return digest
+
+    async def _drain_batch(self, messages: list[dict[str, Any]], cursor: str | None) -> None:
+        """Drain one batch of inbound iLink messages.
+
+        Holds ``self._drain_lock`` across the whole body so that an in-flight
+        ``_reconnect()`` cannot clear the bot token mid-batch. If a stale-token
+        (``-14``) error escapes from ``handle_message`` (typically via
+        ``_send_reliable``), the unprocessed messages are preserved in
+        ``runtime_state["pending_messages"]`` and the exception is re-raised
+        so the outer ``_message_loop`` triggers ``request_relogin``; the
+        ``get_updates_buf`` cursor is *not* advanced, so the batch replays
+        after the new token is in place.
+        """
+        async with self._drain_lock:
+            from bot import ILinkAPIError
+            processed = list(map(str, self.runtime_state.get("processed_message_ids") or []))[-1000:]
+            seen = set(processed)
+            for idx, msg in enumerate(messages):
+                mid = self._message_id(msg)
+                if mid in seen:
+                    continue
+                # Public hook intentionally used here: deployments/tests may wrap
+                # ``handle_message`` for tracing or idempotency.
+                try:
+                    await self.handle_message(msg)
+                except ILinkAPIError as exc:
+                    if getattr(exc, "is_stale_token", False):
+                        # Preserve unprocessed messages for replay after relogin.
+                        remaining = [
+                            m for i, m in enumerate(messages)
+                            if i >= idx and self._message_id(m) not in seen
+                        ]
+                        self.runtime_state["pending_messages"] = remaining
+                        if cursor:
+                            self.runtime_state["pending_cursor"] = cursor
+                        self.save_state()
+                        from utils.logging_setup import get_logger
+                        get_logger("reconnect").warning(
+                            "drain_batch stale_token preserving pending count=%d cursor=%s",
+                            len(remaining), bool(cursor),
+                        )
+                        # Re-raise so _message_loop's outer except triggers
+                        # request_relogin("stale-token") — preserves the
+                        # existing relogin control flow.
+                        raise
+                    raise
+                seen.add(mid)
+                processed.append(mid)
+                processed = processed[-1000:]
+                self.runtime_state["processed_message_ids"] = processed
+                self.save_state()
+            self.runtime_state["pending_messages"] = []
+            if cursor:
+                self.runtime_state["get_updates_buf"] = cursor
+            self.save_state()
+
+    async def handle_message(self, msg: dict[str, Any]) -> None:
+        """Process one inbound message in this account's namespace."""
+        await self._handle_message(msg)
+
+    async def process_update_batch(self, payload: dict[str, Any]) -> None:
+        """Persist and process one getupdates batch transactionally.
+
+        ``get_updates_buf`` is deliberately untouched until every message has
+        either completed or been recognized by the persisted idempotency set.
+        """
+        messages = [m for m in (payload.get("msgs") or []) if isinstance(m, dict)]
+        cursor = payload.get("get_updates_buf")
+        self.runtime_state["pending_messages"] = messages
+        self.runtime_state["pending_cursor"] = cursor
+        self.save_state()
+        await self._drain_batch(messages, cursor)
+
+    async def _message_loop(self) -> None:
+        from bot import (LONG_POLL_TIMEOUT, MAX_CONSECUTIVE_FAILURES, RETRY_DELAY,
+                         BACKOFF_DELAY, api_post, base_info, ensure_business_success,
+                         ILinkAPIError, MAX_LONG_POLL_TIMEOUT, _redact_text)
+        if self.runtime_state.get("pending_messages"):
+            await self._drain_batch(self.runtime_state["pending_messages"],
+                                    self.runtime_state.get("pending_cursor"))
+        failures = 0
+        while True:
+            token, base = self._token_ref[0], self._base_url_ref[0]
+            if not token:
+                await asyncio.sleep(1)
+                continue
+            cursor = str(self.runtime_state.get("get_updates_buf") or "")
+            try:
+                result = await api_post(self.http, "ilink/bot/getupdates",
+                                        {"get_updates_buf": cursor, "base_info": base_info()},
+                                        token, base, timeout=LONG_POLL_TIMEOUT,
+                                        long_poll=True, fallback_cursor=cursor)
+                if result.get("_timeout"):
+                    continue
+                if token != self._token_ref[0] or base != self._base_url_ref[0]:
+                    continue
+                ensure_business_success(result, "getupdates")
+                failures = 0
+                msgs = [m for m in (result.get("msgs") or []) if isinstance(m, dict)]
+                if msgs:
+                    from utils.logging_setup import get_logger
+                    get_logger("diagnostics").info("diag stage=getupdates_messages session=%s count=%d", self.session_id, len(msgs))
+                new_cursor = result.get("get_updates_buf")
+                if msgs:
+                    self.runtime_state["pending_messages"] = msgs
+                    self.runtime_state["pending_cursor"] = new_cursor or cursor
+                    self.save_state()
+                    await self._drain_batch(msgs, new_cursor or cursor)
+                elif isinstance(new_cursor, str) and new_cursor:
+                    self.runtime_state["get_updates_buf"] = new_cursor
+                    self.save_state()
+            except asyncio.CancelledError:
+                raise
+            except ILinkAPIError as exc:
+                from utils.logging_setup import get_logger
+                get_logger("diagnostics").warning("diag stage=getupdates_error session=%s stale=%s error_type=%s", self.session_id, getattr(exc, "is_stale_token", False), type(exc).__name__)
+                if getattr(exc, "is_stale_token", False):
+                    try:
+                        await self.request_relogin("stale-token")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc_inner:
+                        # Keep the browser binding/session alive after a QR
+                        # timeout so the user can press Switch and retry.
+                        from utils.logging_setup import get_logger
+                        get_logger("reconnect").warning(
+                            "message_loop stale_token relogin_failed err=%s",
+                            _redact_text(str(exc_inner)),
+                        )
+                        await asyncio.sleep(5)
+                    continue
+                failures += 1
+                await asyncio.sleep(BACKOFF_DELAY if failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY)
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    failures = 0
+
+    async def _timer_loop(self) -> None:
+        from bot import RECONNECT_CONFIG
+        while True:
+            target = (
+                self.login_time
+                + float(RECONNECT_CONFIG.get("session_duration", 86400))
+                - float(RECONNECT_CONFIG.get("force_before", 1800))
+            )
+            remaining = target - time.time()
+            if remaining > 0:
+                await asyncio.sleep(min(300.0, max(1.0, remaining)))
+                continue
+            if self._stopped:
+                return
+            try:
+                await self.request_relogin("session-expiry")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(5)
+
+    async def wait(self) -> None:
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values())
+        else:
+            await self._fatal.wait()
+
+    async def stop(self) -> None:
+        async with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            async with self._relogin_lock:
+                pending = self._pending_relogin
+                self._pending_relogin = None
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                self._relogin_event.set()
+            # Cancel any in-flight decoupled QR switch task so its background
+            # poll does not outlive the session.
+            pending_qr_task = self._pending_qr_task
+            self._pending_qr_task = None
+            self._pending_qr_token = None
+            self._pending_qr_started_at = 0.0
+            tasks = list(self._tasks.values())
+            if self._relogin_task is not None:
+                tasks.append(self._relogin_task)
+            if pending_qr_task is not None and not pending_qr_task.done():
+                pending_qr_task.cancel()
+                tasks.append(pending_qr_task)
+            current = asyncio.current_task()
+            for task in tasks:
+                if task is not current and not task.done():
+                    task.cancel()
+            await asyncio.gather(*(t for t in tasks if t is not current), return_exceptions=True)
+            # Trace every shutdown so the [user=-] notifystop line is no
+            # longer orphaned.  ``caller`` is the asyncio task that asked for
+            # shutdown — useful when multiple paths (manager.stop, sweeper,
+            # _evict_failed, signal handler) converge here.
+            from utils.logging_setup import get_logger
+            log_reconnect = get_logger("reconnect")
+            owner = (self.ilink_user_id or "")[-12:]
+            caller_task = asyncio.current_task()
+            caller_name = caller_task.get_name() if caller_task is not None else "-"
+            log_reconnect.info(
+                "session.stop session=%s owner=%s bot_id=%s "
+                "had_token=%s authenticating=%s reauth_required=%s "
+                "caller=%s",
+                self.session_id, owner or "-", self.ilink_bot_id or "-",
+                bool(self.bot_token), self._reauthenticating,
+                self._reauthentication_required, caller_name,
+            )
+            if self.bot_token:
+                try:
+                    from bot import notify_lifecycle
+                    await asyncio.wait_for(notify_lifecycle(self.http, "ilink/bot/msg/notifystop",
+                                                            self.bot_token, self.baseurl), 11)
+                except Exception:
+                    pass
+            self.save_state()
+            self._started = False

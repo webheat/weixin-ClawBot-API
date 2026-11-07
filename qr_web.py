@@ -54,6 +54,12 @@ class QrFlowState:
     status: str = "idle"  # idle | qr_pending | scanned | logged_in | error
     last_error: Optional[str] = None
     logged_in_at: Optional[float] = None
+    # 最近一次 /relink 触发时间戳（time.monotonic）；用于 handle_relink 去抖，
+    # 避免 spam-click 把 current_qr_png 反复清空导致前端"—"闪动。
+    last_relink_at: float = 0.0
+    # 标记"正在生成新二维码"：handle_relink 触发后置 True（前端显示"正在生成..."），
+    # set_qr_png 写入新 PNG 时置 False。前端不展示老 QR（避免用户扫错码）。
+    is_regenerating: bool = False
 
     def reset_for_new_qr(self) -> None:
         self.verify_prompt = None
@@ -66,6 +72,7 @@ class QrFlowState:
         self.current_qr_png = png
         self.current_qr_url = source_url
         self.qr_seq += 1
+        self.is_regenerating = False  # 新 PNG 就绪，前端可正常显示
 
     def submit_verify_code(self, code: str) -> None:
         self.verify_value = code.strip()
@@ -91,6 +98,7 @@ class QrFlowState:
             "verify_retry": self.verify_retry,
             "last_error": self.last_error,
             "logged_in_at": self.logged_in_at,
+            "is_regenerating": self.is_regenerating,
         }
 
 
@@ -256,6 +264,10 @@ function render(s) {
   }
   if (s.status === "scanned") {
     status.textContent = "已扫码，请在手机上确认...";
+  } else if (s.status === "qr_pending" && s.is_regenerating) {
+    // handle_relink 已触发但 set_qr_png 还没写入新 PNG：展示"正在生成..."
+    // 替代老 QR，避免用户扫描 dead QR 后无反应误以为"已过期"。
+    status.textContent = "正在生成新二维码...";
   } else if (s.status === "qr_pending") {
     status.textContent = "请用微信扫描下方二维码";
   } else if (s.status === "idle") {
@@ -264,7 +276,10 @@ function render(s) {
     status.textContent = s.status;
   }
 
-  if (s.has_qr_png) {
+  if (s.is_regenerating && s.status === "qr_pending") {
+    // 强制覆盖：正在生成新二维码时不展示老 QR 图（避免 dead QR 误导）
+    qrwrap.innerHTML = '<span id="placeholder" style="color:#999">⟳</span>';
+  } else if (s.has_qr_png) {
     const src = "qrcode.png?v=" + s.qr_seq;
     qrwrap.innerHTML = '<img alt="QR" src="' + src + '">';
   } else if (s.status !== "error") {
@@ -379,6 +394,53 @@ async def handle_verify_code(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_relink(request: web.Request) -> web.Response:
+    """强制重置当前 bot 登录态：清 token + 把 qr_state 拉回 qr_pending。
+
+    由 portal 的 /switch 触发（用户主动切换账号），或测试场景直接调。
+    触发后 bot.py 内部的 relogin_listener 会清 runtime_state["bot_token"]
+    并走受控 do_reconnect；前端轮询 state 看到 status=qr_pending 就会重新
+    显示二维码。
+
+    鉴权：与 verify_code 一致，使用 Bearer token（CLAWBOT_WEB_TOKEN）。
+
+    去抖策略（修复 spam-click 引发的"前端 — 闪动"问题）：
+      1. 1.5s 内重复点击 → 200 但不做任何事（防止 listener 来不及响应就把
+         current_qr_png 反复清空、do_reconnect 又来不及出图导致 UI 空窗）
+      2. **不**清 current_qr_png：保留老 QR 直到 do_reconnect 的 set_qr_png
+         自然覆盖，浏览器在等新 QR 时不会闪"—"
+    """
+    if not _check_bearer(request):
+        log_web.warning("relink unauthorized remote=%s", request.remote)
+        return web.json_response({"error": "unauthorized"}, status=401)
+    state: QrFlowState = request.app["qr_state"]
+    now = time.monotonic()
+    # 去抖：1.5s 内重复点击忽略
+    if state.last_relink_at and (now - state.last_relink_at) < 1.5:
+        log_web.info("relink rate-limited (last %.2fs ago)",
+                     now - state.last_relink_at)
+        return web.json_response({"ok": True, "status": state.status,
+                                  "rate_limited": True})
+    state.last_relink_at = now
+    state.reset_for_new_qr()
+    # 关键：标记"正在生成新二维码"。前端看到 is_regenerating=true 会展示
+    # "正在生成新二维码..." 文案而不是老 QR（避免用户扫 dead QR 没反应误以为"过期"）。
+    # 之前的版本清空 current_qr_png 会闪"—"，不清空又会让用户扫错老 QR，二者兼有 bug。
+    state.is_regenerating = True
+    state.status = "qr_pending"
+    state.last_error = None
+    relogin_event = request.app.get("relogin_event")
+    if relogin_event is not None:
+        relogin_event.set()
+        log_web.info("relink triggered via API; bot relogin scheduled")
+    else:
+        # 没有监听器（罕见；如 bot.py 还没注入 event）—— 仍然把 state 重置了，
+        # 用户能看到 QR，但 token 还在；下次 token 失效才会自动重连。
+        log_web.warning("relink triggered but no relogin_event attached; "
+                        "state reset only, bot token not cleared")
+    return web.json_response({"ok": True, "status": state.status})
+
+
 async def handle_index(request: web.Request) -> web.Response:
     """?token=... 注入 WEB_TOKEN 后返回页面，避免跨页脚本读到其它来源。"""
     token = request.query.get("token", "")
@@ -386,7 +448,9 @@ async def handle_index(request: web.Request) -> web.Response:
     return web.Response(text=page, content_type="text/html")
 
 
-async def start(state: QrFlowState, host: Optional[str] = None, port: Optional[int] = None) -> None:
+async def start(state: QrFlowState, host: Optional[str] = None,
+               port: Optional[int] = None,
+               relogin_event: Optional[asyncio.Event] = None) -> None:
     """启动 aiohttp 服务直到被取消。绑端口失败时打 warning 并 return。"""
     bind_host = host or os.getenv(WEB_HOST_ENV, DEFAULT_WEB_HOST)
     bind_port = port if port is not None else int(os.getenv(WEB_PORT_ENV, str(DEFAULT_WEB_PORT)))
@@ -415,10 +479,13 @@ async def start(state: QrFlowState, host: Optional[str] = None, port: Optional[i
 
     app = web.Application(middlewares=[access_log_mw])
     app["qr_state"] = state
+    if relogin_event is not None:
+        app["relogin_event"] = relogin_event
     app.router.add_get("/healthz", handle_healthz)
     app.router.add_get("/state", handle_state)
     app.router.add_get("/qrcode.png", handle_qr_png)
     app.router.add_post("/verify_code", handle_verify_code)
+    app.router.add_post("/relink", handle_relink)
     app.router.add_get("/", handle_index)
 
     runner = web.AppRunner(app)

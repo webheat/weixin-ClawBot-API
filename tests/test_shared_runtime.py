@@ -1,0 +1,438 @@
+"""Focused lifecycle tests for the session-token shared runtime."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+from aiohttp import web
+
+from shared_runtime import (
+    SharedRuntimeConfig,
+    load_default_config,
+    parse_env_file,
+    run_shared,
+)
+
+
+class FakeManager:
+    """Stand-in for ``BotManager`` that records session-creation calls.
+
+    The session-token runtime creates sessions on demand via the web layer
+    (``POST /start``); ``run_shared`` itself does not eagerly start any
+    session.  This fake records every ``create_background`` call so tests
+    can assert the runtime does not auto-spawn anything.
+    """
+
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self.stopped = False
+
+    async def create_background(self, session_id, config, **kwargs):
+        self.started.append(session_id)
+
+    def get(self, session_id):
+        return None
+
+    async def stop_all(self):
+        self.stopped = True
+
+
+def _write_config(path: Path, payload: dict) -> None:
+    (path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_run_shared_does_not_eagerly_start_sessions(tmp_path: Path):
+    """Session-token sessions start on demand via ``POST /start``; the
+    shared listener itself must never auto-spawn a session."""
+    _write_config(tmp_path, {
+        "provider": "dusapi",
+        "providers": {"dusapi": {"model": "base"}},
+    })
+    (tmp_path / "llm.env").write_text(
+        "CLAWBOT_LLM_MODEL=overridden\n", encoding="utf-8"
+    )
+    manager = FakeManager()
+    stop = asyncio.Event()
+    task = asyncio.create_task(run_shared(
+        SharedRuntimeConfig(host="127.0.0.1", port=0, config_dir=tmp_path,
+                            state_dir=tmp_path, env_dir=tmp_path),
+        manager=manager, app=web.Application(), stop_event=stop,
+    ))
+    # Give the listener a tick to settle; nothing should be started.
+    await asyncio.sleep(0.05)
+    assert manager.started == []
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert manager.stopped
+
+
+def test_parse_env_file_is_pure(tmp_path: Path, monkeypatch):
+    env_file = tmp_path / "llm.env"
+    env_file.write_text(
+        "export CLAWBOT_LLM_API_KEY='secret'\n"
+        "CLAWBOT_LLM_MODEL=small # comment\n"
+        "IMA_ILINK_API_KEY=ima-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CLAWBOT_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("CLAWBOT_LLM_MODEL", raising=False)
+    monkeypatch.delenv("IMA_ILINK_API_KEY", raising=False)
+    parsed = parse_env_file(env_file)
+    assert parsed["CLAWBOT_LLM_API_KEY"] == "secret"
+    assert parsed["CLAWBOT_LLM_MODEL"] == "small"
+    assert parsed["IMA_ILINK_API_KEY"] == "ima-key"
+    # ``parse_env_file`` must never mutate the process environment — that
+    # would leak one session's IMA/LLM credentials to every other.
+    assert "CLAWBOT_LLM_API_KEY" not in os.environ
+    assert "CLAWBOT_LLM_MODEL" not in os.environ
+    assert "IMA_ILINK_API_KEY" not in os.environ
+    # Missing file is also a normal case (shared llm.env / ima.env are optional).
+    assert parse_env_file(tmp_path / "absent.env") == {}
+
+
+def test_load_default_config_is_deep_copied_per_call(tmp_path: Path):
+    """Mutating one returned dict must not affect a fresh call's result."""
+    _write_config(tmp_path, {
+        "provider": "dusapi",
+        "providers": {"dusapi": {"model": "base"}},
+    })
+    first = load_default_config(config_dir=tmp_path)
+    first["providers"]["dusapi"]["model"] = "mutated"
+    second = load_default_config(config_dir=tmp_path)
+    assert second["providers"]["dusapi"]["model"] == "base"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26 事故：待重新扫码的会话必须跨重启存活
+# 见 docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md
+# ---------------------------------------------------------------------------
+
+
+def _write_state(state_dir: Path, session_id: str, payload: dict) -> Path:
+    path = state_dir / f"weixin_state_{session_id}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+@pytest.mark.asyncio
+async def test_restore_resurrects_session_awaiting_qr(tmp_path: Path):
+    """A session that lost its token but still waits for a scan is revived."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == ["alice"]
+    assert restored == ["alice"]
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_session_that_never_logged_in(tmp_path: Path):
+    """A session without a token and without the re-auth flag stays dead."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "guest", {"bot_token": ""})
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == []
+    assert restored == []
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_stale_reauth_session(tmp_path: Path):
+    """Nobody scanned for days: the zombie must not come back every boot."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    path = _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+    stale = time.time() - 48 * 3600
+    os.utime(path, (stale, stale))
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir, reauth_restore_window=24 * 3600)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == []
+    assert restored == []
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_duplicate_account(tmp_path: Path):
+    """One WeChat account must not end up with two live sessions."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    _write_state(state_dir, "live", {"bot_token": "live-token", "ilink_user_id": uid})
+    _write_state(state_dir, "zombie", {
+        "bot_token": "",
+        "ilink_user_id": uid,
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == ["live"]
+    assert restored == ["live"]
+
+
+@pytest.mark.asyncio
+async def test_restore_duplicate_claim_only_after_success(tmp_path: Path):
+    """A live session that fails to start must not block its re-auth twin."""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    _write_state(state_dir, "live", {"bot_token": "live-token", "ilink_user_id": uid})
+    _write_state(state_dir, "zombie", {
+        "bot_token": "",
+        "ilink_user_id": uid,
+        "reauth_required": True,
+    })
+
+    class FlakyManager(FakeManager):
+        async def create_background(self, session_id, config, **kwargs):
+            if session_id == "live":
+                raise RuntimeError("boom")
+            await super().create_background(session_id, config, **kwargs)
+
+    manager = FlakyManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == ["zombie"]
+    assert restored == ["zombie"]
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26：复活一个「没人看得见二维码」的会话毫无意义
+# ---------------------------------------------------------------------------
+
+
+class _FakeStore:
+    """最小 BrowserSessions 替身：绑定 + resume token。"""
+
+    def __init__(self, bindings: dict[str, str], resume: dict[str, str]):
+        self._bindings = {k: type("B", (), {"session_id": v})()
+                          for k, v in bindings.items()}
+        self._resume_tokens = {k: (v, 0.0) for k, v in resume.items()}
+
+    async def snapshot(self):
+        return list(self._bindings.items())
+
+    async def resolve_resume(self, token):
+        rec = self._resume_tokens.get(token)
+        return rec[0] if rec else None
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_unreachable_reauth_session(tmp_path: Path):
+    """没有浏览器能到达的 reauth 会话不复活（但 state 文件留着）。
+
+    复活它 = 白烧一轮 8 分钟的二维码窗口 + 一个没人看得见的二维码。
+    state 文件留着，用户重新扫码时新会话会继承它的账号状态。
+    """
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    path = _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    store = _FakeStore(bindings={"b1": "someone-else"}, resume={})
+    restored = await _restore_persisted_sessions(manager, runtime, {}, store=store)
+
+    assert manager.started == []
+    assert restored == []
+    assert path.exists(), "state 文件必须留着（账号连续性要靠它）"
+
+
+@pytest.mark.asyncio
+async def test_restore_revives_reauth_session_when_browser_can_reach(tmp_path: Path):
+    """浏览器还绑着这个会话 → 复活（页面能看见那张二维码，10-26 的修复不变）。"""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    store = _FakeStore(bindings={"b1": "alice"}, resume={})
+    restored = await _restore_persisted_sessions(manager, runtime, {}, store=store)
+
+    assert manager.started == ["alice"]
+    assert restored == ["alice"]
+
+
+@pytest.mark.asyncio
+async def test_restore_revives_reauth_session_with_resume_token_only(tmp_path: Path):
+    """只有 resume token（30 天 cookie）也算能到达。"""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "alice", {
+        "bot_token": "",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+        "reauth_required": True,
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    store = _FakeStore(bindings={}, resume={"tok": "alice"})
+    restored = await _restore_persisted_sessions(manager, runtime, {}, store=store)
+
+    assert manager.started == ["alice"]
+    assert restored == ["alice"]
+
+
+@pytest.mark.asyncio
+async def test_restore_keeps_token_sessions_even_when_unreachable(tmp_path: Path):
+    """带 token 的会话一律复活 —— 浏览器在不在都跟它有关（它自己能收消息）。"""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "alice", {
+        "bot_token": "live-token",
+        "ilink_user_id": "o9cq801uuudERF61XK5qTdTv5Yyg@im.wechat",
+    })
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    store = _FakeStore(bindings={}, resume={})
+    restored = await _restore_persisted_sessions(manager, runtime, {}, store=store)
+
+    assert manager.started == ["alice"]
+    assert restored == ["alice"]
+
+
+@pytest.mark.asyncio
+async def test_restore_dedups_two_live_sessions_of_the_same_account(tmp_path: Path):
+    """同一个微信账号**不能**复活两个带 token 的会话。
+
+    回归于 2026-10-27：恢复路径的去重只拦「无 token」的重复账号
+    （``if not has_token and uid and uid in claimed``）—— 两个都带 token 的
+    同账号会话**两个都会被复活**，于是两个 bot 同时长轮询同一个账号，
+    消息被两边随机抢走 → 用户看到「有时候没人回」。
+
+    隔离的基准是**账号**（ilink_user_id），不是 session_id。
+    """
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    _write_state(state_dir, "live-a", {"bot_token": "token-a", "ilink_user_id": uid})
+    _write_state(state_dir, "live-b", {"bot_token": "token-b", "ilink_user_id": uid})
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert len(manager.started) == 1, (
+        f"同一账号复活了 {len(manager.started)} 个会话：{manager.started} —— "
+        "两个 bot 会抢同一个账号的消息流"
+    )
+    assert len(restored) == 1
+
+
+@pytest.mark.asyncio
+async def test_restore_keeps_different_accounts_concurrently(tmp_path: Path):
+    """不同账号必须能同时复活 —— 账号隔离不能变成「只留一个」。"""
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_state(state_dir, "acct-a", {
+        "bot_token": "token-a", "ilink_user_id": "acct-a@im.wechat"})
+    _write_state(state_dir, "acct-b", {
+        "bot_token": "token-b", "ilink_user_id": "acct-b@im.wechat"})
+    _write_state(state_dir, "acct-c", {
+        "bot_token": "token-c", "ilink_user_id": "acct-c@im.wechat"})
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    restored = await _restore_persisted_sessions(manager, runtime, {})
+
+    assert sorted(manager.started) == ["acct-a", "acct-b", "acct-c"], (
+        f"不同账号没被同时复活：{manager.started}"
+    )
+    assert len(restored) == 3
+
+
+@pytest.mark.asyncio
+async def test_restore_prefers_the_most_recently_logged_in_session(tmp_path: Path):
+    """同一账号有两个 state 文件时，活过来的应该是**最后登录**的那个。
+
+    判据用 ``login_time`` 而不是文件 mtime：state 文件的 mtime 会被
+    ``save_state()`` 刷新 —— 包括**被驱逐的**旧会话（``stop()`` 里也会
+    ``save_state()``），所以 mtime 靠不住。``login_time`` 只在真正登录成功
+    时更新，才代表「这个会话是最后接管这个账号的」。
+
+    否则「哪个会话活着」取决于 session_id 的字典序或 mtime，而不是用户最后
+    用的那个 —— 表现为用户明明刚用过，重新扫码后却像换了个人（上下文/游标
+    对不上）。
+    """
+    from shared_runtime import _restore_persisted_sessions
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    uid = "o9cq806m1rtXSvyUgFcUc_KO_N7I@im.wechat"
+    now = time.time()
+    # aaa-old 在字典序和 mtime 上都"更新"，但 login_time 更旧 ——
+    # 模拟「旧会话刚被驱逐、stop() 刷新了它的 state 文件」
+    old = _write_state(state_dir, "aaa-old", {
+        "bot_token": "t-old", "ilink_user_id": uid, "login_time": now - 3600})
+    _write_state(state_dir, "zzz-new", {
+        "bot_token": "t-new", "ilink_user_id": uid, "login_time": now})
+    # 让 old 的 mtime 更新（被驱逐的会话 stop() 会重写文件）
+    import os
+    os.utime(old, (now, now))
+
+    manager = FakeManager()
+    runtime = SharedRuntimeConfig(state_dir=state_dir)
+    await _restore_persisted_sessions(manager, runtime, {})
+
+    assert manager.started == ["zzz-new"], (
+        f"复活的是 {manager.started}，应该是最后登录的 zzz-new"
+    )

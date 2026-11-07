@@ -11,6 +11,26 @@ weixin_state.json
 config_*.json
 weixin_state_*.json
 
+# Per-user IMA KB 绑定（含 ilink_user_id → kb_id 映射，ilink_user_id 算敏感）
+ima_bindings.json
+ima_bindings_*.json
+
+# 浏览器会话绑定（含 csrf_token / resume_token —— 等同账号访问凭据）
+browser_sessions.json
+browser_sessions_*.json
+
+# Runtime state files (含真实 openid / bot 启动信息)，不入库
+var/
+!var/.gitkeep
+
+# 语义检索 KB 索引（fastembed 跑出来的 sqlite，含 embedding 二进制；可随时重建）
+docs/.semantic_kb.sqlite3
+docs/.semantic_kb.sqlite3-journal
+*.semantic_kb.sqlite3
+
+# fastembed 模型缓存（91MB，放这里才不会因为 /tmp 被清而每次重启重下）
+.cache/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -49,3 +69,7 @@ build/
 
 # 向量 KB 的嵌入缓存（按文件 mtime 失效，可自动重建）
 docs/knowledge/.vector_cache/
+
+# 每账号私有知识库（docs/kb-users/<账号>/）+ 各自的语义索引
+docs/kb-users/*
+!docs/kb-users/README.md

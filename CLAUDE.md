@@ -8,7 +8,20 @@ Python 3.12+ client that speaks Tencent's [OpenClaw Weixin](https://github.com/T
 
 ## Current state (read first)
 
-- **Active priorities** — see `TODO.md`. Current P0 is **per-user conversation history** (bot currently sees only the last message).
+- **Fixed (2026-10-26) — 发版重启打断二维码窗口 → 账号永久掉线**. 用户报告「暂时无法连接openclaw」；多用户隔离本身没问题（另一个账号 `7I@im.wechat` 全程健康），挂掉的是 `yg@im.wechat`。根因链：iLink token 服务端过期（`-14`，协议无心跳端点、客户端活动不续期）→ `_reconnect` 清空 `bot_token` 进二维码窗口 → **窗口期内发版重启** → state 文件只剩 `bot_token=""`（与「从没登录过」不可区分）→ `_restore_persisted_sessions` 见 token 为空就跳过 → 账号永久掉线、浏览器 resume cookie 也失效。修复：`reauth_required` 标志随 state 落盘（在二维码窗口**开始前**就写）+ 恢复路径认这个标志（带时效窗 + 同账号去重两道护栏）。完整时间线 / 恢复步骤见 [`docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md`](docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md)。
+- **Fixed (2026-10-26 16:16) — 二维码窗口没人扫码 → 会话被打死（同一事故链最后一环）**. `BotSession.start()` 在初始二维码失败（`MAX_QR_REFRESH_COUNT` 用尽 → `RuntimeError`）时把异常抛给 `BotManager._bootstrap` → **会话被从 manager 摘掉**；`reauth_required` 还在 state 文件里，但没有任何活着的会话、也没有浏览器绑定指向它 → 那张二维码没人看得见 → 账号又一次「永久掉线」。修复：**park 而不是 die** —— `_park_awaiting_scan()` 把会话留在 manager 里（`qr_state.status="awaiting_scan"`，`reauth_required` 继续落盘），页面点「重新生成二维码」走解耦 QR 切换路径重新出码；扫码确认后 `_await_qr_confirmation_and_swap` 调用新的幂等 `_ensure_message_loop()` 拉起长轮询（否则 park 住的会话拿到 token 也不收消息）。前端 `INDEX_HTML` 识别 `awaiting_scan`（隐藏过期码 + 按钮改文案）。**Invariant: 二维码过期不得终止会话；没有凭据时不得起长轮询。** 见文档 §7。
+
+- **Fixed (2026-10-26) — 「切换账号」during 初始扫码 kills the session**. Root cause + full timeline: [`docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md`](docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md). User hit 「开始」then 「切换账号」**2 秒后**; the switch QR was scanned and applied (`qr_switch confirmed and applied`), but the **parallel** initial login kept polling its own unscanned QR → 3 expiries → `RuntimeError` out of `BotSession.start()` → `session.stop()` → the just-acquired token was thrown away (`session.stop ... had_token=True`). Fix: `_request_qr_switch` now sets `_initial_cancel` when `self._initializing` (kills the parallel initial login), and `start()` waits on `_await_qr_switch_result()` instead of dying; if the switch QR was never scanned it **falls back to a fresh initial login** instead of leaving a credential-less dead session. New attrs: `_pending_qr_result`. Tests: `test_switch_during_initial_login_keeps_applied_token` / `..._falls_back_when_qr_not_scanned` in `tests/test_bot_session_contract.py` (both fail pre-fix). **Invariant: a user-driven switch must never kill the session, and must never discard a token the switch already applied.**
+- **Fixed (2026-10-26) — `ImaConfig.configured()` was missing**. `configured()` existed only on `ImaClient`, but `shared_web.py:444` and `bot.py:2095` call it on an **`ImaConfig`** instance → `AttributeError`. `shared_web`'s call sits inside `try/except Exception`, so the whole web-UI KB-binding path silently degraded to 「IMA 未配置」. Fixed by moving `configured()` down to `ImaConfig` (`ImaClient.configured()` now forwards).
+- **New feature (2026-10-26) — 公众号发稿桥（多用户隔离）**. `/发贴图号 <kw>` / `/发公众号 <kw>` / `/发列表` / `/发状态` / `/选 N` / `/重发 <kw>` 由 `utils/xiaolvshu.py` 认领（自然语言/语音意图也认：动词 + 目标词都出现在开头 14 字才接管），转交 `/opt/obsidian-xiaolvshu/scripts/xiaolvshu_bridge.py` 子进程（stdout 一行 JSON）。**隔离键是 `from_user_id`（发消息的人），不是 `ilink_user_id`（登录的 bot 账号）** —— 共享 bot 的场景下这两者不同。每人独立 vault / 输出目录 / 发布台账 / 公众号凭据（`/etc/clawbot/xiaolvshu/<slug>.env`），桥拒跨 vault 路径（`cross_vault`）。只进草稿箱不群发。改这块先读 `/opt/obsidian-xiaolvshu/README.md` 的「ClawBot 桥」一节。
+- **Active incident (2026-09-16, ongoing) — bot `pid 2365525` alive but iLink dead ~5h**. User reports "暂时无法连接openclaw" (paraphrase of bot silence; literal string NOT in code — see `docs/knowledge/qa-*`). Caused by `POST /clawbot/switch` → 3 QR expired → `MAX_QR_REFRESH_COUNT` → `RuntimeError` → `bot_token=""` permanently (`bot_session.py:336-381` 清 token 后 QR 失败不留回滚). **No self-healing** — `request_relogin` is fire-and-forget (`bot_session.py:358-369`); `0bed146` 删了所有用户提醒. Recovery: Web UI 再点"切换账号" 或微信发 `/重新连接` + 扫一次码. Critical design finding: iLink 2.4.6 has **no heartbeat / keepalive endpoint** (`weixin-openclaw-api-py-docs.md:60-69` 全 8 个端点无 `/heartbeat` / `/ping` / `/refresh_token`); `-14` 是服务端 token 过期判断,客户端活动**不能延长**(`§2.7.3` 协议明确). "让用户无感"的真路径是 in-flight race lock + `_send_reliable` 失败保留 `pending`,**不是**周期性心跳. 完整时间线 / 恢复步骤 / 三方案对比见 [`docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md`](docs/2026-09-16_RECONNECT_AND_KEEPALIVE.md).
+- **Recent cleanup (2026-09-15) — session-based single-process model**. `python bot.py` 默认进入 `shared_runtime.py`：一个 `BotManager` 管理 N 个隔离的 `BotSession`，共享一个 `aiohttp` 连接池和一个 `shared_web` 登录入口。访客进入 `/clawbot/` 拿到一个不透明的 URL-safe session token（铸造点 `shared_web.py:397`）—— 没有命名用户、没有 OAuth、没有 `--user` / `--legacy-single` / `--named-user` CLI。opaque cookie + CSRF + 限流 + TTL GC 是唯一入口。已删除：`qr_portal.py`、`utils/bot_launcher.py`、`utils/oauth_bindings.py`、`wechat_oauth.py`、`docs/WECHAT_OAUTH.md`、`docs/multi-user.md`、`docs/SESSION_BOT_LIFECYCLE.md`（旧 session-lifecycle 文档，2026-09-15 一并清理）。The user identifier that matters is `ilink_user_id` (WeChat-account-stable, only available after QR confirmation); the opaque token is just a session handle.
+- **Recent feature (2026-09-16) — per-user IMA KB binding**. Each bot owner (`ilink_user_id`, NOT `ilink_bot_id` which rotates per QR) can bind their own IMA knowledge base; the binding survives browser cookie death, device switch, and server restart because it lives in a separate file `CLAWBOT_STATE_DIR/ima_bindings.json`. Read [`docs/IMA_PER_USER_BINDING.md`](docs/IMA_PER_USER_BINDING.md) before touching `_AIWithIma.chat` for per-user routing. Three binding entry points: web UI `/clawbot/ima/bind`, WeChat `/bindkb <kb_id>` (owner-gated), `utils/ima_bindings.py` CLI for ops.
+- **Recent design (2026-09-16) — decoupled QR switch (open-platform style)**. User-driven `request_relogin("web switch" | "manual")` no longer clears `bot_token`; the QR is a display artifact with TTL, and only a confirmed scan triggers an atomic `_apply_login` swap under `_drain_lock` + `_reconnect_lock`. Server-driven `request_relogin("stale-token" | "session-expiry")` keeps the 78e1dfd clearing path (the old token is genuinely dead, must be cleared before QR to avoid `binded_redirect` reuse). See [`docs/2026-09-16_DECOUPLED_QR_SWITCH.md`](docs/2026-09-16_DECOUPLED_QR_SWITCH.md) §2 for the rationale. New methods on `BotSession`: `_request_qr_switch` / `_initiate_qr_switch` / `_await_qr_confirmation_and_swap` / `_run_qr_switch`. New `__init__` attrs: `_pending_qr_token` / `_pending_qr_started_at` / `_pending_qr_task`.
+- **New feature (2026-10-26 17:20) — 发贴图号自动开通 + 知识库按账号目录隔离**. **① 自动开通**：管理员只在 `.env` 里写「哪个用户 / 哪个 vault / 哪个公众号」，桥在第一次用到该用户时自动建 vault 目录 + 写凭据文件（`/etc/clawbot/xiaolvshu/<slug>.env`，600），不用手工跑 `init`/`set-creds`。变量名 `XIAOLVSHU_USER_<uid净化>_VAULT|_APP_ID|_APP_SECRET`（`<uid>` = from_user_id 净化成非字母数字全 `_`；`VAULT` 值里可用 `{slug}`/`{uid}` 占位符；值含 REPLACE/PLACEHOLDER/TODO 视为「还没填」→ 跳过该字段）。桥侧实现在 `xiaolvshu_bridge.ensure_user`（外部项目 `/opt/obsidian-xiaolvshu`）。**② 知识库隔离**：共享基座 `docs/knowledge/` 所有人可读；每个 **bot 账号**（`ilink_user_id` 净化，不是 `ilink_bot_id`）在 `docs/kb-users/<key>/` 下有只属于它的笔记 + 自己的 `.semantic_kb.sqlite3`。`LocalKBIndex`/`SemanticKBIndex` 支持 `extra_dirs` 两层（基座 + 私有），私有命中项 media_id 带 `user/<n>/` 前缀。隔离键与作用域见 [`docs/USER_PROVISIONING_AND_KB_ISOLATION.md`](docs/USER_PROVISIONING_AND_KB_ISOLATION.md)。**⚠️ 两套 env 别搞混**：项目 `.env` → 进程环境 → 桥子进程（`XIAOLVSHU_*`）；`/etc/clawbot/{llm,ima}.env` → 每会话 `runtime_env` → `_AIWithIma`（`CLAWBOT_*`）。`CLAWBOT_USER_KB_DIR` 写进项目 `.env` **不生效**。
+- **Fixed (2026-10-26 20:14) — 「没人看得见的二维码」+ 账号连续性**. 恢复路径复活的是**一个没人找得到的会话**，而不是账号：浏览器绑定 TTL 8h 早过期了，没人能到达那个会话 → 它每次重启都白烧一轮 8 分钟二维码窗口，然后 park 住等人看不见（用户侧症状还是「暂时无法连接openclaw」）。修法：**① 不复活没人能到达的会话** —— `_restore_persisted_sessions` 多带一个 `store`（`shared_web` 把 `BrowserSessions` 挂在 `app["browser_store"]`）；带 token 的一律复活；只标 `reauth_required` 的要问「有没有浏览器能到达它」（绑定或 resume token），都没有就不复活 —— **但 state 文件留着**。**② 账号连续性** —— 用户重新扫码时用的往往是**新会话**，`BotSession._adopt_pending_account_state()`（在 `_apply_login` 里、`logged_in` 事件**之后**调 —— 事件会驱逐同账号旧会话并让它重写 state，继承必须读最新的那份）从同账号待重新扫码的 state 文件继承 `contexts` / **已提交的** `get_updates_buf` / `last_contact`，并把源文件的 `reauth_required` 改回 False（下次重启不再复活它）。**不继承 `pending_messages`** —— 旧 context_token 早过期，且没提交的那批服务端会重新推。守卫：会话自己已有游标 → 不继承；只继承同账号；多个候选取最近更新的。**Invariant: 恢复路径要恢复的是账号，不是会话；会话不可达时留 state 给新会话继承，别复活一个没人看得见的二维码。** 见文档 §8。
+- **New process (2026-10-26) — 跨仓库的发稿桥：契约测试 + 版本钉住 + 固定发布顺序**. 发稿桥在**另一个仓库** `/opt/obsidian-xiaolvshu`（origin = 本地裸库 `/opt/git/obsidian-xiaolvshu.git`；GitHub 仓库待建），两边靠「子进程 + stdout 最后一行 JSON」耦合 —— 桥改了 JSON 形状而 ClawBot 没跟上，用户的「发贴图号」会静默变成「❌ 发布链路出错」。现在三道防线：**① 消费者驱动的契约测试**（`tests/test_xiaolvshu_bridge_contract.py`，在**消费者这边**）—— 跑桥的无副作用命令（info/search/status），断言子命令、每个命令该带的key、消费者认识的 7 个错误码桥还产出、每个错误码分支需要的字段桥还带、契约测试自己不碰生产目录。**桥自己的 CI 测不出这个** —— 只有消费者能测出契约是否还成立。**② 版本钉住** —— `.env` 的 `XIAOLVSHU_BRIDGE_REF=<sha>`；生产上的桥跟它对不上，或桥的工作区有未提交改动，`utils/xiaolvshu.py` 记 `clawbot.message` 版本漂移告警。**③ 发布顺序固定** —— `deploy/deploy.sh`：桥先发（保持向后兼容）→ 跑契约测试 → A 再发（升 pin）→ 重启。A 可单独回滚（只要桥向后兼容）。⚠️ 部署脚本**不用 `git checkout <sha>`**（会进 detached HEAD → 桥仓库里的 commit 凭空消失），改用本地分支 `deploy/<short>`；工作区脏则直接拒绝部署。
+- **Active P0 — per-user conversation history** (in progress). Bot currently sees only the last message; "我刚才说了什么" / "继续上次" both fail. Plan: persist `runtime_state["contexts"][from_id]["history"]` (list of `{"role","content","ts"}`) into `weixin_state.json` so it survives restart; sliding-window cap N=20 (or token-budget trim); rename `ai.chat(text)` → `ai.chat_with_history(messages, system_prompt)` and update `_AIWithIma` to merge history with `ima` snippets. Exclude `/help` / `/time` / `/重新连接` and the `COMMANDS_MSG` welcome from history; private chat only (no group messages). Risk: context bloat → token cost; need a cap and a monitor. Full TODO in `TODO.md`.
 - **Recent big change (2026-09-07)** — full IMA pipeline rewrite + 150 Q&A ingested into a fresh KB. Full timeline, decisions, and sharp edges are in `docs/SESSION_2026-09-07_ima_pipeline.md`. The four new IMA knobs (`IMA_ILINK_KEYWORD_EXTRACT` / `IMA_ILINK_FETCH_BODY` / local fallback / `llm_caveat`) all live in `ima.py` and are routed via `_AIWithIma.chat`'s 3-state machine — read that section before changing AI routing.
 - **Fast Q&A lookup** — `docs/knowledge/` holds ~30 short notes indexed `qa-NNN-<topic>` (ima search keywords, context_token, X-WECHAT-UIN, ret=-14, etc.). Grep by topic when you hit an unfamiliar failure mode before reading the full 51 KB protocol reference.
 
@@ -21,66 +34,94 @@ This project references two very different products. **Don't conflate them.**
 
 The 197 files in `docs/knowledge/` follow the Obsidian-vault convention (frontmatter + directory layout) but are read by `utils/local_kb.py` directly — no Obsidian.app process is involved. They can later be edited in Obsidian.app without code changes (frontmatter is stripped before scoring, `local_kb.py:29-40`).
 
+One unified decision table covers both the product choice and the runtime code path:
+
 | If you need… | Use | Why |
 |---|---|---|
-| Multi-user editing, cross-device access, official AI answering for end users | **ima** | Service-side KB with permissions; 微信小程序 + Web + iOS/Android |
+| Multi-user editing, cross-device access, official AI answering | **ima** (production) | Service-side KB; supports `KEYWORD_EXTRACT` + `FETCH_BODY` + `RERANK`. Shared creds via `/etc/clawbot/llm.env` + `/etc/clawbot/ima.env` (no per-user env files) |
+| **One KB per bot owner (each WeChat user has their own)** | **ima + `utils/ima_bindings.py`** | Bindings keyed by `ilink_user_id` (WeChat-account-stable), persisted to `CLAWBOT_STATE_DIR/ima_bindings.json`. Survives browser-cookie death, device switch, server restart. See [`docs/IMA_PER_USER_BINDING.md`](docs/IMA_PER_USER_BINDING.md). UI: `/clawbot/ima/bind` or WeChat `/bindkb <kb_id>`. |
 | Publishing content externally ("知识号") | **ima** | `KBT_SUBSCRIBED_CREATE_KB` is the native publish channel |
+| New content not yet indexed by IMA (5–15 min lag) | **ima + local fallback + semantic** (推荐) | 三层 fallback：IMA 命中走 `llm+ima`；0 命中走 `llm+local`（CLAWBOT_LOCAL_FALLBACK=1）；仍 0 命中走 `llm+semantic`（SEMANTIC_KB_ENABLED=1）。路由转换在 `logs/clawbot.log` 看 `mode=... reason=...` |
+| Offline / no `ima.qq.com` egress / privacy-sensitive | **LocalKBIndex** only | `CLAWBOT_LOCAL_FALLBACK=1`; clear all `IMA_ILINK_*` to force `mode=llm+local` |
+| Already maintain an Obsidian vault to reuse as KB | **LocalKBIndex pointed at vault** | `CLAWBOT_LOCAL_KB_DIR=/path/to/vault` — `LocalKBIndex.rglob("*.md")` + mtime auto-rebuild; frontmatter stripped to avoid `tags:` false hits (`local_kb.py:29-40`) |
+| Fast RAG for an LLM agent / low latency | **LocalKBIndex** | Zero network, no auth, no index delay; substring match but enough for keyword queries |
 | Long-term personal/team second-brain with Git history, never lose data | **Obsidian** | Plain files; format doesn't rot; `git diff` works on `.md` |
-| Data sovereignty / cannot send content to any cloud | **Obsidian** | 100% local; no API call ever leaves the machine |
-| Fast RAG for an LLM agent / low latency | **Obsidian-vault-as-KB** (`LocalKBIndex`) | Zero network, no auth, no index delay; substring match but enough for keyword queries |
-| Already maintain an Obsidian vault elsewhere (`/opt/ob-vault/`) | Point `CLAWBOT_LOCAL_KB_DIR` at it | `LocalKBIndex.rglob("*.md")` + mtime auto-rebuild |
+| Data sovereignty / cannot send content to any cloud | **Obsidian** or **LocalKBIndex** | 100% local; no API call ever leaves the machine |
+| Want the LLM to **know** it's answering without KB | **Plain LLM** | Leave IMA creds empty → `mode=llm-only reason=ima-not-configured`; `_LLM_ONLY_CAVEAT_PROMPT` (`bot.py:64`) injects "（未参考知识库）" caveat |
+| Bot 端需要**语义检索**（自然语言 → 整句不切词） | **`utils/semantic_kb.py`** (`SEMANTIC_KB_ENABLED=1`) | BAAI/bge-small-zh-v1.5 + fastembed（onnxruntime，无 torch），零网络（除首次模型下载）；落库到 `docs/.semantic_kb.sqlite3`；150 chunks 在毫秒级返回。**国内服务器必加 `HF_ENDPOINT=https://hf-mirror.com` + `HF_HUB_DISABLE_XET=1`** |
+| Debugging baseline LLM with no KB interference | **Plain LLM** | Same as above; fastest way to isolate the model's own answer |
 | Mix: edit in Obsidian, serve/answer from ima | **方案 A** (future) | `SESSION_2026-09-07_ima_pipeline.md:236` — not yet built |
 
-Hard limits both share — **neither does semantic/embedding retrieval by default** (IMA's OpenAPI surface lacks it; `LocalKBIndex` is zero-deps by design: `local_kb.py:1-14`). If you need true semantic search, that's a new dependency, not a config knob.
+Hard limits both share — **neither does semantic/embedding retrieval by default** (IMA's OpenAPI surface lacks it; `LocalKBIndex` is zero-deps by design: `local_kb.py:1-14`). If you need true semantic search at the bot level, that's a **new module + dependency** (`utils/semantic_kb.py` + fastembed) — see the "Bot 端需要语义检索" row above and `_AIWithIma`'s 4-mode routing.
 
 ## Common commands
 
-All commands assume the project root; the venv is `venv/`.
+All commands assume the project root; the venv is `venv/`. First-run setup (provider selection, API key entry, QR scan) is in `README.md`; this block is the day-2 cheat sheet.
 
 ```bash
-# Setup
-pip install -r requirements.txt
-
-# Run (first time: interactively choose provider, paste API key, scan QR)
-python bot.py                              # or ./venv/bin/python bot.py
-
-# Run with daemon-friendly web QR UI (default; CLAWBOT_WEB_ENABLED=1)
-# Exposed via nginx: location ^~ /clawbot/ → 127.0.0.1:18300
+# Run the default one-process service (:18300/clawbot/) — only entry point.
+# Sessions are created on demand by anonymous web visitors hitting
+# POST /clawbot/start; the server mints an opaque URL-safe session token
+# at shared_web.py:397 and uses it to map browser ↔ BotSession in memory.
+python bot.py
+./venv/bin/python bot.py
 
 # Diagnose ima knowledge bases (see docs/IMA_KB.md §3)
 ./venv/bin/python utils/list_ima_kb.py
 ./venv/bin/python utils/list_ima_kb.py --pick <name>          # fuzzy match + show env line
 ./venv/bin/python utils/list_ima_kb.py --pick <name> --update # rewrite .env in place
 
+# Per-user IMA KB bindings (see docs/IMA_PER_USER_BINDING.md)
+./venv/bin/python utils/ima_bindings.py list                                    # show all ilink_user_id → kb_id bindings
+./venv/bin/python utils/ima_bindings.py lookup o9...@im.wechat                 # show one binding
+./venv/bin/python utils/ima_bindings.py unbind  o9...@im.wechat                 # ops-only unbind (web UI path is /clawbot/ima/unbind)
+
 # Debug-level protocol trace (writes clawbot.api DEBUG to logs/clawbot.log)
 CLAWBOT_LOG_LEVEL=DEBUG python bot.py 2>&1 | tee /tmp/debug.log
+
+# Contract tests (pytest for the session/manager/runtime contracts;
+# test_shared_web.py is a unittest module and must be run separately)
+./venv/bin/pytest tests/ --ignore=tests/test_shared_web.py -q
+./venv/bin/python -m unittest tests.test_shared_web
 
 # Build portable U盘 bundle (one-dir PyInstaller; ~105 MB; see docs/PORTABLE.md)
 ./venv/bin/pyinstaller weixin-clawbot.spec
 # Output: dist/weixin-clawbot/ — copy directory + .env to USB root
 ```
 
-There is no test suite, no linter config, and no `Makefile`. The `pyinstaller` and `cairosvg` entries in `requirements.txt` are optional.
+There **is** a contract test suite (`tests/`, pytest + one unittest module) covering `BotSession` / `BotManager` / `shared_runtime` lifecycle invariants — run it before claiming a session-lifecycle change works. There is no linter config and no `Makefile`. The `pyinstaller` and `cairosvg` entries in `requirements.txt` are optional. 5-line diagnosis grep recipes live in `README.md` — do not duplicate them here.
 
 ## High-level architecture
 
 The project is one `asyncio` event loop with five concurrent concerns wired through a single `aiohttp.ClientSession`. Read in this order:
 
-### 1. `bot.py` — main loop (~1900 lines, single file by design)
+### 1. Shared runtime and account sessions
+
+- `bot.py` remains the stateless iLink protocol/AI compatibility module; its default CLI dispatches to `shared_runtime.main()`.
+- `shared_runtime.py` owns one `DummyCookieJar` HTTP pool, one `BotManager`, the web listener, named-user discovery, explicit per-user env/config loading, signal handling and shutdown.
+- `bot_manager.py` deduplicates same-user startup without holding its lock across network awaits and evicts sessions whose permanent task dies.
+- `bot_session.py` owns every mutable per-account value and the login/message/timer/relogin tasks. Inbound batches are persisted before handling and their cursor advances only after confirmed reply delivery.
+
+### 2. `bot.py` — iLink protocol and legacy runner
 Top-to-bottom responsibilities:
 - **Constants & config I/O** (`bot.py:39-326`): `RECONNECT_CONFIG`, `BASE_URL`, `CHANNEL_VERSION`, `ILINK_APP_*`, `PROVIDERS`, `mask_key`, `load_or_create_config`. `load_config_file` auto-migrates old flat configs into the multi-provider `{provider, providers: {...}}` shape.
 - **iLink HTTP layer** (`bot.py:339-575`): `ILinkAPIError` carries `path / status / ret / errcode / network_type`; `api_get` / `api_post` wrap `aiohttp`, treat `asyncio.TimeoutError` as `{status: "wait"}` only when `long_poll=True`, otherwise raise. `ensure_business_success` checks both `ret` and `errcode` (HTTP 200 ≠ success). `make_headers` generates the random base64 `X-WECHAT-UIN` per request — do not cache it.
 - **Redaction** (`bot.py:395-422`): `_redact_text` / `_redact_path` are the primary defense for `bot_token / context_token / verify_code / qrcode / ...`. `RedactFilter` in `utils/logging_setup.py` is a fallback only — every new `logger.info(...)` must pre-redact.
 - **Send helpers** (`bot.py:578-711`): `send_msg_safe` degrades to console on failure (used for welcome / `/help` / reconnect warnings — see `docs/multi-user.md` §4); `send_typing_safe` re-raises on stale token; `get_typing_ticket_safe` caches `typing_ticket` per `user_id` for `CONFIG_CACHE_TTL` (24 h) with exponential backoff on failure.
 - **Login** (`bot.py:984-1327`): `render_terminal_qr` / `save_qrcode_content` / `fetch_login_qrcode` / `poll_login_status` / `wait_login_confirmation` (verifies via web state OR stdin input) / `login_with_qrcode` (max `MAX_QR_REFRESH_COUNT=3` QR cycles within `qrcode_scan_timeout`). `BASE_URL` (`https://ilinkai.weixin.qq.com`) is only used for the first QR; after `scaned_but_redirect`, baseurl switches to the node returned by the server.
-- **Lifecycle + main** (`bot.py:1329-1790`): `notify_lifecycle` posts `notifystart` / `notifystop`. `main()` orchestrates login → `apply_new_login` (atomic credential swap; clears cursor + contexts + `last_contact` if account id changes) → spawns `reconnect_timer_task` (lifecycle warnings at `warning_before`, force reconnect at `force_before`) and `message_loop` → `asyncio.gather` for graceful cancel of all tasks + final `notifystop`.
+- **Lifecycle + main** (`bot.py:1329-1790`): `notify_lifecycle` posts `notifystart` / `notifystop`. `main()` orchestrates login → `apply_new_login` (atomic credential swap; clears cursor + contexts + `last_contact` if account id changes) → starts the `message_loop` (the iLink long poll is the keepalive) and only enables the legacy `reconnect_timer_task` when `proactive_relogin=True` → `asyncio.gather` for graceful cancel of all tasks + final `notifystop`.
 - **`message_loop` & `handle_message`** (`bot.py:1479-1761`): long-polls `getupdates`, advances `get_updates_buf`, dispatches each `msg` to `handle_message`. Stale responses (token/baseurl changed mid-poll) are dropped. On `is_stale_token` (`ret/errcode == -14`) it clears `bot_token`, sleeps `RETRY_DELAY`, runs a fresh `login_with_qrcode`, and continues. **Per-peer state** lives in `runtime_state["contexts"][from_id]` and is overwritten on each inbound message; `welcomed_users` is derived from `contexts.keys()` on startup so first-time users get `COMMANDS_MSG`.
 - **AI layer** (`bot.py:1804-1886`): `_AIWithIma` is a transparent wrapper that calls `ImaClient.search_knowledge` before `base.chat` and injects snippets (`### 参考资料 N: title\nsnippet`) into the system prompt. If `ima.configured()` is false (no `IMA_ILINK_CLIENT_ID`/`API_KEY`), the wrapper passes through. `create_ai_client` picks `DeepSeekAPI` or `DusAPI` from `raw_cfg["provider"]`.
+- **4-mode AI routing** (新增；详见 `utils/semantic_kb.py` 和 `utils/local_kb.py`): `_AIWithIma.chat` 是 **4 档 state machine**，按 `ima → local → semantic → llm_only` 顺序 fallback：
+  - `mode=llm+ima` (`reason=hits-injected`) —— IMA 命中并注入 prompt
+  - `mode=llm+local` (`reason=local-fallback`) —— IMA 0 命中，BM25 substring 兜底（`CLAWBOT_LOCAL_FALLBACK=1`）
+  - `mode=llm+semantic` (`reason=semantic-fallback`) —— IMA + local 都 0 命中，向量相似度兜底（`SEMANTIC_KB_ENABLED=1` + fastembed）
+  - `mode=llm-only` —— 全部未命中或未配置，注入 `_LLM_ONLY_CAVEAT_PROMPT`（`bot.py:64`）让 LLM 自我标记"未参考知识库"
 
-### 2. AI provider wrappers (`dusapi.py`, `deepseek.py`)
+### 3. AI provider wrappers (`dusapi.py`, `deepseek.py`)
 Same shape: `@dataclass *Config` + `*API` class with `chat(message, model=None, stream=False, prompt=None, history=None)`. Both are **synchronous `requests`**, 5 retries with `[2, 4, 8, 16, 32]`s backoff. DusAPI uses Anthropic `/v1/messages` format (model name decides parser: `claude` vs `gpt`). DeepSeek uses OpenAI `/chat/completions`; for `deepseek-v4-flash` it sets `thinking: {type: disabled}`. Both cap `max_tokens=1024`.
 
-### 3. `ima.py` — Tencent ima Knowledge Base OpenAPI client
+### 4. `ima.py` — Tencent ima Knowledge Base OpenAPI client
 Sync `requests` wrapper, mirrors `dusapi.py`/`deepseek.py`. **First `.env` consumer** in the project: `ImaConfig.from_env()` calls `python-dotenv` with `override=False`. Missing creds → `configured()` returns False → caller passes through silently. Search is keyword-match (not embedding); see `docs/IMA_KB.md` §4–§5 for sharp edges.
 
 **Five runtime knobs (env-driven)**; defaults match what production runs today — change only with care:
@@ -89,29 +130,14 @@ Sync `requests` wrapper, mirrors `dusapi.py`/`deepseek.py`. **First `.env` consu
 - `IMA_ILINK_FETCH_BODY` (default `0`) — after search, hit `get_doc_content` per hit to fill in missing bodies (works around `highlight_content` being empty; +1–3 s).
 - `IMA_ILINK_KEYWORD_EXTRACT` (default `0`) — pre-search LLM call extracts 1–3 keywords so natural-language questions like "IMA是什么？" can hit the KB.
 - `IMA_ILINK_LOCAL_FALLBACK` — when IMA returns 0 hits, transparently try `utils/local_kb.py` (offline KB shipped with the project) before falling back to plain LLM. Set `llm_caveat` mode to make the LLM advertise when it's answering without KB context.
+- `ImaClient.list_searchable_kbs()` (`ima.py:520`) — enumerates `KBT_SHARED_KB` + `KBT_SUBSCRIBED_CREATE_KB` for the web UI dropdown; filters out `KBT_MINE_KB` because `search_knowledge` returns `code=220004` for personal KBs. Constant `ImaClient.SEARCHABLE_KB_TYPES` (`ima.py:310`) is the whitelist; per-user binding via `IMABindings.bind(..., kb_type=...)` also enforces the same set.
 
-`_AIWithIma.chat` is a 3-state machine (`ima` / `local` / `llm_only`) and logs `mode=` / `reason=` / `hits=` / `ctx_chars=` on every call — that line in `logs/clawbot.log` is the canonical answer to "did the KB fire?".
+`_AIWithIma.chat` is a 4-state machine (`ima` / `local` / `semantic` / `llm_only`) and logs `mode=` / `reason=` / `hits=` / `ctx_chars=` on every call — that line in `logs/clawbot.log` is the canonical answer to "did the KB fire?". For per-user routing, `chat()` also accepts `kb_id=...` (a `knowledge_base_id` override resolved from `IMABindings.lookup_kb_id(ilink_user_id)` at `handle_message` time); when `kb_id is None`, behavior is unchanged (falls back to `ImaConfig.default_knowledge_base_id`). Local and semantic fallbacks are owner-independent and intentionally NOT gated by `kb_id`.
 
-#### Picking the KB: IMA vs `docs/knowledge/*.md` (Obsidian-style) vs plain LLM
+**Hard limit:** neither IMA nor `LocalKBIndex` does embedding/semantic search (substring keyword match only). If you need true semantic retrieval, that's a new dependency, not a config knob. See the decision table under "Product context: IMA vs Obsidian" for which code path to use.
 
-Two knowledge-base code paths already exist; Obsidian.app itself is **not** wired in (only listed as future work in `docs/SESSION_2026-09-07_ima_pipeline.md:236`). The 197 markdown files in `docs/knowledge/` follow the Obsidian-vault convention (frontmatter + directory layout), and `LocalKBIndex` reads them directly with no extra process.
-
-| If you need… | Use | Why |
-|---|---|---|
-| Production, multi-user, official content with editing workflow | **IMA** | Service-side KB, indexing delayed 5–15 min, supports `KEYWORD_EXTRACT` + `FETCH_BODY` + `RERANK`. Per-user creds via `/etc/clawbot/<user>.env`. |
-| Offline / no `ima.qq.com` egress / privacy-sensitive | **Local KB only** | Set `CLAWBOT_LOCAL_FALLBACK=1` and clear all `IMA_ILINK_*` to force `mode=llm+local`. |
-| Already have an Obsidian vault you want to reuse as a KB | **Local KB pointed at vault** | `CLAWBOT_LOCAL_KB_DIR=/path/to/ob-vault` — `LocalKBIndex.rglob("*.md")` + mtime auto-rebuild; frontmatter stripped to avoid `tags:` false hits (`local_kb.py:29-40`). |
-| Want the LLM to **know** it's answering without KB | Plain LLM | Leave IMA creds empty → `mode=llm-only reason=ima-not-configured`; `_LLM_ONLY_CAVEAT_PROMPT` (`bot.py:64`) injects "（未参考知识库）" caveat. |
-| New content not yet indexed by IMA (the 5–15 min lag) | **Both on** | Default config: IMA first, local fallback when IMA hits=0. `mode=llm+ima` vs `mode=llm+local reason=local-fallback` shows the transition in `logs/clawbot.log`. |
-| Debugging baseline LLM with no KB interference | Plain LLM | Same as above; fastest way to isolate the model's own answer. |
-
-Hard limits to know before choosing: **both KBs are substring keyword match — neither does embedding search** (LocalKBIndex by design: `local_kb.py:1-14`; IMA OpenAPI surface area also lacks the semantic path). If you need true semantic retrieval, that's a new dependency, not a config change.
-
-### 4. `qr_web.py` — embedded aiohttp web login UI (per-user backend)
-Standalone aiohttp app bound to a per-user port (env `CLAWBOT_WEB_{ENABLED,TOKEN,HOST,PORT}`). Exposes: QR PNG, login state machine (`idle / qr_pending / scanned / logged_in / error`), and a verify-code POST endpoint. `QrFlowState` is the single source of truth — `bot.py` writes via `make_web_on_qrcode`, handlers read. Port collision → logs warning, returns, does not block the bot loop. `wait_for_verify_code` is shared between web and `stdin _safe_input` so the same code path works in TTY and daemon.
-
-### 5. `qr_portal.py` — single-entry multi-user portal (`:18300`)
-aiohttp multiplexer that reads `/etc/clawbot/*.env` to enumerate users. `GET /` shows picker if no cookie, otherwise proxies to the selected user's `qr_web.py`. `GET /select?name=<user>` sets 30-day `clawbot_user` cookie; `GET /switch` clears it. HTML responses get an injected "切换用户" bar (z-index:99999, top-right) so users can return to the picker from any proxied backend page. Non-HTML responses stream through. Auth is handled by injecting `Authorization: Bearer <user.CLAWBOT_WEB_TOKEN>` from each user's env file — qr_web's `_check_bearer` validates it.
+### 5. `shared_web.py` and `qr_web.py`
+`shared_web.py` is the default single listener. It maps opaque browser cookies to Manager sessions and exposes QR state, verification, account switching and session creation under `/clawbot`. `qr_web.py` still provides the per-session `QrFlowState` and QR conversion helpers; its old standalone per-session server is legacy only.
 
 ### 6. `utils/` — diagnostics, KB tools, logging
 
@@ -119,6 +145,7 @@ All five utilities are runnable as `python utils/<name>.py` from the project roo
 
 - **`logging_setup.py`** — `setup_logging()` is called once at `__main__` entry. Idempotent. Console respects `CLAWBOT_LOG_LEVEL`, file always DEBUG, rotates at midnight local time, keeps 7 backups. Sub-loggers use `get_logger("qr")` → `clawbot.qr`. `RedactFilter` takes the `_redact_text` callback and is wired onto both handlers.
 - **`list_ima_kb.py`** — diagnostic CLI. Lists ima knowledge bases for the configured account; `--pick <substr>` fuzzy-matches and prints the env line; `--update` rewrites `.env` in place. Useful when `IMA_ILINK_DEFAULT_KB` needs to change.
+- **`ima_bindings.py`** — per-user IMA KB binding store. Keyed by `ilink_user_id` (WeChat-account-stable, NOT the opaque browser session token). Persists `ilink_user_id → {kb_id, kb_name, kb_type, bound_at, bot_id_at_bind}` to `CLAWBOT_STATE_DIR/ima_bindings.json` with `asyncio.Lock` + atomic write + `chmod 0o600`. CLI: `list` / `lookup <user>` / `unbind <user>` — `bind` is intentionally NOT exposed (must go through `/clawbot/ima/bind` for CSRF + cookie auth). Rejects `kb_type=1001` (`KBT_MINE_KB`) because search returns `code=220004` (`docs/IMA_KB.md:126-139`).
 - **`local_kb.py`** — offline fallback KB (JSON-serialised Q&A pairs) consulted when IMA returns 0 hits and `IMA_ILINK_LOCAL_FALLBACK` is on. Format is the same one `import_business_lang.py` writes — keep them in sync.
 - **`seed_ima_kb.py`** — bulk-ingest a directory of markdown / text into a target ima KB using `ImaClient.import_doc`. Used for the 150 Q&A bootstrap on 2026-09-07.
 - **`import_business_lang.py`** — convenience importer that normalises a 客服话术 corpus into the local KB + ima KB shape (covers chunking, dedupe, keyword tagging). Run before `seed_ima_kb.py` if the corpus is in the raw 话术 / transcript form.
@@ -128,37 +155,33 @@ All five utilities are runnable as `python utils/<name>.py` from the project roo
 | Path | Lifecycle | Sensitive? |
 |---|---|---|
 | `config.json` | first run, rewritten on every config edit | yes (API keys) |
-| `weixin_state.json` | rewritten on every `getupdates` cursor advance, every `contexts` write, every reconnect | yes (`bot_token`, `context_token`) |
-| `logs/clawbot.log` | daily rolling, 7-day retention | partial (filter redacts) |
-| `.env` | read once at startup by `ImaConfig.from_env` (override=False, env wins) | yes (`IMA_ILINK_API_KEY`) |
+| `weixin_state_<session_token>.json` | atomically rewritten per session after messages, cursor commits and reconnects | yes (`bot_token`, `context_token`) |
+| `CLAWBOT_STATE_DIR/ima_bindings.json` | rewritten per `IMABindings.bind` / `unbind` (web UI or `/bindkb`); survives session-token death | yes (`ilink_user_id` is sensitive; `kb_id` is not) |
+| `logs/clawbot_shared.log` | daily rolling shared log with a per-record user dimension | partial (filter redacts) |
+| `/etc/clawbot/{llm,ima}.env` | explicitly parsed into per-session dictionaries without mutating `os.environ` | yes (`IMA_ILINK_API_KEY`) |
 
-`weixin_state.json` keys: `bot_token`, `baseurl`, `ilink_bot_id`, `ilink_user_id`, `get_updates_buf`, `contexts` (dict keyed by `from_id`, value = `context_token`), `last_contact` (`{from_id, context_token}`).
+State keys: `bot_token`, `baseurl`, `ilink_bot_id`, `ilink_user_id`, `get_updates_buf`, `pending_messages`, `processed_message_ids`, `contexts` and `last_contact`.
 
-## Multi-user layout (`--user` + portal)
+## Multi-user layout (session-based single-process model)
 
-Single-tenant is the default (no `--user` → `weixin_state.json`, `config.json`, `logs/clawbot.log`, port from env). With `--user <name>`:
+`python bot.py` is the only entry point. Anonymous web visitors receive an opaque URL-safe session token minted at `shared_web.py:397` and known only to the server-side cookie store. There are no named users, no OAuth, no per-user subprocess / port / systemd unit — sessions live as in-process `BotSession` tasks under one shared `BotManager` and one shared `aiohttp` connection pool. Note: the **stable user identifier** (used for IMA KB bindings, KB lookups, etc.) is `ilink_user_id`, which is only assigned after QR confirmation; the opaque session token is just a browser-handle.
 
 | Path | Form |
 |---|---|
-| state file | `weixin_state_<name>.json` |
-| config file | `config_<name>.json` |
-| log file | `logs/clawbot_<name>.log` |
-| env files | `/etc/clawbot/<name>.env` (user) → `/etc/clawbot/ima.env` (shared ima fallback) |
-| web port | `CLAWBOT_WEB_PORT` from user env (e.g. 18301+) |
-| systemd unit | `clawbot@<name>.service` |
+| state file | `CLAWBOT_STATE_DIR/weixin_state_<session_token>.json` |
+| config file | each session deep-copies `CLAWBOT_CONFIG_DIR/config.json` at session create time |
+| log file | `logs/clawbot_shared.log`, every protocol task carries `[user=<id>]` |
+| env files | `/etc/clawbot/llm.env` → `ima.env`, parsed into per-session dictionaries without mutating `os.environ` |
+| web port | one process-level `CLAWBOT_WEB_PORT` (default 18300) |
+| systemd unit | one shared service only; none per user |
 
-`/etc/clawbot/ima.env` is the shared ima fallback (currently the production ima key). A user gets their own ima by adding `IMA_ILINK_CLIENT_ID` / `IMA_ILINK_API_KEY` / `IMA_ILINK_DEFAULT_KB` to their `<user>.env`; `load_dotenv(override=False)` puts user values first.
+The shared page never lists users. `POST /clawbot/start` allocates one random in-process session and sets an opaque server-mapped cookie; `/switch` retains that binding while requesting a new iLink QR. Browser TTL cleanup removes the web binding, but keeps a session that already owns an iLink token running so WeChat/OpenClaw interaction is independent of browser activity; only an unauthenticated QR session is stopped. Cookie Secure is auto-selected from the request scheme; set `CLAWBOT_TRUST_PROXY=1` only when a trusted edge overwrites forwarding headers, or force it with `CLAWBOT_COOKIE_SECURE=1`.
 
-`qr_portal.py` runs on `:18300` as the single entry point: `https://bx.mengxa.com/clawbot/`. Picker reads `/etc/clawbot/*.env`, dispatch uses 30-day cookie `clawbot_user`, HTML gets a "切换用户" injection bar, upstream auth is `Authorization: Bearer <user.CLAWBOT_WEB_TOKEN>` injected per-request. Backends (per-user `qr_web.py`) keep their existing routes — `qr_web.py`'s `?token=` query path still works.
-
-Operations (nginx stays simple):
+Typical service operation:
 ```bash
-sudo systemctl stop clawbot.service           # disable legacy single-tenant
-sudo systemctl enable --now clawbot-portal.service
-sudo cp /etc/clawbot/user.env.example /etc/clawbot/alice.env
-sudo $EDITOR /etc/clawbot/alice.env          # CLAWBOT_WEB_PORT, CLAWBOT_WEB_TOKEN
-sudo systemctl enable --now clawbot@alice
+sudo systemctl enable --now clawbot-shared.service
 sudo nginx -t && sudo systemctl reload nginx
+# 日志：journalctl -u clawbot-shared -f  或  tail -f logs/clawbot_shared.log
 ```
 
 ## Critical invariants
@@ -169,9 +192,16 @@ sudo nginx -t && sudo systemctl reload nginx
 - **`get_updates_buf` is opaque**: store verbatim, forward verbatim. Only the iLink server can advance it.
 - **`context_token` must come from the inbound message** and is required by `sendmessage`. Token rotation across reconnect/reinstall is expected.
 - **Account switch (`ilink_bot_id` change) clears `get_updates_buf`, `contexts`, `last_contact`, and `welcomed_users`**. Same-account relogin preserves them.
+- **A user-driven QR switch must never kill the session, and must never discard a token it already applied.** The initial QR login and a decoupled switch are two independent login flows; if they overlap, the initial one must be cancelled (`_initial_cancel`) and `start()` must wait on the switch outcome — never let the initial flow's `RuntimeError` reach `session.stop()` with a live token. See [`docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md`](docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md).
+- **`ilink_user_id` is the stable identity for per-user IMA KB binding** — NOT `ilink_bot_id` (rotates per QR; see `docs/2026-09-15_IN_FLIGHT_RELOGIN_RACE.md:392-410` + commit `f298d82`) and NOT `from_user_id` (chat peer, not bot owner). Bindings live in `ima_bindings.json`, **not** inside `weixin_state_<session_token>.json` (the latter dies with the browser cookie and would break cross-device survival). Web UI `/ima/bind` always re-validates submitted `kb_id` against live `ImaClient.list_searchable_kbs()` to defeat client spoofing of `kb_name` / `kb_type`.
+- **Isolation is keyed by ACCOUNT (`ilink_user_id`), not by session (`session_id`).** One WeChat account ⇒ at most **one** live session; different accounts ⇒ run concurrently. Two sessions polling the same account split that account's messages at random → "sometimes nobody replies". Enforced in two places: `shared_runtime._restore_persisted_sessions` (restore-time dedup — `claimed` set, applies to **all** sessions, not just tokenless ones) and `bot_manager._evict_same_account` (runtime — fires on the `logged_in` event). When several sessions claim one account, the survivor is the one with the newest **`login_time`** (only bumped on a real login) — **not** the state file's mtime, which `save_state()` refreshes even for an *evicted* session's file. Never key account-scoped state (KB dir, IMA binding, publish vault) on `session_id`: it rotates per scan. See [`docs/2026-10-27_MULTI_ACCOUNT_AUDIT.md`](docs/2026-10-27_MULTI_ACCOUNT_AUDIT.md).
+- **A session waiting for a re-scan must survive a restart.** The moment `_reconnect` clears `bot_token`, it persists `reauth_required=True` into the state file — *before* the QR window opens — so a deploy in the middle of the window cannot kill the account for good. `_restore_persisted_sessions` revives such sessions (bounded by `CLAWBOT_REAUTH_RESTORE_WINDOW`, default 24h; one session per `ilink_user_id`). See [`docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md`](docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md).
+- **An expired QR must never terminate a session.** `BotSession.start()`'s initial-login failure (nobody scanned inside the window) is *not* fatal: it parks the session (`_park_awaiting_scan` → `qr_state.status="awaiting_scan"`, `reauth_required` stays on disk) instead of letting the `RuntimeError` reach `BotManager._bootstrap` → `session.stop()`. Re-arm on demand via the decoupled QR switch (`request_relogin("web switch")`, which never touches `bot_token`); a confirmed scan swaps credentials atomically and then calls the idempotent `_ensure_message_loop()` — **without it a parked session would hold a valid token but never poll `getupdates`, i.e. "登录成功但机器人不回复"**. Corollary: **the message loop may only start once credentials exist.**
+- **Portal never leaks user list (privacy)**: 无 cookie 访客的页面**必须**是单一登录按钮（OAuth / start-session / 错误页），**不得**渲染任何用户、端口、env 文件路径、bot 状态。`/healthz` 只返 `{ok: True, login_mode: ...}` 不带 `users` 字段。proxy 502 fallback 不暴露 name/port/exception。`/select` 已删除（OAuth 模式下任何人 GET `/select?name=` 已知用户即拿到 cookie = 账号劫持；现在 cookie 只能由 `/oauth/cb` 或 `/clawbot/start` 设置）。
 - **First QR is fixed endpoint `BASE_URL = https://ilinkai.weixin.qq.com`**. After `scaned_but_redirect`, switch to the server-returned `baseurl`. This switch is one-way per session.
 - **Headers**: never set `Content-Length` manually (aiohttp computes it). The `X-WECHAT-UIN` is a fresh random uint32 → base64 per request. Each POST body includes `base_info: {channel_version: "2.4.6", bot_agent: "weixin-ClawBot-API/1.2.0 (python)"}` (sanitized via `sanitize_bot_agent`).
-- **Media messages are out of scope** for now: image / file / untranscribed voice return a capability hint and are not passed to AI. AES-128-ECB + CDN upload/download not implemented.
+- **Media messages are out of scope** for now: image / file are not passed to AI; an untranscribed voice gets an actionable retry/“转文字” prompt and is not passed to AI. AES-128-ECB + CDN upload/download not implemented.
+- **Forwarded message text extraction** (`bot.py:821` `extract_message_text`): reads `text_item.text`, `voice_item.text`, `ref_msg.{title,message_item.text_item.text}`, `title` / `description` / `des`, `app_msg.{title,des}`, and `url` (rewritten as `[链接] url`) from every item in `item_list`. Deduplicates with `text not in parts` so quoted / ref_msg overlap doesn't double-feed the LLM. URL is treated as text only — never fetched. See `docs/FORWARDED_MESSAGES.md`.
 
 ## Logger namespace
 
@@ -187,13 +217,52 @@ All diagnostic logs go through `logging.getLogger("clawbot.<subsystem>")`:
 | `clawbot.api` | every iLink HTTP (DEBUG only) |
 | `clawbot.state` | `weixin_state.json` read/write |
 | `clawbot.ima` | ima search / write / config |
+| `clawbot.ima_bindings` | per-user `ima_bindings.json` lookup / bind / unbind |
+| `clawbot.publish` | 发稿闭环（贴图号 / 图文 → 公众号草稿箱）：认领 / 调桥 / 桥的结果 / 回信 |
+| `clawbot.diagnostics` | 连接链路埋点（`diag stage=inbound` / `reply_sent` / `worker_failed` …） |
 
 User-facing output (banners, menu, command echo) stays on `print` — don't move it to logger.
+
+### 发稿闭环的流程日志（`clawbot.publish`）
+
+一次「用户发消息 → clawbot 认领 → 调桥 → 桥出结果 → 回信给用户」横跨三层
+（`bot_session._handle_message` → `utils/xiaolvshu.handle` → `utils/xiaolvshu._run_bridge`）。
+每条相关日志都带同一个 `flow=<8位hex>` 关联 id，`grep flow=<id>` 就能捞出完整链路。
+
+| stage | 记在哪 | 含义 |
+|---|---|---|
+| `publish_intent` | `utils/xiaolvshu.handle` | 认领了这条消息（`source=command` / `natural`，含 kind + keyword） |
+| `publish_unclaimed` | 同上（DEBUG） | 不是发稿意图 → 落回 AI 对话 |
+| `publish_skipped` | `utils/xiaolvshu._publish` | 认领了但没有关键词（用户光说「发贴图号」） |
+| `bridge_call` | `_run_bridge` | 子进程调桥（args + timeout） |
+| `bridge_stderr` | 同上（DEBUG） | 桥自己的排障输出（插图找不到、标题超限……），平时被丢掉，出问题时是唯一线索 |
+| `bridge_result` | 同上 | 桥的 JSON 结果（ok / code / elapsed_ms / kind / title / cards / media_id） |
+| `bridge_error` | 同上 | `timeout` / `spawn_failed` / `no_json_line`（带 stderr 尾巴） |
+| `publish_result` | `utils/xiaolvshu.handle` | 这次发稿的最终结论（ok / code / 回信内容前 120 字） |
+| `publish_need_select` | 同上 | 多命中，候选列表（用户回 `/选 N` 时可对账） |
+| `publish_exception` | `bot_session` | 桥调用抛异常 |
+| `publish_unavailable` | `bot_session` | 桥模块 import 失败 → 发稿功能整个不可用 |
+| `reply_sent` | `bot_session` | 回信已发出（同时在 `clawbot.diagnostics` 的 `diag stage=reply_sent` 里带 flow） |
+
+回信**发不出去**时记在 `clawbot.message`（不是 `clawbot.publish`）：
+`send_reliable failed path=sendmessage kind=... flow=... err=...`。
+「有 `publish_result` 但没有 `reply_sent`」就是这个断点。
+
+`clawbot.diagnostics` 的 `diag stage=inbound` / `diag stage=reply_sent` 也带同一个
+`flow=` —— 两套日志可以用同一个 id 交叉引用。回归测试：
+[`tests/test_publish_flow_logging.py`](tests/test_publish_flow_logging.py)。
 
 ## References inside this repo
 
 - `README.md` — quickstart, `RECONNECT_CONFIG` table, OpenClaw protocol summary, 5-line diagnosis grep recipes for `logs/clawbot.log`.
 - `docs/IMA_KB.md` — ima integration sharp edges (keyword-match vs semantic, no body return, rerank behavior) + `list_ima_kb.py` usage.
+- `docs/IMA_PER_USER_BINDING.md` — per-user KB design + invariants (read before touching `_AIWithIma.chat` for per-user routing, `utils/ima_bindings.py`, or `/clawbot/ima/bind`).
+- `docs/IMA_WEB_UI.md` — three binding entry points (web UI + `/bindkb` command + CLI) + auth model + cross-device recovery flow.
+- `docs/IMA_PER_USER_BINDING_REVIEW.md` — outstanding review items from 2026-09-16 implementation; P0/P1/P2 checklist for the next reviewer.
+- `docs/FORWARDED_MESSAGES.md` — what `extract_message_text` reads from `item_list` (text / voice / ref_msg / app_msg / url), dedup strategy, 8-case smoke test patterns, URL is text-only (never fetched).
+- `docs/PUBLISH_FLOW_LOGGING.md` — 发稿闭环（用户发消息 → 认领 → 调桥 → 回信）的流程日志：flow id 怎么来、每个 stage 各自记什么、卡在哪一环怎么查。
+- `docs/2026-10-25_QR_SWITCH_KILLS_SESSION.md` — 2026-10-25 incident: 「切换账号」during 初始扫码 → parallel initial login raised `RuntimeError` → `session.stop()` discarded the applied token. Root cause, fix, new invariants, and grep recipes.
+- `docs/2026-10-26_REAUTH_RESTORE_AFTER_RESTART.md` — 2026-10-26 incident: iLink token 过期 (`-14`) 后进二维码窗口，发版重启打断窗口 → state 只剩空 `bot_token` → 账号永久掉线。`reauth_required` 标志落盘 + 恢复路径复活（时效窗 + 同账号去重）。
 - `docs/multi-user.md` — single-tenant limits, scenario A vs B, comparison with XTmai reference impl, recommended fixes (#2 broadcast, #3 gather, #4 retry) ranked by ROI.
 - `docs/PORTABLE.md` — PyInstaller `--onedir` build steps, USB layout, `noexec` mount workaround.
 - `docs/SESSION_2026-09-07_ima_pipeline.md` — chronological record of the IMA rewrite + 4 new knobs + KB bootstrap. **Read this before touching `_AIWithIma.chat`** — it documents the 3-state machine (`ima` / `local` / `llm_only`) and the reasons each knob exists.
@@ -204,8 +273,9 @@ User-facing output (banners, menu, command echo) stays on `print` — don't move
 
 ## Adding a new logger / feature
 
-When adding code that emits logs or errors:
+When adding code that emits logs or handles a new error path:
 1. Use `get_logger("subsystem")` from `utils/logging_setup.py` — do not call `setup_logging()` again.
-2. Pre-redact any sensitive value with `bot._redact_text()` / `_redact_path()` or print only first 8 chars (`token={tok[:8]}…`). The `RedactFilter` is a safety net, not the primary defense.
-3. New failure paths in `message_loop` should distinguish stale-token (`exc.is_stale_token`) from transient network (`exc.network_type` ∈ `dns / tcp / tls / timeout / unknown`) from generic `Exception` — see the existing handler at `bot.py:1707-1761` for the canonical pattern.
-4. `handle_message` currently serializes per message via `for msg in msgs: await handle_message(msg)` (`bot.py:1705`). If converting to `asyncio.gather`, watch `welcomed_users.add` / `last_contact` writes — they need a lock or hoisting outside the gather (see `TODO.md` P1 #3).
+2. New failure paths in `message_loop` must distinguish stale-token (`exc.is_stale_token`) from transient network (`exc.network_type` ∈ `dns / tcp / tls / timeout / unknown`) from generic `Exception` — see the canonical handler at `bot.py:1707-1761`.
+3. `handle_message` currently serializes per message via `for msg in msgs: await handle_message(msg)` (`bot.py:1705`). If converting to `asyncio.gather` (TODO P1 #3), watch `welcomed_users.add` / `last_contact` writes — they need a lock or hoisting outside the gather.
+
+Pre-redaction of sensitive values is already covered by the Redaction bullet in the architecture section above — do not restate it here.

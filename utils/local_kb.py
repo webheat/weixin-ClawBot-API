@@ -46,6 +46,7 @@ class _Entry:
     title: str  # 取 H1 行；无 H1 用文件名
     content: str  # 全文（已剥 frontmatter）
     mtime: float
+    key: str = ""  # 相对索引根的键（overlay 目录带 "user/" 前缀）
 
     def matches(self, terms: list[str]) -> tuple[int, set[str]]:
         """返回 ``(总命中次数, 命中的 terms 集合)``。大小写不敏感（英文部分）。"""
@@ -74,27 +75,60 @@ class LocalKBIndex:
 
     命中后 ``SearchHit.media_id`` 设为 ``local:<相对路径>``（前缀 ``local:``
     是给上层区分 IMA / 本地的标记）。``score`` 字段填命中次数。
+
+    **两层目录**（多账号隔离用）：
+
+    - ``directory`` —— 共享基座（``docs/knowledge``），所有人一起读；
+    - ``extra_dirs`` —— 该账号私有的目录（每账号一个），只有这个账号看得到。
+
+    overlay 里的文件在 media_id 里带 ``user/`` 前缀，避免和基座的相对路径撞名。
     """
 
-    def __init__(self, directory: str | os.PathLike[str]):
-        self.dir = Path(directory)
-        if not self.dir.is_absolute():
-            # 解析成项目根的相对路径（脚本/bot 启动时 cwd 可能不同）
-            # bot.py 跑在 /opt/weixin-ClawBot-API/；utils/*.py 也是
-            here = Path(__file__).resolve().parent.parent  # 项目根
-            candidate = here / self.dir
-            if candidate.is_dir():
-                self.dir = candidate
-            else:
-                # 退到 cwd
-                self.dir = Path.cwd() / directory
+    def __init__(self, directory: str | os.PathLike[str],
+                 extra_dirs: Optional[Iterable[str | os.PathLike[str]]] = None):
+        self.dir = self._resolve(directory)
+        self.extra_dirs: list[Path] = []
+        for item in (extra_dirs or []):
+            resolved = self._resolve(item)
+            if resolved.is_dir() and resolved != self.dir:
+                self.extra_dirs.append(resolved)
         self._entries: list[_Entry] = []
         self._last_mtime: float = 0.0
         self.rebuild()
 
+    @staticmethod
+    def _resolve(directory: str | os.PathLike[str]) -> Path:
+        """相对路径 → 项目根 / cwd 下的绝对路径。"""
+        path = Path(directory)
+        if path.is_absolute():
+            return path
+        # 解析成项目根的相对路径（脚本/bot 启动时 cwd 可能不同）
+        # bot.py 跑在 /opt/weixin-ClawBot-API/；utils/*.py 也是
+        here = Path(__file__).resolve().parent.parent  # 项目根
+        candidate = here / path
+        # 目录本身可能还没建（每账号私有库就是这样：先算路径，后创建），
+        # 所以父目录在就算它有效。
+        if candidate.is_dir() or candidate.parent.is_dir():
+            return candidate
+        # 退到 cwd
+        return Path.cwd() / path
+
     @property
     def exists(self) -> bool:
-        return self.dir.is_dir()
+        return self.dir.is_dir() or bool(self.extra_dirs)
+
+    def _scan_dirs(self) -> list[tuple[Path, str]]:
+        """(目录, media_id 前缀) 列表 —— 基座在前，overlay 在后。
+
+        overlay 的前缀带序号（``user/0/``），这样多个 overlay 的相对路径
+        不会互相撞名，也能从 media_id 反推出文件在哪。
+        """
+        out: list[tuple[Path, str]] = []
+        if self.dir.is_dir():
+            out.append((self.dir, ""))
+        for index, extra in enumerate(self.extra_dirs):
+            out.append((extra, f"user/{index}/"))
+        return out
 
     def rebuild(self) -> None:
         """重建内存索引。静默吞掉读文件异常（单文件坏了不影响其它）。"""
@@ -104,20 +138,26 @@ class LocalKBIndex:
             return
         new_entries: list[_Entry] = []
         max_mtime = 0.0
-        for path in sorted(self.dir.rglob("*.md")):
-            try:
-                stat = path.stat()
-                mtime = stat.st_mtime
-                if mtime > max_mtime:
-                    max_mtime = mtime
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            body = _strip_front_matter(text)
-            title = self._extract_title(body, path)
-            new_entries.append(_Entry(
-                path=path, title=title, content=body, mtime=mtime,
-            ))
+        for root, prefix in self._scan_dirs():
+            for path in sorted(root.rglob("*.md")):
+                try:
+                    stat = path.stat()
+                    mtime = stat.st_mtime
+                    if mtime > max_mtime:
+                        max_mtime = mtime
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                body = _strip_front_matter(text)
+                title = self._extract_title(body, path)
+                try:
+                    rel = path.relative_to(root)
+                except ValueError:
+                    rel = path
+                new_entries.append(_Entry(
+                    path=path, title=title, content=body, mtime=mtime,
+                    key=f"{prefix}{rel}",
+                ))
         self._entries = new_entries
         self._last_mtime = max_mtime
 
@@ -127,13 +167,14 @@ class LocalKBIndex:
             return
         try:
             current_max = 0.0
-            for p in self.dir.rglob("*.md"):
-                try:
-                    mt = p.stat().st_mtime
-                except OSError:
-                    continue
-                if mt > current_max:
-                    current_max = mt
+            for root, _prefix in self._scan_dirs():
+                for p in root.rglob("*.md"):
+                    try:
+                        mt = p.stat().st_mtime
+                    except OSError:
+                        continue
+                    if mt > current_max:
+                        current_max = mt
             if current_max > self._last_mtime:
                 self.rebuild()
         except OSError:
@@ -169,12 +210,8 @@ class LocalKBIndex:
         scored.sort(key=lambda x: -x[0])
         out: list[SearchHit] = []
         for score, entry in scored[:limit]:
-            try:
-                rel = entry.path.relative_to(self.dir)
-            except ValueError:
-                rel = entry.path
             hit = SearchHit(
-                media_id=f"local:{rel}",
+                media_id=f"local:{entry.key}",
                 title=entry.title,
                 content=entry.content,
                 snippet="",  # SearchHit.display_snippet 会优先用 content

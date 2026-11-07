@@ -1,6 +1,6 @@
 # 微信 Claw Bot（Python）
 
-这是一个直接调用腾讯 [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin)（iLink Bot）接口的 Python 客户端示例。它无需部署 OpenClaw，即可通过扫码登录微信个人账号，并把收到的文字消息交给 DusAPI 或 DeepSeek 生成回复。
+这是一个直接调用腾讯 [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin)（iLink Bot）接口的 Python 客户端示例。它无需部署 OpenClaw，即可通过扫码登录微信个人账号，并把收到的文字或语音转写内容交给 DusAPI 或 DeepSeek 生成回复。
 
 当前运行代码按 [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin) 2.4.6 的公开 HTTP 行为对齐。协议细节和版本差异记录在 [weixin-openclaw-api-py-docs.md](weixin-openclaw-api-py-docs.md)。
 
@@ -16,12 +16,14 @@
 
 ## 功能
 
+- 单个 `bot.py` 进程并发服务多个微信账号，每个账号拥有独立 token、上下文、QR 状态和持久化文件
+- 内置共享登录页：匿名访客获得不可猜测的临时会话，扫码后直接进入微信文字对话
 - 固定入口申请二维码，支持扫码状态长轮询、数字配对码和节点跳转
 - `getupdates` 长轮询收消息，并持久化 `get_updates_buf` 游标
 - `getconfig`、输入状态和完整文本 `sendmessage` 流程
 - 校验 HTTP、JSON、`ret/errcode`，识别 `-14` 失效 token 并受控重新登录
 - 启动/停止时最佳努力调用 `notifystart` / `notifystop`
-- 连接到期前提醒、确认和自动重连
+- 服务端 token 失效后的受控自动恢复
 - DusAPI / DeepSeek provider 配置与 API Key 脱敏显示
 - 终端二维码渲染；缺少图像依赖时保留二维码链接
 
@@ -30,6 +32,10 @@
 ```text
 .
 ├── bot.py              # Bot 主程序
+├── bot_session.py      # 单个微信账号的隔离状态与常驻任务
+├── bot_manager.py      # 多账号并发创建、查找、监督和停止
+├── shared_runtime.py   # 默认共享进程入口
+├── shared_web.py       # 共享 QR 登录页与临时会话生命周期
 ├── dusapi.py           # DusAPI 兼容封装
 ├── deepseek.py         # DeepSeek 兼容封装
 ├── ima.py              # 腾讯 ima 知识库 OpenAPI 客户端
@@ -51,13 +57,24 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-首次运行会选择 AI provider，并填写 API Key、接口地址、模型和系统提示词。也可以从 [Releases](https://github.com/SiverKing/weixin-ClawBot-API/releases) 下载打包版本。登录成功后会按账号保存连接状态，正常重启直接复用；服务端返回 `-14` 或手动执行重连时进入受控重新扫码。
+`python bot.py` 默认启动单进程多用户服务，监听
+`http://127.0.0.1:18300/clawbot/`。终端首次运行且缺少 `config.json`
+时仍会引导选择 AI provider；随后在网页点击“扫码登录”即可创建独立的临时微信会话。
+登录成功后按账号保存连接状态，正常重启可直接复用；服务端返回 `-14`
+或页面点击“切换用户”时进入受控重新扫码。
+
+共享运行常用环境变量：`CLAWBOT_WEB_HOST`、`CLAWBOT_WEB_PORT`、
+`CLAWBOT_WEB_PREFIX`、`CLAWBOT_CONFIG_DIR`、`CLAWBOT_STATE_DIR`、
+`CLAWBOT_ENV_DIR`、`CLAWBOT_SESSION_TTL` 和
+`CLAWBOT_MAX_SESSIONS`（最大并发 session 数 / max concurrent sessions）。Cookie 默认按请求是否为 HTTPS 自动决定 Secure；
+在可信 nginx 后部署时设置 `CLAWBOT_TRUST_PROXY=1`，也可用
+`CLAWBOT_COOKIE_SECURE=1` 强制开启。
 
 首次登录或 token 失效后的登录步骤：
 
 1. 选择并确认 AI 配置。
-2. 使用手机微信扫描终端显示的二维码。
-3. 如果手机要求数字配对码，在终端输入配对码。
+2. 打开 `/clawbot/` 页面，使用手机微信扫描页面二维码。
+3. 如果手机要求数字配对码，在页面提交配对码。
 4. 登录成功后，在微信中发送消息；首次交互会收到指令列表。
 
 ## 配置文件
@@ -96,14 +113,39 @@ python bot.py
 | 指令 | 说明 |
 |---|---|
 | `/help` 或 `/指令` | 查看指令列表 |
-| `/time` | 查询当前连接剩余时间 |
+| `/time` | 查询当前连接状态 |
 | `/重新连接` | 请求立即重连，随后回复 `Y` 或 `N` |
+| `/发贴图号 关键词` | 出图并推进贴图号（newspic）草稿箱 |
+| `/发公众号 关键词` | 排版并推进图文（news）草稿箱 |
+| `/发列表` / `/发状态` | 看自己能发什么 / 最近发过什么 |
+| `/选 N` / `/重发 关键词` | 多命中时选一篇 / 同一篇重推 |
 
-非指令文字会转发给 AI。图片、文件和未提供文字转写的语音目前只会收到能力提示，不会被错误地送入 AI。
+文字和 iLink 提供的语音转写内容会走同一条命令/AI 路由。图片、文件等暂不支持的媒体会被忽略；语音没有转写文本时会提示用户重试或使用微信“转文字”，不会发送无效的能力说明。
+
+### 发稿桥（多用户隔离）
+
+`/发*` 指令由 `utils/xiaolvshu.py` 认领，转交给
+`/opt/obsidian-xiaolvshu/scripts/xiaolvshu_bridge.py`（子进程，stdout 一行 JSON）。
+
+隔离键是**发消息的人**（`from_user_id`），不是登录的 bot 账号：
+
+| 东西 | 位置 |
+|---|---|
+| vault | `/opt/clawbot-xiaolvshu/users/<slug>/vault` |
+| 输出 / 台账 | `<home>/out/` / `<home>/ledger.json` |
+| 公众号凭据 | `/etc/clawbot/xiaolvshu/<slug>.env`（600） |
+
+桥那边拒绝跨 vault 的笔记路径（`cross_vault`）。发布只进**草稿箱**，
+不群发 —— 人工在后台核对后再发表。
+
+配置在 `.env`：`XIAOLVSHU_BRIDGE` / `XIAOLVSHU_PYTHON` / `XIAOLVSHU_TIMEOUT`
+/ `XIAOLVSHU_STORE` / `XIAOLVSHU_CREDS_DIR`。
 
 ## 自动重连
 
-`bot.py` 顶部的 `RECONNECT_CONFIG` 可调整项目侧的提醒策略：
+`bot.py` 顶部的 `RECONNECT_CONFIG` 可调整兼容参数。正常运行时，
+`getupdates` 长轮询就是连接保活；只有 iLink 明确返回 `ret=-14` 或
+`errcode=-14` 才会进入二维码恢复流程，不会因为用户长时间不打开网页而退出。
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
@@ -112,8 +154,9 @@ python bot.py
 | `reminder_interval` | `30 * 60` | 用户回复 N 后再次提醒间隔（秒） |
 | `force_before` | `30 * 60` | 剩余时间低于此值时强制重连（秒） |
 | `qrcode_scan_timeout` | `480` | 整体扫码等待上限（秒） |
+| `proactive_relogin` | `False` | 兼容旧版的本地计时主动扫码开关，生产不要开启 |
 
-这些是客户端调度参数，不是服务端承诺的固定 token 生命周期。服务端明确返回 `ret=-14` 或 `errcode=-14` 时，程序会停止紧密轮询并重新走二维码登录。
+`session_duration` / `warning_before` / `force_before` 不是服务端承诺的 token 生命周期；默认仅保留用于兼容 `/time` 等旧接口。网页会话 TTL 到期会回收网页绑定，但不会停止尚未失效的后台 BotSession；只有尚未扫码成功的临时会话才会被停止。临时登录同时保存独立的随机恢复 cookie（默认 30 天），控制页闲置后重新打开会自动绑定回原后台 session，不会把 `user_id` 放进 cookie。
 
 ## OpenClaw Weixin 2.4.6 协议要点
 
@@ -186,6 +229,8 @@ POST sendtyping { status: 2 }（finally 中尽力执行）
 | `clawbot.api` | 每次 iLink HTTP 自动 trace（DEBUG） |
 | `clawbot.state` | `weixin_state.json` 读写 |
 | `clawbot.ima` | ima 检索 / 写入 / 配置 |
+| `clawbot.publish` | 发稿闭环（贴图号 / 图文 → 公众号草稿箱）：认领 / 调桥 / 桥的结果 / 回信 |
+| `clawbot.diagnostics` | 连接链路埋点（`diag stage=inbound` / `reply_sent` / `worker_failed` …） |
 
 ### 环境变量
 
@@ -221,6 +266,16 @@ grep -E "reconnect (start|warning|force|credentials|getupdates)" logs/clawbot.lo
 grep -E "ima (search|POST|envelope|exhausted)" logs/clawbot.log | tail -10
 # → "envelope err code=401" → API key 失效
 # → "exhausted after 5 attempts" → 上游 5xx 或网络问题
+
+# 6. 「发贴图号」没反应 / 不知道发到哪一步了
+#    每一步都带同一个 flow id，grep 一个 id 就是一整条链路
+grep -E "flow=[0-9a-f]{8}" logs/clawbot.log | tail -40
+# → 完全没有 publish_intent：命令没被认领（认错了说法或模块没加载）
+# → 有 publish_intent 没有 bridge_call：桥模块 import 失败（看 publish_unavailable）
+# → 有 bridge_call 没有 bridge_result：桥卡住了（看 bridge_stderr / bridge_error）
+# → 有 bridge_result ok=False code=need_select：命中多篇，等用户 /选 N
+# → 有 publish_result 没有 reply_sent：回信发不出去（看 clawbot.message 的 send_reliable failed）
+# → 有 reply_sent 但微信没收到 → 问题在 iLink 侧
 ```
 
 DEBUG 级别会输出每次 iLink HTTP 的 method / path / status / body（脱敏后）。复盘协议漂移类问题时打开：

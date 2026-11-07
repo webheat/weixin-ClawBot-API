@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import base64
+import contextvars
 import io
 import inspect
 import json
@@ -9,6 +10,7 @@ import re
 import secrets
 import time
 import urllib.request
+from functools import partial
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -22,6 +24,12 @@ from ima import ImaClient, ImaConfig, build_context_prompt as _ima_build_context
 from qr_web import QrFlowState, make_web_on_qrcode, wait_for_verify_code, web_enabled, start as qr_web_start
 from utils.local_kb import LocalKBIndex
 from utils.logging_setup import get_logger
+from utils.ima_bindings import get_default_bindings as _get_ima_bindings
+
+try:
+    from utils.semantic_kb import SemanticKBIndex  # 4 档 mode: llm+semantic
+except Exception:  # fastembed 缺失不致命；只在 SEMANTIC_KB_ENABLED=1 时才用
+    SemanticKBIndex = None  # type: ignore[assignment]
 
 # 关键词抽取 prompt：用于 _AIWithIma._extract_keywords，从自然语言问句里
 # 拆出 1-3 个最适合 IMA 搜索的关键词。
@@ -86,13 +94,23 @@ ai = None  # 启动时从配置文件加载后初始化
 # 测试时将数值改小，例如：
 #   "session_duration": 300, "warning_before": 60, "reminder_interval": 30,
 #   "force_before": 60, "qrcode_scan_timeout": 120
+#
+# 策略：长轮询负责连接保活，服务端明确返回 stale token（-14）时才扫码恢复。
+# 旧版本按本地 24 小时计时器主动发起二维码登录，这会把仍然有效的连接误判为
+# 已退出，且用户不在网页旁边时无法完成扫码。保留 proactive_relogin 仅作紧急
+# 兼容开关，生产默认关闭。
 RECONNECT_CONFIG = {
     "session_duration":    24 * 3600,  # 会话总时长（秒）
     "warning_before":       2 * 3600,  # 提前多久发出警告（秒）
     "reminder_interval":      30 * 60, # 用户回 N 后多久再问（秒）
     "force_before":           30 * 60, # 最后多久强制重连（秒）
     "qrcode_scan_timeout":       480,  # 官方客户端默认整体等待时长（秒）
+    "proactive_relogin":       False,  # 仅兼容旧行为；默认由 getupdates 保活
 }
+# 当 do_reconnect 还在 QR 扫描/登录流程里、或 elapsed 已越过 warning_before 但仍未成功
+# 重连时，timer 任务的下一次 recheck 至少等这么秒；避免 sendmessage 失败 + do_reconnect 挂
+# 起时退化成 ~4 Hz 日志风暴（logs/clawbot_alice.log 2026-09-13 09:18:56+）。
+_RECONNECT_RECHECK_BACKOFF_SECS = 60.0
 # =============================================
 
 # ========== 配置文件 ==========
@@ -105,45 +123,6 @@ ILINK_APP_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 6)
 BOT_AGENT = "weixin-ClawBot-API/1.2.0 (python)"
 DEFAULT_BOT_AGENT = "OpenClaw"
 BOT_AGENT_MAX_LEN = 256
-
-# ========== 多用户路径解析（--user） ==========
-USER_ENV_DIR = "/etc/clawbot"
-SHARED_IMA_ENV = f"{USER_ENV_DIR}/ima.env"
-LEGACY_PROJECT_ENV = ".env"
-
-
-def _resolve_user_paths(user: Optional[str]) -> dict:
-    """根据 --user 解析文件名 / env 文件加载顺序 / 日志路径。
-
-    不传 --user：单租户旧行为，使用 cwd 下的 config.json / weixin_state.json
-    以及项目 .env。传 --user alice：使用 config_alice.json /
-    weixin_state_alice.json / logs/clawbot_alice.log，加载
-    /etc/clawbot/alice.env（可选） → /etc/clawbot/ima.env（兜底）。
-    """
-    if not user:
-        return {
-            "user": None,
-            "config_file": CONFIG_FILE,
-            "state_file": STATE_FILE,
-            "log_file": Path("logs") / "clawbot.log",
-            "env_files": [LEGACY_PROJECT_ENV],
-            "banner_suffix": "(legacy single-tenant)",
-        }
-    # 用户名只能含字母数字_.-，其它字符替换成 _（避免 path traversal）
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", user)
-    if safe != user:
-        print(f"[警告] --user 值含非法字符，已替换为 '{safe}'")
-    return {
-        "user": safe,
-        "config_file": f"config_{safe}.json",
-        "state_file": f"weixin_state_{safe}.json",
-        "log_file": Path("logs") / f"clawbot_{safe}.log",
-        "env_files": [
-            f"{USER_ENV_DIR}/{safe}.env",   # 用户专属（不存在时静默跳过）
-            SHARED_IMA_ENV,                 # 共享 ima 兜底
-        ],
-        "banner_suffix": f"user={safe}",
-    }
 
 # iLink 2.4.6 官方客户端默认超时。长轮询超时属于正常控制流，不能当作业务失败。
 QR_STATUS_TIMEOUT = 35
@@ -416,12 +395,58 @@ def load_or_create_config() -> dict:
 
 BASE_URL = "https://ilinkai.weixin.qq.com"
 COMMANDS_MSG = (
-    "连接成功！\n"
-    "可用指令：\n"
-    "/help  /指令   - 查看全部指令列表\n"
-    "/time          - 查询当前连接剩余时间\n"
-    "/重新连接       - 立即触发重新连接（需确认）\n"
-    "\n非指令输入即为 AI 对话"
+    "你好，我是 🪶 翼claw，您的个人微信专属智能助理。\n"
+    "📚 接入 ima 知识库，支持文字 / 语音 / 公众号卡片。\n"
+    "\n"
+    "直接发消息即可对话，常用指令：\n"
+    "/help    查看全部指令\n"
+    "/time    查看当前连接状态\n"
+    "/重新连接 立即刷新连接\n"
+    "\n"
+    "📮 发公众号（文字或语音都行）：\n"
+    "/发贴图号 关键词   出图并推进贴图号草稿箱\n"
+    "/发公众号 关键词   排版并推进图文草稿箱\n"
+    "/发列表            看你知识库里能发什么\n"
+    "/发状态            看最近发过什么\n"
+    "/重发 关键词       同一篇再推一次\n"
+    "语音直接说「发贴图号 沉香」也能认。"
+)
+
+VOICE_TRANSCRIPT_UNAVAILABLE_MSG = (
+    "这条语音的文字内容没有成功传到我这里，暂时无法理解。"
+    "请重新发送一次语音；如果仍未识别，请在微信里点击“转文字”后发送，或直接发文字。"
+)
+
+INTRO_DETAIL_MSG = (
+    "🪶 翼claw · 您的个人微信专属智能助理\n"
+    "\n"
+    "我是一个由大语言模型驱动的微信机器人（DeepSeek / Claude / GPT 可选），\n"
+    "跑在您自己的服务器上。发消息给我，我会用 AI 帮您解答问题、\n"
+    "整理资料、撰写内容。\n"
+    "\n"
+    "📚 我能做什么\n"
+    "\n"
+    "• AI 自由对话：闲聊、写作、翻译、分析、头脑风暴——直接发消息就行。\n"
+    "• 知识库问答：接入了腾讯 ima，预装 150 条您专属 Q&A。\n"
+    "  \"xxx 怎么用 / xxx 是什么\" 这类问题优先从知识库找答案。\n"
+    "• 三层兜底检索：云端 KB 没命中时，自动回退本地 KB 或语义检索。\n"
+    "  断网也能用本地知识库回答。\n"
+    "• 多模态理解：文字、语音（自动转文字）、公众号 / 小程序卡片\n"
+    "  （自动读标题和摘要）都能识别处理。\n"
+    "• 持续在线：后台持续维护连接，服务端 token 失效时自动进入恢复流程。\n"
+    "\n"
+    "⚙️ 常用指令\n"
+    "\n"
+    "• /help    · 查看全部指令\n"
+    "• /time    · 查看当前连接状态\n"
+    "• /重新连接 · 立即刷新连接\n"
+    "\n"
+    "💡 小提示\n"
+    "问具体问题比\"你好\"更能发挥我的能力；\n"
+    "知识库内容会随您上传的资料持续更新。\n"
+    "\n"
+    "━━━━━━━━━━━\n"
+    "直接发消息即可开始对话 👋"
 )
 
 
@@ -491,9 +516,9 @@ def _redact_text(value):
     else:
         text = str(value or "")
     patterns = (
-        r"(?i)(bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)=([^&\s,}\"]+)",
-        r'(?i)("(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)"\s*:\s*")([^"]+)(")',
-        r"(?i)('(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)'\s*:\s*')([^']+)(')",
+        r"(?i)(bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param|appsecret|wxoapp_app_secret|access_token|refresh_token|oauth_code)=([^&\s,}\"]+)",
+        r'(?i)("(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param|appsecret|wxoapp_app_secret|access_token|refresh_token|oauth_code)"\s*:\s*")([^"]+)(")',
+        r"(?i)('(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param|appsecret|wxoapp_app_secret|access_token|refresh_token|oauth_code)'\s*:\s*')([^']+)(')",
         r'(?i)("local_token_list"\s*:\s*)\[[^\]]*\]',
     )
     for index, pattern in enumerate(patterns):
@@ -799,19 +824,129 @@ async def get_typing_ticket_safe(session, user_id, context_token, cache,
     return str(cached.get("typing_ticket") or "")
 
 
-def extract_message_text(msg: dict) -> str:
-    """遍历完整 item_list，提取文本/语音转写，避免只读取第一项。"""
-    parts = []
+def _voice_transcript(voice_item) -> str:
+    """Return the transcript emitted by iLink for one voice item.
+
+    The documented wire shape is ``voice_item.text``.  We intentionally do
+    not treat the encrypted media payload as text: the configured LLM must
+    receive the server ASR result, not a placeholder such as "[语音]".
+    """
+    if not isinstance(voice_item, dict):
+        return ""
+    value = voice_item.get("text")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def is_voice_message(msg: dict) -> bool:
+    """Whether an inbound iLink message contains a voice item.
+
+    ``type`` is numeric in the official schema, but JSON bridges occasionally
+    serialize it as a string or omit it and rely on the payload key.
+    """
+    if not isinstance(msg, dict):
+        return False
     for item in msg.get("item_list") or []:
         if not isinstance(item, dict):
             continue
+        if (
+            item.get("type") in (3, "3")
+            or "voice_item" in item
+        ) and isinstance(item.get("voice_item"), dict):
+            return True
+    return False
+
+
+def extract_voice_transcript(msg: dict) -> str:
+    """Extract iLink's server-side ASR text without inventing voice content."""
+    if not isinstance(msg, dict):
+        return ""
+    items = msg.get("item_list") or []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        transcript = _voice_transcript(item.get("voice_item"))
+        if transcript:
+            return transcript
+    return ""
+
+
+def extract_message_text(msg: dict) -> str:
+    """遍历完整 item_list，提取文本/语音转写 / 转发卡片元数据。
+
+    协议字段来源：``weixin-openclaw-api-py-docs.md:1021``（``ref_msg`` 由
+    ``message_item`` + 摘要 ``title`` 组成）。覆盖的入站形态：
+
+    * 普通文字（``text_item.text``）
+    * 语音转写（``voice_item.text``）
+    * 转发/引用的聊天记录（多个 ``text_item`` 遍历 + ``ref_msg.message_item``）
+    * 链接 / 公众号文章 / 小程序卡片（``title`` / ``description`` / ``url`` /
+      ``app_msg.title`` / ``app_msg.des``）
+
+    不做的事：不解 CDN、不抓 URL 网页内容、不解析图片/文件/视频二进制。
+    """
+    parts: list[str] = []
+
+    def _add(text):
+        """去重 append：阻止文本在整个 parts 里重复出现。
+
+        为什么用 ``text not in parts`` 而不是 ``parts[-1] != text``：
+        引用回复场景下 ``text_item.text`` 与 ``ref_msg.message_item.text_item.text``
+        是同一字符串但被 ``ref_msg.title`` 等中间字段隔开，``parts[-1]`` 检查
+        会漏判；O(n²) 在单条消息最多 20 个 item 的场景下完全可接受。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        if text not in parts:
+            parts.append(text)
+
+    for item in msg.get("item_list") or []:
+        if not isinstance(item, dict):
+            continue
+
+        # 1. 直接挂在 item 上的文本 / 语音转写
         text_item = item.get("text_item") or {}
         if text_item.get("text"):
-            parts.append(str(text_item["text"]))
-            continue
-        voice_item = item.get("voice_item") or {}
-        if voice_item.get("text"):
-            parts.append(str(voice_item["text"]))
+            _add(str(text_item["text"]))
+        voice_text = _voice_transcript(item.get("voice_item"))
+        if voice_text:
+            _add(voice_text)
+
+        # 2. 转发 / 引用：被引用 item 里也可能再嵌一份完整副本
+        ref_msg = item.get("ref_msg") or {}
+        if isinstance(ref_msg, dict):
+            ref_title = ref_msg.get("title")
+            if ref_title:
+                _add(str(ref_title))
+            ref_inner = ref_msg.get("message_item") or {}
+            if isinstance(ref_inner, dict):
+                ref_text = (ref_inner.get("text_item") or {}).get("text")
+                if ref_text:
+                    _add(str(ref_text))
+
+        # 3. 链接 / 公众号 / 小程序卡片：标题、描述、URL
+        #    不同协议版本字段名不一致，列几个常见 key 容错读取。
+        for key in ("title", "description", "des"):
+            val = item.get(key)
+            if val:
+                _add(str(val))
+        app_msg = item.get("app_msg") or {}
+        if isinstance(app_msg, dict):
+            for key in ("title", "des", "description"):
+                val = app_msg.get(key)
+                if val:
+                    _add(str(val))
+        url = item.get("url")
+        if url:
+            _add(f"[链接] {url}")
+
+        # 4. 识别到任何转发/卡片元数据时打一条 debug，便于运维排查
+        if ref_msg or app_msg or item.get("url") or item.get("title"):
+            log_msg.debug("forwarded item extracted title=%r has_text=%s url=%s",
+                          (str(item.get("title"))[:40]) if item.get("title") else None,
+                          bool(text_item.get("text") or voice_text),
+                          bool(item.get("url")))
+
     return "\n".join(parts).strip()
 
 
@@ -828,17 +963,28 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
     warning_active[0] = False
     reconnect_asked.clear()
 
-    log_reconnect.info("reconnect start current_token=%s contact=%s",
-                       (current_token[:8] + "…") if current_token else "-",
-                       from_id[-8:] if from_id else None)
-    print("[重连] 开始重连流程...")
+    # Bug fix: current_token / from_id / ctx 必须在 log 调用之前赋值——
+    # 之前把读和写分置在第 850 行（读）和第 854/856 行（写），Python 编译时
+    # 看到函数体内有 `current_token = ...` 就把整函数内 current_token 当 local，
+    # 导致首次调用 do_reconnect 必抛 UnboundLocalError，让 reconnect_in_progress[0]
+    # 卡在 True 不掉，timer 退化成 4 Hz 死循环（详见 logs/clawbot_alice.log
+    # 2026-09-12 23:59:58 那条 remaining_s=-19036 的风暴）。
+    current_token = bot_token_ref[0]
     from_id = last_contact.get("from_id")
     ctx = last_contact.get("context_token")
-    current_token = bot_token_ref[0]
 
     try:
+        log_reconnect.info("reconnect start current_token=%s contact=%s",
+                           (current_token[:8] + "…") if current_token else "-",
+                           from_id[-8:] if from_id else None)
+        print("[重连] 开始重连流程...")
+
         async def deliver_qrcode(content):
-            """把当前二维码同步输出到网页 + 终端 + 最近联系人。"""
+            """把当前二维码同步输出到网页 + 终端。
+
+            后台静默策略：QR 不再发到 last_contact 微信会话，仅走 web_on_qrcode +
+            终端（print / render_terminal_qr）。用户收件箱保持安静。
+            """
             if web_on_qrcode is not None:
                 try:
                     await web_on_qrcode(content)
@@ -846,14 +992,11 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                     log_reconnect.warning("reconnect web_on_qrcode failed err=%s",
                                           _redact_text(exc))
                     print(f"[重连] web 二维码回调失败: {_redact_text(exc)}")
-            qr_msg = f"[重连] 请扫码完成新连接：{content}"
             print(f"[重连] 请扫码完成新连接：{_redact_text(content)}")
             # HTTP 图片链接已由 save_qrcode_content 渲染，其他格式在这里补渲染。
             if not content.startswith("http"):
                 render_terminal_qr(content)
-            await send_msg_safe(session, from_id, ctx, qr_msg, bot_token_ref, bot_base_url_ref)
-            log_reconnect.info("reconnect qr delivered via web+console+contact contact=%s",
-                               from_id[-8:] if from_id else None)
+            log_reconnect.info("reconnect qr delivered via web+console (silent, no user msg)")
 
         try:
             login_result = await login_with_qrcode(
@@ -954,9 +1097,9 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
             print("[重连] 当前连接仍然有效，无需切换凭据")
         if not account_changed:
             completion_text = (
-                "[完成] 新连接已建立，已自动切换，继续使用"
+                "[完成] 已自动重新连接，继续使用"
                 if credentials_changed
-                else "[完成] 当前连接仍然有效，可以继续使用"
+                else "[完成] 当前连接仍然有效，继续使用"
             )
             await send_msg_safe(
                 session,
@@ -967,6 +1110,15 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                 bot_base_url_ref,
             )
         login_time_ref[0] = time.time()
+        # 关键：前端 render() 只有看到 status==="logged_in" 才会显示"登录成功 ✓"。
+        # do_reconnect 成功后必须同步刷这个状态，否则页面一直停留在 qr_pending
+        # 显示 QR，哪怕 iLink 实际已登录成功（用户看到老 QR 继续扫 → 实际是 dead QR
+        # 因为 do_reconnect 已在等 scan 结果并会进入新的 QR 周期）。
+        # 旧路径（message_loop 的 -14 handler）单独写过一行，这里补齐 do_reconnect 主路径。
+        if web_state is not None:
+            web_state.status = "logged_in"
+            web_state.logged_in_at = time.time()
+            log_reconnect.info("reconnect web state set logged_in (frontend should show ✓)")
     finally:
         reconnect_in_progress[0] = False
 
@@ -984,78 +1136,56 @@ async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_co
                        session_dur_h, warn_before_h, force_before_m)
     while True:
         try:
-            elapsed = time.time() - login_time_ref[0]
-            first_wait = max(0, cfg["session_duration"] - cfg["warning_before"] - elapsed)
-            await asyncio.sleep(first_wait)
-            remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-
-            if remaining <= cfg["force_before"]:
-                force_msg = "[自动] 连接即将到期，开始强制重新连接..."
-                log_reconnect.warning("reconnect force firing remaining_s=%.0f", remaining)
-                print(force_msg)
-                if not last_contact.get("from_id") or not last_contact.get("context_token"):
-                    log_reconnect.info("reconnect reminder skipped reason=no_contact (force)")
-                    print("[自动] 尚无最近联系人，跳过本轮自动重连提醒")
-                    login_time_ref[0] = time.time()
-                    continue
-                await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                    force_msg, bot_token_ref, bot_base_url_ref)
-                await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                   typing_ticket_cache, reconnect_asked, warning_active,
-                                   reconnect_in_progress, login_time_ref, cfg, runtime_state,
-                                   web_on_qrcode, web_state)
+            # Bug fix: 若上一次 force-fire / do_reconnect 仍在飞行中（典型场景是 QR 没人扫
+            # 导致 login_with_qrcode 卡在扫码超时之前），就退避而非立刻重试。否则下面
+            # first_wait=0 会让 timer 跟着 send_msg_safe 的超时节奏（~280ms）刷成 ~4 Hz
+            # 日志风暴（logs/clawbot_alice.log 2026-09-13 09:18:56+）。
+            if reconnect_in_progress[0]:
+                log_reconnect.debug("reconnect timer backing off reason=in_progress")
+                await asyncio.sleep(_RECONNECT_RECHECK_BACKOFF_SECS)
                 continue
 
-            remaining_h = remaining / 3600
-            warn_msg = f"[提醒] 连接还剩约 {remaining_h:.1f} 小时到期，是否现在重新连接？回复 Y 立即重连，N 稍后提醒"
-            log_reconnect.info("reconnect warning fired remaining_h=%.1f", remaining_h)
-            print(warn_msg)
+            elapsed = time.time() - login_time_ref[0]
+            # Bug fix: 当 elapsed 已经越过 warning_before 阈值时，原始公式
+            # `max(0, session_duration - warning_before - elapsed)` 退化成 0，外层 timer
+            # 会以事件循环最快速度空转。给一个 ≥ reminder_interval 的下限，保证哪怕 do_reconnect
+            # 短暂退场（极少见），我们也不会比正常提醒节奏更频繁地再 fire。
+            raw_wait = cfg["session_duration"] - cfg["warning_before"] - elapsed
+            first_wait = max(0, raw_wait)
+            if first_wait == 0:
+                first_wait = float(cfg.get("reminder_interval", 30 * 60))
+            await asyncio.sleep(first_wait)
+
+            # 后台静默策略：会话进入"接近到期"窗口后，仅在日志里记一行 armed，
+            # 不向用户发任何"提醒"消息；外层 warning_active 也保持 False，
+            # 让 message_loop 里 if warning_active[0] ... 那条分支不再被命中。
+            remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
+            log_reconnect.info("reconnect armed silently remaining_s=%.0f; awaiting force_before", remaining)
+
+            # 静默等到 force_before：每 5 分钟重算一次 remaining，
+            # 既不发任何用户消息，也不会让 timer 在 force_before 之前空转耗 CPU。
+            while True:
+                if remaining <= cfg["force_before"]:
+                    break
+                await asyncio.sleep(min(300.0, remaining - cfg["force_before"]))
+                remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
+
+            # force_before 触发：直接走 do_reconnect（QR 走 web/terminal，不打扰用户）。
+            log_reconnect.warning("reconnect force firing remaining_s=%.0f", remaining)
+            print("[自动] 连接即将到期，开始强制重新连接...")
             if not last_contact.get("from_id") or not last_contact.get("context_token"):
-                log_reconnect.info("reconnect reminder skipped reason=no_contact (warning)")
-                print("[提醒] 尚无最近联系人，跳过本轮连接到期提醒")
+                log_reconnect.info("reconnect force skipped reason=no_contact")
+                print("[自动] 尚无最近联系人，跳过本轮自动重连（仅 web/terminal 出 QR）")
                 login_time_ref[0] = time.time()
                 continue
-            await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                warn_msg, bot_token_ref, bot_base_url_ref)
-            warning_active[0] = True
-
-            while True:
-                remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-                if remaining <= cfg["force_before"]:
-                    force_msg = "[自动] 连接即将到期，开始强制重新连接..."
-                    log_reconnect.warning("reconnect force firing remaining_s=%.0f", remaining)
-                    print(force_msg)
-                    await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                        force_msg, bot_token_ref, bot_base_url_ref)
-                    await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                       typing_ticket_cache, reconnect_asked, warning_active,
-                                       reconnect_in_progress, login_time_ref, cfg, runtime_state,
-                                       web_on_qrcode, web_state)
-                    break
-
-                wait_secs = max(0.0, min(float(cfg["reminder_interval"]),
-                                         remaining - cfg["force_before"]))
-                try:
-                    await asyncio.wait_for(reconnect_asked.wait(), timeout=wait_secs)
-                    log_reconnect.info("reconnect user-confirmed via Y, dispatching")
-                    # 用户回 Y，执行重连
-                    await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                       typing_ticket_cache, reconnect_asked, warning_active,
-                                       reconnect_in_progress, login_time_ref, cfg, runtime_state,
-                                       web_on_qrcode, web_state)
-                    break
-                except asyncio.TimeoutError:
-                    remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-                    if remaining <= cfg["force_before"]:
-                        continue  # 下一轮循环走强制重连分支
-                    remaining_m = remaining / 60
-                    remind_msg = (f"[提醒] 连接还剩约 {remaining_m:.0f} 分钟，"
-                                  f"是否现在重新连接？回复 Y 立即重连，N 继续等待")
-                    print(remind_msg)
-                    # 用最新的 last_contact（可能已更新）
-                    if last_contact.get("from_id") and last_contact.get("context_token"):
-                        await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                            remind_msg, bot_token_ref, bot_base_url_ref)
+            # 走单一入口：若 listener 已在跑（被 /relink 抢先或 -14 触发），
+            # 这里会 await 同一 Future，不会再开第二个 login_with_qrcode。
+            try:
+                await request_relogin("force-before")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_reconnect.warning("force reconnect failed err=%s", _redact_text(exc))
         except asyncio.CancelledError:
             raise
         except ILinkAPIError as exc:
@@ -1256,7 +1386,8 @@ async def poll_login_status(session, qrcode, base_url=BASE_URL, verify_code=None
 
 
 async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_seconds=None,
-                                  allow_already_connected=False, web_state=None):
+                                  allow_already_connected=False, web_state=None,
+                                  cancel_event=None):
     timeout_seconds = timeout_seconds or RECONNECT_CONFIG["qrcode_scan_timeout"]
     deadline = time.time() + timeout_seconds
     current_base_url = base_url or BASE_URL
@@ -1267,6 +1398,11 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
         if time.time() >= deadline:
             log_qr.warning("login timed out after %.1fs", timeout_seconds)
             return {"timeout": True}
+        # 协作式取消：portal /relink 在初始登录等待扫码阶段触发的 cancel_event
+        # 必须在 1s 内命中，否则 listener 一直等不到 reconnect_in_progress 变 False
+        if cancel_event is not None and cancel_event.is_set():
+            log_qr.info("wait_login_confirmation cancelled by external event")
+            return {"cancelled": True}
 
         try:
             result = await poll_login_status(session, qrcode, current_base_url, pending_verify_code)
@@ -1283,19 +1419,26 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
             continue
 
         if result.get("bot_token"):
+            log_qr.info("qr_confirmed bot_id=%s",
+                        str(result.get("ilink_bot_id") or "-")[:12])
             return result
         if result.get("login_error"):
+            log_qr.info("qr_status=login_error")
             return result
         if result.get("already_connected"):
+            log_qr.info("qr_status=already_connected")
             return result if allow_already_connected else {"already_connected": True}
         if result.get("expired") or result.get("verify_code_blocked"):
+            log_qr.info("qr_status=expired_or_verify_code_blocked")
             return result
         if result.get("redirect_base"):
             current_base_url = result["redirect_base"]
             log_qr.info("poll node switched to=%s", current_base_url)
             print(f"扫码轮询切换到新节点: {current_base_url}")
+            log_qr.info("qr_status=redirect_base")
             continue
         if result.get("scanned"):
+            log_qr.info("qr_status=scanned")
             if pending_verify_code and result.get("verify_code_accepted"):
                 pending_verify_code = None
             if web_state is not None:
@@ -1329,8 +1472,16 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
         await asyncio.sleep(1)
 
 
-async def login_with_qrcode(session, local_token_list=None, existing_state=None, on_qrcode=None, web_state=None):
-    """执行官方二维码登录，最多展示 MAX_QR_REFRESH_COUNT 个二维码。"""
+async def login_with_qrcode(session, local_token_list=None, existing_state=None,
+                            on_qrcode=None, web_state=None, cancel_event=None,
+                            save_qr_artifact=True):
+    """执行官方二维码登录，最多展示 MAX_QR_REFRESH_COUNT 个二维码。
+
+    Args:
+        cancel_event: 可选的 ``asyncio.Event``——若在循环中被 set，函数立刻
+            抛 ``asyncio.CancelledError``。用于让 portal ``/switch`` 在初始
+            登录等待扫码阶段也能触发接管（避免 listener 还没起来就被忽略）。
+    """
     # 与官方实现一致：初始二维码计为第 1 次，最多共展示 3 个二维码。
     refresh_count = 1
     deadline = time.time() + RECONNECT_CONFIG["qrcode_scan_timeout"]
@@ -1339,6 +1490,9 @@ async def login_with_qrcode(session, local_token_list=None, existing_state=None,
                 refresh_count, MAX_QR_REFRESH_COUNT,
                 max(0.0, deadline - time.time()))
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            log_qr.info("login cancelled by external event (cancel_event set)")
+            raise asyncio.CancelledError("login_with_qrcode cancelled by event")
         remaining = deadline - time.time()
         if remaining <= 0:
             log_qr.error("login aborted refresh_count=%d reason=deadline_exceeded",
@@ -1355,11 +1509,12 @@ async def login_with_qrcode(session, local_token_list=None, existing_state=None,
         log_qr.info("qr cycle refresh=%d qr_len=%d img_content_present=%s",
                     refresh_count, len(str(qrcode)), bool(qrcode_img_content))
         qr_content = str(qrcode_img_content or qrcode)
-        try:
-            save_qrcode_content(qr_content)
-        except Exception as exc:
-            log_qr.warning("qr save failed err=%s, falling back to link", _redact_text(exc))
-            print(f"二维码保存失败，将继续使用链接: {_redact_text(exc)}")
+        if save_qr_artifact:
+            try:
+                save_qrcode_content(qr_content)
+            except Exception as exc:
+                log_qr.warning("qr save failed err=%s, falling back to link", _redact_text(exc))
+                print(f"二维码保存失败，将继续使用链接: {_redact_text(exc)}")
         if on_qrcode:
             callback_result = on_qrcode(qr_content)
             if inspect.isawaitable(callback_result):
@@ -1378,9 +1533,13 @@ async def login_with_qrcode(session, local_token_list=None, existing_state=None,
             timeout_seconds=remaining,
             allow_already_connected=True,
             web_state=web_state,
+            cancel_event=cancel_event,
         )
         if login_result.get("bot_token"):
             return login_result
+        if login_result.get("cancelled"):
+            # cancel_event 命中：把 cancelled 信号透传上去，让 main() 抛 CancelledError
+            raise asyncio.CancelledError("login_with_qrcode cancelled by event")
         if login_result.get("already_connected"):
             old_token = str(existing_state.get("bot_token") or "").strip()
             if old_token:
@@ -1450,31 +1609,219 @@ async def main():
     async with aiohttp.ClientSession() as session:
         # ---- 启动 web 登录页面（CLAWBOT_WEB_ENABLED=1 默认）----
         qr_state = QrFlowState()
+        relogin_event = asyncio.Event()
         web_task: asyncio.Task | None = None
         web_on_qrcode = None
         if web_enabled():
-            web_task = asyncio.create_task(qr_web_start(qr_state))
+            web_task = asyncio.create_task(qr_web_start(qr_state, relogin_event=relogin_event))
             web_on_qrcode = make_web_on_qrcode(qr_state, session)
 
-        if saved_token:
-            # 官方客户端会按账号复用本地凭据；若服务端随后返回 -14，
-            # 消息循环会停止紧密轮询并进入受控二维码重登录。
-            print("[登录] 复用本地保存的微信连接；token 失效时会自动要求重新扫码。")
-            log_qr.info("login reuse saved_token len=%d", len(saved_token))
+        # ---- 初始化可变状态容器 + relogin_listener（必须在初始登录之前）----
+        #
+        # 历史 bug：relogin_listener 之前在 main() 末尾才创建，初始登录等待扫码期间
+        # /relink 设的 event 没人消费，新 QR 永远不出。现把容器 / listener 都前置，
+        # 初始登录期间用 reconnect_in_progress[0]=True 排斥 listener，
+        # 登录完成后再让 listener 接棒（处理登录期间累积的 /relink 事件）。
+        bot_token_ref = [saved_token]
+        bot_base_url_ref = [runtime_state.get("baseurl", BASE_URL)]
+        saved_contact = runtime_state.get("last_contact") or {}
+        last_contact = {
+            "from_id": saved_contact.get("from_id") or None,
+            "context_token": saved_contact.get("context_token") or None,
+        }
+        typing_ticket_cache = {}
+        welcomed_users = set(runtime_state.get("contexts", {}).keys())
+        reconnect_asked = asyncio.Event()
+        warning_active = [False]
+        reconnect_in_progress = [False]
+        login_time_ref = [time.time()]
+        manual_reconnect_pending = {}
+        # ---- 重新登录：单一 owner 模式 ----
+        #
+        # 历史 bug：relogin_listener（来自 /relink）、message_loop 的 -14 handler、
+        # reconnect_timer_task 的 force_before、handle_message 的 "Y" 手动重连
+        # 各自独立调 login_with_qrcode / do_reconnect。在 /relink 场景下 listener
+        # 刚清空 token 触发自己的 do_reconnect 时，message_loop 的下一轮 getupdates
+        # 用空 token 拿到 -14，又调一次 login_with_qrcode，两条链路并发抢
+        # web_on_qrcode，前端看到的 QR 被两条链路互踩（"正在生成新二维码..." 卡很久
+        # 然后突然换一张码 = 用户扫的码已失效）。修法：所有 4 条路径都通过
+        # request_relogin() 入口；唯一真正干活的是 relogin_listener，并发调用者
+        # 共享同一个 Future，避免双发登录。
+        _relogin_lock = asyncio.Lock()
+        _pending_relogin: list[Optional[asyncio.Future]] = [None]
+
+        async def request_relogin(reason: str) -> dict:
+            """所有重新登录路径的唯一入口。
+
+            - 若已有 listener 在跑：直接 await 它的 Future，调用方零额外登录。
+            - 若空闲：登记新 Future、set relogin_event 唤醒 listener，await 它的结果。
+
+            Returns: do_reconnect 产出的 login_result dict（与 listen 自身用同一个）。
+            Raises: do_reconnect 抛出的任何异常。
+            """
+            async with _relogin_lock:
+                if _pending_relogin[0] is not None and not _pending_relogin[0].done():
+                    log_reconnect.info("relogin dedup: joining in-flight reason=%s", reason)
+                    existing = _pending_relogin[0]
+                else:
+                    existing = None
+                    future: asyncio.Future = asyncio.get_event_loop().create_future()
+                    _pending_relogin[0] = future
+                    relogin_event.set()
+                    log_reconnect.warning("relogin requested reason=%s", reason)
+            if existing is not None:
+                return await existing
+            return await future
+
+        async def relogin_listener():
+            """重新登录的真正执行者（唯一 owner）。被 request_relogin 或 /relink 唤醒。
+
+            触发条件 1：portal 用户在右上角点"切换账号" → /relink → qr_web 把
+            relogin_event.set()。
+            触发条件 2：request_relogin 被 message_loop / timer / handle_message
+            "Y" 调用，登记 Future + set event。
+
+            行为：清空 token 引用 → 调 do_reconnect → 把结果 set 给 _pending_relogin
+            （如果有等待方）。Future 异常路径同样 set_exception，让 await 抛出来。
+            """
+            log_reconnect.warning("relogin_listener task started")
+            while True:
+                await relogin_event.wait()
+                # reconnect_in_progress=True 时**不**清 event，让初始 login 的
+                # cancel_event 检查能在 ~1s 内命中；但必须 sleep 避免 busy-loop
+                # （不清 event + 不 sleep 会让 wait() 立刻返回陷入死循环）。
+                if reconnect_in_progress[0]:
+                    log_reconnect.info("relogin_listener skipped: reconnect in progress; event kept")
+                    await asyncio.sleep(0.5)
+                    continue
+                relogin_event.clear()
+                # 拿当前等待方（若有）。即使没有人 await 也要跑（/relink 是
+                # fire-and-forget；没有等待方就直接 set 不上 future，do_reconnect
+                # 仍然把新 QR 推到 qr_state）。
+                async with _relogin_lock:
+                    current_future = _pending_relogin[0]
+                log_reconnect.warning("relogin_listener running; has_awaiter=%s",
+                                     current_future is not None)
+                try:
+                    runtime_state["bot_token"] = ""
+                    save_runtime_state(runtime_state)
+                    bot_token_ref[0] = ""
+                    qr_state.status = "qr_pending"  # 双保险（qr_web 已经设过）
+                    login_result = await do_reconnect(
+                        session, bot_token_ref, bot_base_url_ref, last_contact,
+                        typing_ticket_cache, reconnect_asked, warning_active,
+                        reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
+                        runtime_state,
+                        web_on_qrcode=web_on_qrcode,
+                        web_state=qr_state,
+                    )
+                    if current_future is not None and not current_future.done():
+                        current_future.set_result(login_result)
+                except asyncio.CancelledError:
+                    # main() 在被取消时也会取消本 task；如果有等待方，要把异常传出去
+                    # 否则 caller 永久挂起。
+                    if current_future is not None and not current_future.done():
+                        current_future.set_exception(asyncio.CancelledError())
+                    raise
+                except Exception as exc:
+                    log_reconnect.error("relogin_listener crashed err=%s",
+                                        _redact_text(exc), exc_info=True)
+                    if current_future is not None and not current_future.done():
+                        current_future.set_exception(exc)
+                finally:
+                    # 兜底：do_reconnect 任何退出路径（成功 / 异常 / max_refresh_exceeded）
+                    # 都确保 is_regenerating=False。如果 set_qr_png 没机会跑（fetch 失败
+                    # / qrcode 缺失），前端就不会永远卡在"正在生成..."。
+                    if qr_state.is_regenerating:
+                        log_reconnect.warning("relogin_listener: clearing stale is_regenerating "
+                                              "(do_reconnect exited without set_qr_png)")
+                        qr_state.is_regenerating = False
+                    # 释放 _pending_relogin 槽位，让下一轮 request_relogin 能起新流程。
+                    async with _relogin_lock:
+                        if _pending_relogin[0] is current_future:
+                            _pending_relogin[0] = None
+
+        relogin_task = asyncio.create_task(relogin_listener())
+
+        # 初始登录期间占住 reconnect_in_progress，避免 relogin_listener 抢跑
+        # 触发第二个 login_with_qrcode（两个并行会竞争 QR、互相覆盖 state）。
+        # 包成 task 是为了让 cancel_event 命中时能强制 cancel_task.cancel() 中断
+        # iLink 的 35s 长轮询 poll_login_status（不用 task 的话只能在 1-35s 后
+        # 排队等 poll 返回再检测 cancel，listener 一直等不到 reconnect_in_progress
+        # 变 False）。
+        reconnect_in_progress[0] = True
+        login_result: Optional[dict] = None
+        login_task: Optional[asyncio.Task] = None
+        try:
+            if saved_token:
+                # 官方客户端会按账号复用本地凭据；若服务端随后返回 -14，
+                # 消息循环会停止紧密轮询并进入受控二维码重登录。
+                print("[登录] 复用本地保存的微信连接；token 失效时会自动要求重新扫码。")
+                log_qr.info("login reuse saved_token len=%d", len(saved_token))
+                login_result = {
+                    "bot_token": saved_token,
+                    "baseurl": runtime_state.get("baseurl") or BASE_URL,
+                    "ilink_bot_id": runtime_state.get("ilink_bot_id", ""),
+                    "ilink_user_id": runtime_state.get("ilink_user_id", ""),
+                }
+            else:
+                # 同时启动 cancel-watcher：relogin_event 一被 set，立刻取消 login_task
+                # （task 模式：cancel_event 协作式检测在 iLink 35s 长轮询里走不到，
+                # 必须强制 cancel task 才能让 login_with_qrcode 立刻抛 CancelledError）
+                async def _cancel_initial_login():
+                    await relogin_event.wait()
+                    if login_task is not None and not login_task.done():
+                        log_qr.info("cancel-watcher: cancelling initial login task")
+                        login_task.cancel()
+                cancel_watcher = asyncio.create_task(_cancel_initial_login())
+                login_task = asyncio.create_task(login_with_qrcode(
+                    session,
+                    [],
+                    existing_state=runtime_state,
+                    on_qrcode=web_on_qrcode,
+                    web_state=qr_state,
+                ))
+                try:
+                    login_result = await login_task
+                finally:
+                    cancel_watcher.cancel()
+                    try:
+                        await cancel_watcher
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        except asyncio.CancelledError:
+            # relogin_event 触发 cancel_task → login_with_qrcode 抛 CancelledError；
+            # 此时不要退出 main()，让 relogin_listener 接手：它会清 token、跑 do_reconnect
+            # 重新出 QR、扫到后再把 token 写回 bot_token_ref[0]。这里等 do_reconnect
+            # 完成（bot_token_ref 被 listener 重新填好）后继续走 message_loop。
+            log_qr.warning("initial login cancelled by /relink; "
+                           "awaiting relogin_listener to produce new token")
+            # **立刻**释放 reconnect_in_progress，让 listener 的下一轮 wait() 命中
+            # 并启动 do_reconnect（不再 sleep + skip）。如果等 60s listener 还没填回
+            # token（一般不会发生），则下面抛 RuntimeError 终止进程。
+            reconnect_in_progress[0] = False
+            for _ in range(600):  # 60s 上限
+                await asyncio.sleep(0.1)
+                if bot_token_ref[0]:
+                    break
+            else:
+                raise RuntimeError("relogin_listener did not produce token within 60s")
+            # 把 listener 刚拿到的凭据同步到 runtime_state 和 login_result，
+            # 让下面的"登录成功"代码块正常 apply / 发 notifystart / 起 message_loop。
             login_result = {
-                "bot_token": saved_token,
-                "baseurl": runtime_state.get("baseurl") or BASE_URL,
+                "bot_token": bot_token_ref[0],
+                "baseurl": bot_base_url_ref[0] or runtime_state.get("baseurl") or BASE_URL,
                 "ilink_bot_id": runtime_state.get("ilink_bot_id", ""),
                 "ilink_user_id": runtime_state.get("ilink_user_id", ""),
             }
+            log_qr.info("resuming main() after listener produced token "
+                        "bot_id=%s", str(login_result["ilink_bot_id"])[:8] or "-")
         else:
-            login_result = await login_with_qrcode(
-                session,
-                [],
-                existing_state=runtime_state,
-                on_qrcode=web_on_qrcode,
-                web_state=qr_state,
-            )
+            reconnect_in_progress[0] = False
+        if login_result is None:
+            # 理论不会到这里；defensive：未拿到 token 直接退出
+            log_qr.error("login failed reason=no_login_result")
+            return
         bot_token = str(login_result.get("bot_token") or "").strip()
         if not bot_token:
             log_qr.error("login failed reason=missing_bot_token_in_response")
@@ -1484,6 +1831,8 @@ async def main():
         qr_state.logged_in_at = time.time()
 
         bot_base_url = login_result.get("baseurl") or runtime_state.get("baseurl") or BASE_URL
+        bot_base_url_ref[0] = bot_base_url
+        bot_token_ref[0] = bot_token
         old_account_id = str(runtime_state.get("ilink_bot_id") or "")
         new_account_id = str(login_result.get("ilink_bot_id") or old_account_id)
         if new_account_id and old_account_id != new_account_id:
@@ -1502,21 +1851,6 @@ async def main():
 
         print(f"登录成功！baseurl={bot_base_url}")
         print(f"{'=' * 40}\n{COMMANDS_MSG}\n{'=' * 40}")
-
-        bot_token_ref = [bot_token]
-        bot_base_url_ref = [bot_base_url]
-        saved_contact = runtime_state.get("last_contact") or {}
-        last_contact = {
-            "from_id": saved_contact.get("from_id") or None,
-            "context_token": saved_contact.get("context_token") or None,
-        }
-        typing_ticket_cache = {}
-        welcomed_users = set(runtime_state.get("contexts", {}).keys())
-        reconnect_asked = asyncio.Event()
-        warning_active = [False]
-        reconnect_in_progress = [False]
-        login_time_ref = [time.time()]
-        manual_reconnect_pending = {}
 
         await notify_lifecycle(session, "ilink/bot/msg/notifystart", bot_token, bot_base_url)
 
@@ -1575,16 +1909,36 @@ async def main():
                 print("[消息] 缺少 from_user_id/context_token，跳过")
                 return
             text = extract_message_text(msg)
-            log_msg.info("recv msg from=%s type=text len=%d preview=%r",
+            item_types = {
+                item.get("type") for item in (msg.get("item_list") or [])
+                if isinstance(item, dict)
+            }
+            has_voice = is_voice_message(msg)
+            voice_text = extract_voice_transcript(msg).strip() if has_voice else ""
+            input_kind = (
+                "voice_transcript" if voice_text
+                else "voice_without_transcript" if has_voice
+                else "text"
+            )
+            log_msg.info("recv msg from=%s type=%s len=%d preview=%r",
                          from_id[-8:] if from_id else "-",
+                         input_kind,
                          len(text),
                          (text or "")[:30])
-            print(f"收到消息: {text or '[非文本消息]'}")
+            print(f"收到{('语音转写' if input_kind == 'voice_transcript' else '消息')}: "
+                  f"{text or '[无可用转写]'}")
 
             last_contact.update({"from_id": from_id, "context_token": context_token})
             runtime_state.setdefault("contexts", {})[from_id] = context_token
             runtime_state["last_contact"] = dict(last_contact)
             save_runtime_state(runtime_state)
+
+            # Voice messages already have their own conversational response:
+            # either the LLM answer based on iLink's transcript or the
+            # actionable missing-transcript feedback.  Do not prepend the
+            # first-contact welcome message to either voice path.
+            if has_voice:
+                welcomed_users.add(from_id)
 
             normalized = text.strip().upper()
             if manual_reconnect_pending.get(from_id) and normalized in ("Y", "N"):
@@ -1594,19 +1948,23 @@ async def main():
                 if normalized == "Y":
                     await send_msg_safe(session, from_id, context_token, "好的，正在重新连接...",
                                         bot_token_ref, bot_base_url_ref)
-                    await do_reconnect(
-                        session, bot_token_ref, bot_base_url_ref, last_contact,
-                        typing_ticket_cache, reconnect_asked, warning_active,
-                        reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
-                        runtime_state,
-                        web_on_qrcode=web_on_qrcode,
-                        web_state=qr_state,
-                    )
+                    try:
+                        await request_relogin("manual-reconnect")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log_msg.error("manual reconnect failed err=%s", _redact_text(exc), exc_info=True)
+                        await send_msg_safe(session, from_id, context_token,
+                                            f"[失败] 重连未完成: {_redact_text(exc)}",
+                                            bot_token_ref, bot_base_url_ref)
                 else:
                     await send_msg_safe(session, from_id, context_token, "已取消重新连接",
                                         bot_token_ref, bot_base_url_ref)
                 return
 
+            # 后台静默策略（2026-09-14 改）：reconnect_timer_task 不再 set
+            # warning_active[0]，所以下面这条 if 永远不会为 True，保留仅为
+            # 历史兼容 / 未来恢复交互式提醒时启用。
             if warning_active[0] and normalized in ("Y", "N"):
                 log_msg.debug("handle reconnect warning reply from=%s choice=%s",
                               from_id[-8:], normalized)
@@ -1619,32 +1977,44 @@ async def main():
                                         bot_token_ref, bot_base_url_ref)
                 return
 
-            if from_id not in welcomed_users:
-                log_msg.debug("handle welcome from=%s", from_id[-8:])
-                welcomed_users.add(from_id)
-                await send_msg_safe(session, from_id, context_token, COMMANDS_MSG,
-                                    bot_token_ref, bot_base_url_ref)
-                return
-
-            if not text:
+            if has_voice and not voice_text:
+                log_msg.info(
+                    "voice transcript unavailable; sending actionable feedback from=%s",
+                    from_id[-8:],
+                )
                 await send_msg_safe(
                     session, from_id, context_token,
-                    "当前版本暂支持文字消息（语音转文字消息除外），图片/文件请稍后处理。",
+                    VOICE_TRANSCRIPT_UNAVAILABLE_MSG,
                     bot_token_ref, bot_base_url_ref,
                 )
                 return
 
-            if text in ("/help", "/指令"):
+            if not text:
+                log_msg.info("recv msg skipped reason=no_text_or_voice_transcript types=%s",
+                             sorted(str(item_type) for item_type in item_types))
+                return
+
+            if from_id not in welcomed_users:
+                log_msg.debug("handle welcome from=%s", from_id[-8:])
+                welcomed_users.add(from_id)
+                await send_msg_safe(session, from_id, context_token, INTRO_DETAIL_MSG,
+                                    bot_token_ref, bot_base_url_ref)
+
+            if normalized in ("/HELP", "/指令"):
                 log_msg.debug("handle command name=/help from=%s", from_id[-8:])
                 await send_msg_safe(session, from_id, context_token, COMMANDS_MSG,
                                     bot_token_ref, bot_base_url_ref)
                 return
-            if text == "/time":
+            if normalized == "/TIME":
                 log_msg.debug("handle command name=/time from=%s", from_id[-8:])
-                remaining = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())
-                hours, minutes, seconds = int(remaining // 3600), int((remaining % 3600) // 60), int(remaining % 60)
-                display = f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟 {seconds} 秒"
-                await send_msg_safe(session, from_id, context_token, f"当前连接剩余时间：{display}",
+                if RECONNECT_CONFIG.get("proactive_relogin", False):
+                    remaining = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())
+                    hours, minutes, seconds = int(remaining // 3600), int((remaining % 3600) // 60), int(remaining % 60)
+                    display = f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟 {seconds} 秒"
+                    text_reply = f"当前连接剩余时间：{display}"
+                else:
+                    text_reply = "当前连接由后台持续维护，服务端 token 失效时会自动恢复。"
+                await send_msg_safe(session, from_id, context_token, text_reply,
                                     bot_token_ref, bot_base_url_ref)
                 return
             if text == "/重新连接":
@@ -1661,6 +2031,157 @@ async def main():
                     )
                 return
 
+            # ========== Per-user IMA KB 绑定命令（docs/IMA_WEB_UI.md §4.3） ==========
+            # 仅 bot 主人（from_id == ilink_user_id）可操作；他人拒绝。
+            owner_id_cmd = str(runtime_state.get("ilink_user_id") or "")
+            if text.startswith("/bindkb") or text in ("/unbindkb", "/mykb"):
+                if not owner_id_cmd:
+                    await send_msg_safe(
+                        session, from_id, context_token,
+                        "尚未绑定到 iLink 账号，请先完成扫码登录后再管理知识库。",
+                        bot_token_ref, bot_base_url_ref,
+                    )
+                    return
+                if from_id != owner_id_cmd:
+                    log_msg.warning(
+                        "ima cmd denied cmd=%s from=%s owner=%s",
+                        text.split()[0], from_id[-8:], owner_id_cmd[-8:],
+                    )
+                    await send_msg_safe(
+                        session, from_id, context_token,
+                        "❌ 权限不足：只有 bot 主人能管理知识库",
+                        bot_token_ref, bot_base_url_ref,
+                    )
+                    return
+                # 鉴权通过；进入分支
+                cmd_parts = text.split(maxsplit=1)
+                cmd = cmd_parts[0].upper()
+                arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+                log_msg.debug("handle command name=%s from=%s", cmd, from_id[-8:])
+                if cmd == "/MYKB":
+                    try:
+                        bindings = await _get_ima_bindings()
+                        b = bindings.lookup(owner_id_cmd)
+                    except Exception as exc:
+                        log_msg.warning("mykb lookup failed err=%s", exc)
+                        b = None
+                    if b:
+                        kb_label = b.get("kb_name") or "(未命名)"
+                        text_reply = (
+                            f"当前知识库：{kb_label}（{b.get('kb_id', '')}）\n"
+                            f"绑定时间：{b.get('bound_at', '')}"
+                        )
+                    else:
+                        text_reply = "当前知识库：未绑定（回退默认 IMA_ILINK_DEFAULT_KB）"
+                    await send_msg_safe(session, from_id, context_token, text_reply,
+                                        bot_token_ref, bot_base_url_ref)
+                    return
+                if cmd == "/UNBINDKB":
+                    try:
+                        bindings = await _get_ima_bindings()
+                        removed = await bindings.unbind(owner_id_cmd)
+                    except Exception as exc:
+                        log_msg.warning("unbindkb failed err=%s", exc)
+                        removed = False
+                    text_reply = (
+                        "✅ 已解绑知识库，后续问答将回退到默认 KB。"
+                        if removed else "当前没有绑定的知识库。"
+                    )
+                    await send_msg_safe(session, from_id, context_token, text_reply,
+                                        bot_token_ref, bot_base_url_ref)
+                    return
+                if cmd == "/BINDKB":
+                    # 构造 ImaClient 拿可绑定列表；与 bot_session._make_ai 同模式
+                    ima_cfg = ImaConfig.from_env()
+                    if not ima_cfg.configured():
+                        await send_msg_safe(
+                            session, from_id, context_token,
+                            "❌ IMA 未配置（缺 IMA_ILINK_CLIENT_ID / API_KEY），无法绑定。",
+                            bot_token_ref, bot_base_url_ref,
+                        )
+                        return
+                    try:
+                        client = ImaClient(ima_cfg)
+                        kbs = client.list_searchable_kbs()
+                    except Exception as exc:
+                        log_msg.warning("bindkb list_searchable_kbs failed err=%s", exc)
+                        await send_msg_safe(
+                            session, from_id, context_token,
+                            f"❌ 拉取 IMA 知识库列表失败：{_redact_text(exc)}",
+                            bot_token_ref, bot_base_url_ref,
+                        )
+                        return
+                    if not arg:
+                        # 无参数：列出可绑定 KB
+                        if not kbs:
+                            text_reply = "暂无可绑定的知识库（账号下没有共享或订阅类 KB）。"
+                        else:
+                            lines = ["可绑定的 IMA 知识库："]
+                            for idx, kb in enumerate(kbs, 1):
+                                type_label = "共享" if kb["kb_type"] == 1002 else "订阅"
+                                lines.append(
+                                    f"  {idx}. {kb['kb_name']} [{type_label}] "
+                                    f"({kb['kb_id'][:12]}…)"
+                                )
+                            lines.append("\n回复 /bindkb <kb_id> 完成绑定。")
+                            text_reply = "\n".join(lines)
+                        await send_msg_safe(session, from_id, context_token, text_reply,
+                                            bot_token_ref, bot_base_url_ref)
+                        return
+                    # 有参数：按 kb_id 查找并绑定
+                    matched = None
+                    for kb in kbs:
+                        if kb["kb_id"] == arg:
+                            matched = kb
+                            break
+                    if matched is None:
+                        # 接受前缀匹配（kb_id 可能被截断显示），但要求唯一命中
+                        prefix_matches = [kb for kb in kbs if kb["kb_id"].startswith(arg)]
+                        if len(prefix_matches) == 1:
+                            matched = prefix_matches[0]
+                        elif len(prefix_matches) > 1:
+                            text_reply = (
+                                f"❌ 前缀 {arg!r} 命中 {len(prefix_matches)} 个 KB，"
+                                "请提供完整 kb_id。"
+                            )
+                            await send_msg_safe(session, from_id, context_token, text_reply,
+                                                bot_token_ref, bot_base_url_ref)
+                            return
+                    if matched is None:
+                        text_reply = (
+                            f"❌ 未找到 kb_id={arg!r}。先发 /bindkb 查看可绑定列表。"
+                        )
+                        await send_msg_safe(session, from_id, context_token, text_reply,
+                                            bot_token_ref, bot_base_url_ref)
+                        return
+                    try:
+                        bindings = await _get_ima_bindings()
+                        await bindings.bind(
+                            owner_id_cmd,
+                            matched["kb_id"],
+                            matched["kb_name"],
+                            int(matched["kb_type"]),
+                            bound_by="wechat",
+                            bot_id_at_bind=str(
+                                runtime_state.get("ilink_bot_id") or ""
+                            ),
+                        )
+                    except Exception as exc:
+                        log_msg.warning("bindkb failed err=%s", exc)
+                        await send_msg_safe(
+                            session, from_id, context_token,
+                            f"❌ 绑定失败：{_redact_text(exc)}",
+                            bot_token_ref, bot_base_url_ref,
+                        )
+                        return
+                    text_reply = (
+                        f"✅ 已绑定 KB: {matched['kb_name']}（{matched['kb_id']}）\n"
+                        "下一条消息开始生效。"
+                    )
+                    await send_msg_safe(session, from_id, context_token, text_reply,
+                                        bot_token_ref, bot_base_url_ref)
+                    return
+
             typing_ticket = await get_typing_ticket_safe(
                 session,
                 from_id,
@@ -1674,13 +2195,37 @@ async def main():
             t_ai_start = time.perf_counter()
             log_ai.info("ai call start from=%s prompt_chars=%d",
                         from_id[-8:] if from_id else "-", len(text))
+            # Per-user IMA KB 绑定（docs/IMA_PER_USER_BINDING.md）：
+            # 按 ilink_user_id 查 ima_bindings.json，把命中的 kb_id 透传给
+            # _AIWithIma.chat；未命中走 IMA_ILINK_DEFAULT_KB 兜底。lookup 走
+            # 单例 IMABindings（asyncio.Lock 序列化 bind/unbind）。
+            owner_id = str(runtime_state.get("ilink_user_id") or "")
+            kb_id: Optional[str] = None
+            if owner_id:
+                try:
+                    bindings = await _get_ima_bindings()
+                    kb_id = bindings.lookup_kb_id(owner_id)
+                except Exception as exc:  # 持久化层异常不能让回复失败
+                    log_ai.warning("ima_bindings lookup failed user=%s err=%s",
+                                   owner_id[-8:], exc)
+                    kb_id = None
             try:
                 typing_started = await send_typing_safe(
                     session, from_id, typing_ticket, 1, bot_token_ref, bot_base_url_ref,
                 )
                 try:
                     loop = asyncio.get_running_loop()
-                    reply = await loop.run_in_executor(executor, ai.chat, text)
+                    # copy_context().run(...) 而不是裸 run_in_executor：
+                    # executor 线程不继承 contextvars，USER_LOG_CONTEXT 在线程里
+                    # 读出来是 "-" —— clawbot.ai / clawbot.ima 的日志会丢掉
+                    # user= 维度，多用户进程里无法定位是谁的调用。
+                    # 这里保留专用的 executor（max_workers=4）而不是换成
+                    # asyncio.to_thread，因为那个用的是默认 executor（上限不同）。
+                    ctx = contextvars.copy_context()
+                    reply = await loop.run_in_executor(
+                        executor,
+                        lambda: ctx.run(partial(ai.chat, text, kb_id=kb_id)),
+                    )
                 except Exception as exc:
                     dur_ms = (time.perf_counter() - t_ai_start) * 1000
                     log_ai.warning("ai call failed from=%s dur_ms=%.0f err=%s",
@@ -1797,22 +2342,16 @@ async def main():
                     raise
                 except ILinkAPIError as exc:
                     if exc.is_stale_token:
-                        log_msg.warning("iLink -14 stale_token, entering controlled relogin")
+                        log_msg.warning("iLink -14 stale_token; requesting relogin")
                         print("[iLink] ret/errcode=-14，当前 token 已失效，进入受控重新登录。")
-                        runtime_state["bot_token"] = ""
-                        save_runtime_state(runtime_state)
+                        # 走单一入口：若 listener 已被 /relink 唤醒（典型场景：
+                        # 用户点"切换账号"时 listener 刚清 token、开始 do_reconnect），
+                        # 这里直接 await 同一 Future，绝不会并发调第二个
+                        # login_with_qrcode 导致 web_on_qrcode 被两条链路互踩。
                         try:
-                            await asyncio.sleep(RETRY_DELAY)
-                            fresh_login = await login_with_qrcode(
-                                session, [], existing_state={},
-                                on_qrcode=web_on_qrcode,
-                                web_state=qr_state,
-                            )
-                            await apply_new_login(fresh_login)
-                            qr_state.status = "logged_in"
-                            qr_state.logged_in_at = time.time()
-                            # 同账号重新登录沿用该账号游标；切换账号时
-                            # apply_new_login 会清空持久化状态，这里同步本地变量。
+                            await request_relogin("iLink -14")
+                            # 重新读持久化游标：同账号 re-login 保留游标；换账号时
+                            # listener 内部已清空 runtime_state。reset long-poll 节奏。
                             get_updates_buf = str(runtime_state.get("get_updates_buf") or "")
                             long_poll_timeout = LONG_POLL_TIMEOUT
                             consecutive_failures = 0
@@ -1849,18 +2388,23 @@ async def main():
                     print(f"[消息循环] 未分类异常: {_redact_text(exc)}；{delay}s 后重试")
                     await asyncio.sleep(delay)
 
-        timer_task = asyncio.create_task(reconnect_timer_task(
-            session, bot_token_ref, bot_base_url_ref, last_contact,
-            typing_ticket_cache, reconnect_asked, warning_active,
-            reconnect_in_progress, login_time_ref, RECONNECT_CONFIG, runtime_state,
-            web_on_qrcode=web_on_qrcode,
-            web_state=qr_state,
-        ))
+        timer_task = None
+        if RECONNECT_CONFIG.get("proactive_relogin", False):
+            timer_task = asyncio.create_task(reconnect_timer_task(
+                session, bot_token_ref, bot_base_url_ref, last_contact,
+                typing_ticket_cache, reconnect_asked, warning_active,
+                reconnect_in_progress, login_time_ref, RECONNECT_CONFIG, runtime_state,
+                web_on_qrcode=web_on_qrcode,
+                web_state=qr_state,
+            ))
+
         message_task = asyncio.create_task(message_loop())
         try:
             await message_task
         finally:
-            all_tasks = [message_task, timer_task]
+            all_tasks = [message_task, relogin_task]
+            if timer_task is not None:
+                all_tasks.append(timer_task)
             if web_task is not None:
                 all_tasks.append(web_task)
             for task in all_tasks:
@@ -1898,30 +2442,104 @@ class _AIWithIma:
     为空，等价于直通到底层 ``_base``。
     """
 
-    def __init__(self, base, ima_client: ImaClient):
+    def __init__(self, base, ima_client: ImaClient, environ=None):
         self._base = base
         self._ima = ima_client
+        self._env = os.environ if environ is None else dict(environ)
         self.config = base.config  # 保持 ai.config.prompt 等属性可访问
         # 本地 Markdown KB 兜底索引（lazy：只有命中 IMA 0 条时才会建索引）
         self._local_kb: Optional[LocalKBIndex] = None
         self._local_kb_attempted = False
+        self._local_kb_scope: str = ""
+        # 语义检索 KB 兜底索引（lazy：IMA + local 都 0 命中才触发）
+        # 需 fastembed + 模型下载；首次 search 会触发重建（30~60s 阻塞），
+        # 日志走 ``clawbot.semantic``，warn 级排查。
+        self._semantic_kb = None
+        self._semantic_kb_attempted = False
+        self._semantic_kb_scope: str = ""
 
-    def _maybe_local_kb(self) -> Optional[LocalKBIndex]:
-        """lazy 构造本地 KB 索引，仅在开关开启时。"""
-        if self._local_kb_attempted:
+    def _kb_scope_dir(self, scope: str) -> Optional[str]:
+        """该账号私有的知识库目录（没配 / 不存在 → None）。
+
+        ``CLAWBOT_USER_KB_DIR`` 是每账号知识库的根目录，实际目录是
+        ``<root>/<scope>``；``scope`` 由调用方给（通常是 ilink_user_id 净化
+        后的 key）。目录不存在就当没有私有库 —— 基座照样能用。
+        """
+        root = (self._env.get("CLAWBOT_USER_KB_DIR") or "").strip()
+        if not root or not scope:
+            return None
+        try:
+            base = LocalKBIndex._resolve(root)
+        except Exception:  # noqa: BLE001 —— 路径异常不能让回复失败
+            return None
+        return str(base / scope)
+
+    def _maybe_local_kb(self, scope: str = "") -> Optional[LocalKBIndex]:
+        """lazy 构造本地 KB 索引，仅在开关开启时。
+
+        ``scope`` = 该账号的隔离键。私有目录作为 overlay 叠在共享基座上：
+        基座人人可读，私有目录只有这个账号看得到（``local:<user/0/...>``）。
+        """
+        if self._local_kb_attempted and self._local_kb_scope == scope:
             return self._local_kb
         self._local_kb_attempted = True
-        if os.environ.get("CLAWBOT_LOCAL_FALLBACK", "").strip().lower() not in (
+        self._local_kb_scope = scope
+        if self._env.get("CLAWBOT_LOCAL_FALLBACK", "").strip().lower() not in (
             "1", "true", "yes", "on",
         ):
             return None
-        kb_dir = os.environ.get("CLAWBOT_LOCAL_KB_DIR", "docs/knowledge")
+        kb_dir = self._env.get("CLAWBOT_LOCAL_KB_DIR", "docs/knowledge")
+        extra = self._kb_scope_dir(scope)
         try:
-            self._local_kb = LocalKBIndex(kb_dir)
+            self._local_kb = LocalKBIndex(
+                kb_dir, extra_dirs=[extra] if extra else None
+            )
         except Exception as exc:  # 路径/权限异常不能让回复失败
             log_ai.warning("ai local_kb init failed dir=%s err=%s", kb_dir, exc)
             self._local_kb = None
         return self._local_kb
+
+    def _maybe_semantic_kb(self, scope: str = ""):
+        """lazy 构造语义检索索引。仅在 ``SEMANTIC_KB_ENABLED=1`` 时有效。
+
+        失败（fastembed 未装 / 模型下不下来 / 路径错）一律静默降级返回 ``None``，
+        让上层走纯 LLM。索引路径默认 ``docs/knowledge/``，落库到
+        ``docs/.semantic_kb.sqlite3``（已 gitignore）。
+
+        **按账号隔离**：``scope`` 非空时，私有目录作为 overlay 一起索引，
+        SQLite 也落到该账号自己的目录下 —— 不同账号的语义库互不干扰。
+        """
+        if self._semantic_kb_attempted and self._semantic_kb_scope == scope:
+            return self._semantic_kb
+        self._semantic_kb_attempted = True
+        self._semantic_kb_scope = scope
+        if SemanticKBIndex is None:
+            log_ai.info(
+                "ai semantic_kb unavailable: utils.semantic_kb.SemanticKBIndex "
+                "import failed (fastembed 缺失？)。开 SEMANTIC_KB_ENABLED 前 "
+                "先 pip install fastembed"
+            )
+            return None
+        if self._env.get("SEMANTIC_KB_ENABLED", "").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return None
+        kb_dir = self._env.get("SEMANTIC_KB_DIR", "docs/knowledge")
+        extra = self._kb_scope_dir(scope)
+        db_path = str(Path(extra) / ".semantic_kb.sqlite3") if extra else None
+        try:
+            min_score_raw = self._env.get("SEMANTIC_KB_MIN_SCORE", "").strip()
+            min_score = float(min_score_raw) if min_score_raw else 0.0
+            self._semantic_kb = SemanticKBIndex(
+                kb_dir, min_score=min_score,
+                cache_dir=self._env.get("CLAWBOT_FASTEMBED_CACHE") or None,
+                db_path=db_path,
+                extra_dirs=[extra] if extra else None,
+            )
+        except Exception as exc:  # 路径/权限/模型下载异常不能让回复失败
+            log_ai.warning("ai semantic_kb init failed dir=%s err=%s", kb_dir, exc)
+            self._semantic_kb = None
+        return self._semantic_kb
 
     def _extract_keywords(self, message: str) -> list[str]:
         """用底层 LLM 从自然语言问句里抽 1-3 个最适合 IMA 搜索的关键词。
@@ -1967,11 +2585,19 @@ class _AIWithIma:
                 break
         return terms[:3]
 
-    def _search_ima_merged(self, terms: list[str], limit: int) -> list:
+    def _search_ima_merged(
+        self,
+        terms: list[str],
+        limit: int,
+        *,
+        knowledge_base_id: Optional[str] = None,
+    ) -> list:
         """对一组关键词分别搜 IMA，合并 hits 并按 media_id 去重（保留先出现顺序）。
 
         第一个 term 通常是 LLM 判定的最强信号，其结果排前面；后续 term 补充召回。
         每个 term 单独 search 时 limit 自动收紧，避免一次 IMA 调用返回太多。
+        ``knowledge_base_id`` 透传到 :meth:`ImaClient.search_knowledge`；为 ``None``
+        时回落到 ``ImaConfig.default_knowledge_base_id``（ima.py:507-512 已处理）。
         """
         seen: set[str] = set()
         merged: list = []
@@ -1981,7 +2607,11 @@ class _AIWithIma:
             # 第一个 term 用完整 limit；后续 term 用更小的 limit 节省资源
             per_limit = limit if i == 0 else max(2, limit - i)
             try:
-                hits = self._ima.search_knowledge(term, limit=per_limit)
+                hits = self._ima.search_knowledge(
+                    term,
+                    limit=per_limit,
+                    knowledge_base_id=knowledge_base_id,
+                )
             except Exception as exc:  # 单 term 失败不阻塞其它
                 log_ima.warning("ai ima search term=%r failed err=%s", term, exc)
                 continue
@@ -2001,16 +2631,30 @@ class _AIWithIma:
         为空，等价于直通到底层 ``_base``。
 
         调试阶段新增路由日志（INFO 级别，终端 + ``logs/clawbot*.log`` 同时输出），
-        三种语义明确区分：
-          ``mode=llm-only reason=ima-not-configured``  IMA 未配置（缺凭据），纯 LLM
-          ``mode=llm-only reason=ima-search-failed``   IMA 检索异常（warn 已记录详情）
-          ``mode=llm-only reason=ima-no-match``        IMA 检索成功但 0 条 / ctx 为空
-          ``mode=llm+ima  reason=hits-injected``        已拼接参考资料注入 prompt
+        四档 mode + reason 精确表达决策路径：
+          ``mode=llm-only     reason=ima-not-configured``   IMA 未配置（缺凭据），纯 LLM
+          ``mode=llm-only     reason=ima-search-failed``    IMA 检索异常（warn 已记录详情）
+          ``mode=llm-only     reason=ima-no-match``         IMA 检索成功但 0 条 / ctx 为空
+          ``mode=llm+ima      reason=hits-injected``        IMA 命中并注入 prompt
+          ``mode=llm+local    reason=local-fallback``       IMA 0 命中，local KB BM25 兜底
+                                                            （CLAWBOT_LOCAL_FALLBACK=1）
+          ``mode=llm+semantic reason=semantic-fallback``    IMA 0 + local 0，语义检索兜底
+                                                            （SEMANTIC_KB_ENABLED=1）
         一行 ``[AI 路由] mode=...`` 同步打到终端，方便肉眼确认本次回答走了哪条路径。
+
+        新增 ``kb_id`` kwarg（per-user IMA 绑定，``docs/IMA_PER_USER_BINDING.md``）；
+        非空时透传给 ``ImaClient.search_knowledge``，为空时继续走
+        ``ImaConfig.default_knowledge_base_id`` 的 fallback。
         """
         prompt = kwargs.pop("prompt", None)
         if prompt is None:
             prompt = getattr(self.config, "prompt", "") or ""
+        # Per-user KB 绑定键：调用方（handle_message）从 IMABindings 查
+        # ilink_user_id 得到。None = 走 IMA_ILINK_DEFAULT_KB。
+        kb_id = kwargs.pop("kb_id", None)
+        # 知识库隔离键（每个 bot 账号一个）：决定本地/语义兜底用哪个私有目录。
+        # 空 = 只有共享基座。
+        kb_scope = str(kwargs.pop("kb_scope", None) or "")
 
         # 默认路由：仅 LLM（IMA 未配置）
         mode = "llm-only"
@@ -2048,10 +2692,15 @@ class _AIWithIma:
 
             try:
                 # 多个 term 逐个搜，合并去重（_search_ima_merged）
-                hits = self._search_ima_merged(search_terms, self._ima.cfg.search_limit)
+                hits = self._search_ima_merged(
+                    search_terms,
+                    self._ima.cfg.search_limit,
+                    knowledge_base_id=kb_id,
+                )
                 hits_count = len(hits)
                 query_log = " | ".join(search_terms)
                 print(f"[ima] query='{query_log[:60]}' hits={hits_count} "
+                      f"kb_id={kb_id or '-'} "
                       f"titles={[getattr(h, 'title', '')[:30] for h in hits[:3]]}",
                       flush=True)
                 log_ima.debug("ai ima inject prompt before=%d", len(prompt or ""))
@@ -2065,7 +2714,7 @@ class _AIWithIma:
             # IMA 0 命中 → 本地 Markdown 兜底（CLAWBOT_LOCAL_FALLBACK=1）
             # 解决 IMA 关键词匹配对部分词不友好、本地却能 substring 命中的问题。
             if not hits:
-                local_kb = self._maybe_local_kb()
+                local_kb = self._maybe_local_kb(kb_scope)
                 if local_kb and local_kb.exists:
                     local_t0 = time.perf_counter()
                     local_hits = local_kb.search(search_terms, limit=self._ima.cfg.search_limit)
@@ -2086,6 +2735,44 @@ class _AIWithIma:
                         log_ima.info(
                             "ai local_kb fallback none (ima=0, local=0) elapsed_ms=%.0f",
                             (time.perf_counter() - local_t0) * 1000,
+                        )
+
+            # IMA 0 + local KB 0 → 语义检索兜底（SEMANTIC_KB_ENABLED=1）
+            # 接在 local 后面，不抢 BM25 能命中的情形；直接吃整句 ``message``（语义
+            # 检索本身能消化自然语言，无需 keyword_extract 后的 terms）。
+            # 首次 search 会触发 embedding 重建（~30–60s 阻塞），日志里看得到。
+            if not hits:
+                semantic_kb = self._maybe_semantic_kb(kb_scope)
+                if semantic_kb and semantic_kb.exists:
+                    sem_t0 = time.perf_counter()
+                    try:
+                        sem_hits = semantic_kb.search(
+                            message, limit=self._ima.cfg.search_limit
+                        )
+                    except Exception as exc:
+                        log_ai.warning("ai semantic_kb search failed err=%s", exc)
+                        sem_hits = []
+                    sem_elapsed_ms = (time.perf_counter() - sem_t0) * 1000
+                    if sem_hits:
+                        hits = sem_hits
+                        hits_count = len(hits)
+                        reason = "semantic-fallback"
+                        print(
+                            f"[semantic] query='{(message or '')[:60]}' "
+                            f"hits={hits_count} "
+                            f"titles={[getattr(h, 'title', '')[:30] for h in hits[:3]]}",
+                            flush=True,
+                        )
+                        log_ai.info(
+                            "ai semantic_kb fallback hits=%d elapsed_ms=%.0f "
+                            "(ima=0, local=0)",
+                            hits_count, sem_elapsed_ms,
+                        )
+                    else:
+                        log_ai.info(
+                            "ai semantic_kb fallback none "
+                            "(ima=0, local=0, semantic=0) elapsed_ms=%.0f",
+                            sem_elapsed_ms,
                         )
 
             # 命中数 > 0 且 IMA_ILINK_FETCH_BODY=1：逐条 get_doc_content 拿正文。
@@ -2151,10 +2838,14 @@ class _AIWithIma:
                 ctx = _ima_build_context(hits)
                 if ctx:
                     prompt = (prompt + "\n\n" + ctx) if prompt else ctx
-                    # 本地 fallback 走 ``llm+local`` 模式以便日志区分；其它
-                    # 走 ``llm+ima``。reason 字段负责更细的语义。
-                    mode = "llm+local" if reason == "local-fallback" else "llm+ima"
-                    if reason != "local-fallback":
+                    # fallback 来源决定 mode；reason 字段负责更细的语义。
+                    if reason == "local-fallback":
+                        mode = "llm+local"
+                    elif reason == "semantic-fallback":
+                        mode = "llm+semantic"
+                    else:
+                        mode = "llm+ima"
+                    if reason not in ("local-fallback", "semantic-fallback"):
                         reason = "hits-injected"
                     ctx_chars = len(ctx)
                     log_ima.debug("ai ima inject prompt after=%d (added %d, mode=%s)",
@@ -2168,12 +2859,13 @@ class _AIWithIma:
 
         # 路由决策统一日志：INFO 级别，文件 + 终端同时出现；便于 grep
         log_ai.info(
-            "ai route mode=%s reason=%s msg_chars=%d hits=%d ctx_chars=%d",
+            "ai route mode=%s reason=%s msg_chars=%d hits=%d ctx_chars=%d kb_id=%s",
             mode, reason, len(message or ""), hits_count, ctx_chars,
+            (kb_id or "-"),
         )
         print(
             f"[AI 路由] mode={mode} reason={reason} "
-            f"hits={hits_count} ctx_chars={ctx_chars}",
+            f"hits={hits_count} ctx_chars={ctx_chars} kb_id={kb_id or '-'}",
             flush=True,
         )
 
@@ -2181,7 +2873,7 @@ class _AIWithIma:
         if (
             mode == "llm-only"
             and ctx_chars == 0
-            and os.environ.get("CLAWBOT_LLM_CAVEAT", "1").strip().lower()
+            and self._env.get("CLAWBOT_LLM_CAVEAT", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
             prompt = (prompt + "\n\n" + _LLM_ONLY_CAVEAT_PROMPT) if prompt else _LLM_ONLY_CAVEAT_PROMPT
@@ -2208,75 +2900,9 @@ def create_ai_client(raw_cfg: dict):
 
 
 if __name__ == "__main__":
-    # 1) 解析 CLI 参数（决定文件命名空间 + 日志路径）
-    parser = argparse.ArgumentParser(
-        prog="bot.py",
-        description="微信 ClawBot (OpenClaw Weixin 2.4.6) 多用户客户端",
-    )
-    parser.add_argument(
-        "--user", default=None,
-        help="多用户模式：传入用户名（仅字母数字_.-）。"
-             "会切换到 config_<user>.json / weixin_state_<user>.json / "
-             "logs/clawbot_<user>.log，并从 /etc/clawbot/<user>.env + "
-             "/etc/clawbot/ima.env 加载凭据。不传则单租户旧行为。",
-    )
-    args = parser.parse_args()
-    paths = _resolve_user_paths(args.user)
-
-    # 2) 重新绑定模块级文件名（state/config I/O 用到的常量）
-    CONFIG_FILE = paths["config_file"]
-    STATE_FILE = paths["state_file"]
-
-    # 3) 加载 env 文件（顺序：用户专属 → ima 共享 → 项目 .env 兜底）
-    if paths["env_files"]:
-        try:
-            from dotenv import load_dotenv as _load_dotenv
-        except ImportError:
-            _load_dotenv = None
-        if _load_dotenv is not None:
-            for _env_path in paths["env_files"]:
-                if _env_path and Path(_env_path).exists():
-                    _load_dotenv(_env_path, override=False)
-
-    # 4) 日志（必须在 print banner 前装好；每个用户独立日志文件）
-    from utils.logging_setup import setup_logging
-    setup_logging(
-        level=os.getenv("CLAWBOT_LOG_LEVEL", "INFO"),
-        log_file=paths["log_file"],
-        redactor=_redact_text,
-    )
-    print(
-        "\n"
-        "╔══════════════════════════════════════════════════════════╗\n"
-        "║          微信 ClawBot  ·  WeChat iLink Bot               ║\n"
-        "║  Copyright (c) 2026 SiverKing. All rights reserved.     ║\n"
-        "║  GitHub : https://github.com/SiverKing/weixin-ClawBot-API║\n"
-        f"║  Mode   : {paths['banner_suffix'].ljust(43)}║\n"
-        "╚══════════════════════════════════════════════════════════╝"
-    )
-    print(f"[config] config_file={CONFIG_FILE} state_file={STATE_FILE} log={paths['log_file']}")
-    _raw_cfg = load_or_create_config()
-    ai = create_ai_client(_raw_cfg)
-    # 用 ima 检索为 AI 回答注入参考资料。未配置凭据时包装层会直通。
-    # env 已在第 3 步加载完，ImaConfig.from_env() 只读 os.environ 不再二次加载。
-    try:
-        _ima_client = ImaClient(ImaConfig.from_env(env_files=None))
-    except Exception as exc:
-        print(f"[ima] 初始化失败，回退到无检索模式: {exc}")
-        log_ima.warning("ima init failed err=%s; falling back to no-retrieval mode", exc)
-        _ima_client = ImaClient(ImaConfig())  # 空配置 → configured()=False
-    if _ima_client.configured():
-        cfg_env = ImaConfig.from_env()
-        kb_ids = cfg_env.default_knowledge_base_id or "(未设置)"
-        kb_count = len([x for x in kb_ids.replace("，", ",").replace("、", ",").split(",") if x.strip()])
-        log_ima.info("ima config base_url=%s kb_count=%d default_kb=%s configured=True",
-                     _ima_client.cfg.base_url, kb_count, kb_ids)
-        print(f"[ima] 知识库检索已启用，默认 KB: {kb_ids}")
-    else:
-        log_ima.info("ima configured=False (missing IMA_ILINK_CLIENT_ID / IMA_ILINK_API_KEY)")
-        print("[ima] 知识库检索未启用（IMA_ILINK_CLIENT_ID / IMA_ILINK_API_KEY 未配置）")
-    ai = _AIWithIma(ai, _ima_client)
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n已停止 Bot。")
+    # Default entry: dispatch to shared_runtime. The shared process serves
+    # only session-token sessions (``secrets.token_urlsafe(32)`` minted in
+    # ``shared_web.py``) — no named users, no per-port subprocess, no OAuth.
+    import sys
+    from shared_runtime import main as shared_main
+    shared_main(sys.argv[1:])

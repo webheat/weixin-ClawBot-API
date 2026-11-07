@@ -60,6 +60,18 @@ class ImaConfig:
     fetch_body: bool = False  # IMA_ILINK_FETCH_BODY=1 开启：search 后再调 get_doc_content 拿正文
     keyword_extract: bool = False  # IMA_ILINK_KEYWORD_EXTRACT=1 开启：search 前用 LLM 抽取 1-3 个关键词
 
+    def configured(self) -> bool:
+        """True iff client_id AND api_key are both non-empty.
+
+        Lives on the config (not only on :class:`ImaClient`) because callers
+        check "IMA 是否可用" *before* building a client — e.g.
+        ``shared_web._build_ima_client`` and the ``/BINDKB`` command.  When
+        this method only existed on ``ImaClient`` those call sites raised
+        ``AttributeError: 'ImaConfig' object has no attribute 'configured'``
+        and the whole web-UI binding path silently degraded to "IMA 未配置".
+        """
+        return bool(self.client_id and self.api_key)
+
     @classmethod
     def from_env(cls, env_files: Optional[Iterable[str]] = None) -> "ImaConfig":
         """Build config from a list of ``.env`` files + ``os.environ``.
@@ -229,6 +241,21 @@ def _envelope_error(data: dict) -> Optional[str]:
     return f"ima api error: code={code} message={msg}"
 
 
+# ima 的永久性错误码：重试不会变好，必须立刻放弃去 fallback。
+# 220004 = knowledge_base_id 失效或格式不对；220001 = appKey 无效。
+_IMA_PERMANENT_CODES = {220001, 220002, 220004}
+
+
+def _is_permanent_ima_error(data: dict) -> bool:
+    """判断这个信封错误是不是「重试也没用」的那类。"""
+    code = data.get("code") or data.get("errcode") or data.get("ret") or 0
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return False
+    return code in _IMA_PERMANENT_CODES
+
+
 def _unwrap_envelope(data: dict) -> dict:
     """Tencent ima wraps successful payloads in ``{"code": 0, "data": {...}}``.
 
@@ -303,6 +330,31 @@ class ImaClient:
     KB_TYPE_INT_SHARED = 1002
     KB_TYPE_INT_SUBSCRIBED = 1004
 
+    # 真正能用于 search_knowledge 的 KB 类型集合——只含 shared + subscribed。
+    # 个人知识库（KBT_MINE_KB）调 search_knowledge 会返回 220004（见
+    # docs/IMA_KB.md §6）。web UI dropdown 等场景直接 import 这个常量做
+    # 白名单过滤即可，不用再硬编码字符串。
+    SEARCHABLE_KB_TYPES = frozenset({KB_TYPE_SHARED, KB_TYPE_SUBSCRIBED})
+
+    # search_knowledge_base 接口只返回字符串 ``base_type``（如"个人知识库"/
+    # "共享知识库"），不返回整型枚举。这里把字符串映射到整型，方便统一按
+    # 1001/1002/1004 过滤。Tencent 改名只改这一处。
+    _BASE_TYPE_TO_INT: dict[str, int] = {
+        "个人知识库": KB_TYPE_INT_MINE,
+        "团队知识库": KB_TYPE_INT_SHARED,
+        "共享知识库": KB_TYPE_INT_SHARED,
+        "订阅知识库": KB_TYPE_INT_SUBSCRIBED,
+        "我加入的订阅知识库": KB_TYPE_INT_SUBSCRIBED,
+        "我创建的订阅知识库": KB_TYPE_INT_SUBSCRIBED,
+    }
+
+    # 整型枚举 → 英文短名（list_searchable_kbs 输出 kb_type_name 用）。
+    _KB_TYPE_DISPLAY_NAME: dict[int, str] = {
+        KB_TYPE_INT_MINE: "personal",
+        KB_TYPE_INT_SHARED: "shared",
+        KB_TYPE_INT_SUBSCRIBED: "subscribed",
+    }
+
     # 5 retries, sleeps [2,4,8,16,32]s — same ladder as deepseek.py / dusapi.py.
     _RETRY_DELAYS = (2, 4, 8, 16, 32)
 
@@ -321,7 +373,7 @@ class ImaClient:
 
     def configured(self) -> bool:
         """True iff client_id AND api_key are both non-empty (matches Go)."""
-        return bool(self.cfg.client_id and self.cfg.api_key)
+        return self.cfg.configured()
 
     def _post(self, endpoint: str, payload: dict) -> dict:
         """POST JSON to ``base_url/endpoint`` with the standard 5-retry ladder.
@@ -391,6 +443,14 @@ class ImaClient:
                 log_ima.error("ima POST %s attempt=%d envelope err=%s",
                               endpoint, attempt_idx + 1, err)
                 last_exc = ImaError(err)
+                # 永久性错误重试没有意义 —— 越等越久，用户那边早就放弃了。
+                # 220004 = knowledge_base_id 失效（个人库调 search_knowledge
+                # 必回），220001 = appKey 无效。原先这两种也走满 6 次重试，
+                # 白等 63 秒才 fallback —— 表现就是「bot 不理人」。
+                if _is_permanent_ima_error(data):
+                    log_ima.warning(
+                        "ima POST %s permanent error, skip retries: %s", endpoint, err)
+                    raise last_exc
                 continue
             log_ima.debug("ima POST %s attempt=%d ok elapsed_ms=%.0f",
                           endpoint, attempt_idx + 1, elapsed_ms)
@@ -485,6 +545,85 @@ class ImaClient:
         # 该端点返回列表字段名是 ``addable_knowledge_base_list``，不是 info_list
         items = data.get("addable_knowledge_base_list") or []
         return [KnowledgeBaseSummary.from_dict(x) for x in items]
+
+    # ---- read methods: raise on transport / auth failure ------------------
+    # 上面那一组 read 方法是「静默降级」（错就返回 []，不污染调用方）；这一
+    # 组 read 方法是「显式报错」，给需要区分"没结果"和"环境出错"的 UI / CLI
+    # 路径用。list_searchable_kbs 是 web UI dropdown 的数据源，没有凭据 /
+    # 服务宕机时静默返回空会让 UI 永远不显示可选项——必须抛出去。
+
+    def list_searchable_kbs(self) -> list[dict]:
+        """列出能被 ``search_knowledge`` 检索的知识库。
+
+        调 ``search_knowledge_base`` 拿到账号下所有 KB，按 ``base_type`` 映射
+        到整型枚举（1001/1002/1004），丢掉 ``KBT_MINE_KB``（个人知识库——
+        ``search_knowledge`` 会回 ``code=220004``，见 ``docs/IMA_KB.md:126-139``）。
+        返回的 ``kb_type`` 是整型（不是 ``base_type`` 中文串），``kb_type_name``
+        是英文短名（``"shared"`` / ``"subscribed"``）便于 UI 国际化。
+
+        返回 ``list[dict]``，每项 ``{"kb_id", "kb_name", "kb_type", "kb_type_name"}``，
+        按 ``kb_name`` 升序排序。无 KB / 全部被过滤掉时返回 ``[]``，不抛异常。
+        传输 / 鉴权失败抛 :class:`ImaError`（同 mutation 方法，区别于上方
+        silent-degrade 组）。
+
+        请求形态复用 ``utils/list_ima_kb.py:190 _paginate``：cursor + is_end 翻页，
+        每页 ``limit=20``（ima 硬上限）。
+        """
+        if not self.configured():
+            raise ImaError("list_searchable_kbs: client_id / api_key 未配置")
+
+        # 翻页：与 utils/list_ima_kb.py _paginate 保持一致
+        items: list[dict] = []
+        cursor = ""
+        while True:
+            data = self._post(
+                self.PATH_SEARCH_KNOWLEDGE_BASE,
+                {
+                    "query": "",
+                    "query_user": False,
+                    "cursor": cursor,
+                    "limit": 20,
+                },
+            )
+            items.extend(data.get("info_list") or [])
+            if data.get("is_end", True):
+                break
+            cursor = data.get("next_cursor", "") or ""
+            if not cursor:
+                break
+
+        # base_type 字符串 → 整型枚举，再过滤个人 KB
+        searchable: list[dict] = []
+        for item in items:
+            kb_id = item.get("kb_id") or item.get("id") or ""
+            if not kb_id:
+                continue
+            base_type_str = item.get("base_type") or ""
+            kb_type_int = self._BASE_TYPE_TO_INT.get(base_type_str, 0)
+            if kb_type_int == self.KB_TYPE_INT_MINE:
+                # 个人知识库——search_knowledge 会返 220004，跳过
+                continue
+            if kb_type_int == 0:
+                # 没认出来的 base_type（Tencent 加了新类型）；保守起见丢掉，
+                # 宁可少展示也别让 UI 选完 search 失败
+                log_ima.warning(
+                    "list_searchable_kbs: 未知 base_type=%r (kb_id=%s)，跳过",
+                    base_type_str, kb_id,
+                )
+                continue
+            searchable.append({
+                "kb_id": kb_id,
+                "kb_name": item.get("kb_name") or item.get("name") or "",
+                "kb_type": kb_type_int,
+                "kb_type_name": self._KB_TYPE_DISPLAY_NAME[kb_type_int],
+            })
+
+        searchable.sort(key=lambda x: x["kb_name"])
+        log_ima.info(
+            "list_searchable_kbs: total=%d searchable=%d",
+            len(items), len(searchable),
+        )
+        return searchable
 
     def search_knowledge(
         self,
