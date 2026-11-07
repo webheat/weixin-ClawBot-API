@@ -45,3 +45,7 @@ nohup.out
 dist/
 build/
 *.spec.bak
+.gstack/
+
+# 向量 KB 的嵌入缓存（按文件 mtime 失效，可自动重建）
+docs/knowledge/.vector_cache/

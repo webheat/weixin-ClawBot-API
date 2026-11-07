@@ -243,7 +243,7 @@ def find_kb_by_name(client: ImaClient, name: str) -> str:
             data = client._session.post(
                 f"{client.cfg.base_url}/openapi/wiki/v1/search_knowledge_base",
                 data=json.dumps(
-                    {"query": name, "cursor": cursor, "limit": 20},
+                    {"query": "", "cursor": cursor, "limit": 20},
                     ensure_ascii=False,
                 ).encode("utf-8"),
                 headers={"Content-Type": "application/json; charset=utf-8"},
@@ -257,11 +257,14 @@ def find_kb_by_name(client: ImaClient, name: str) -> str:
             log.warning("search_knowledge_base err: %s", j.get("msg"))
             return ""
         for item in (j.get("data") or {}).get("info_list") or []:
-            if item.get("name") == name:
+            item_name = item.get("kb_name") or item.get("name") or ""
+            if item_name == name:
                 return item.get("id") or item.get("kb_id") or ""
         if (j.get("data") or {}).get("is_end"):
             return ""
         cursor = (j.get("data") or {}).get("next_cursor") or ""
+        if not cursor:
+            return ""
 
 
 def list_existing_titles(client: ImaClient, kb_id: str, limit: int = 50) -> set[str]:
